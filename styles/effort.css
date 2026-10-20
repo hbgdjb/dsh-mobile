@@ -1,0 +1,342 @@
+/* ============================================================
+   dsh-codex-effort-slider — 移植样式
+   尺寸 / 颜色 / 粒子 / 面板均取自源插件 lib/client.js (v1.1.2, MIT)
+   ============================================================ */
+
+.ces-row {
+  --ces-accent: #4d93f8;
+  position: relative;
+  margin: 6px -8px 0;
+  padding: 10px 8px 6px;
+  border-radius: 12px;
+  transition: box-shadow 0.2s ease;
+}
+
+.ces-row__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 2px;
+}
+
+.ces-row__label {
+  font-size: 13px;
+  line-height: 20px;
+  color: var(--text);
+}
+
+.ces-row__value {
+  font-size: 13px;
+  line-height: 20px;
+  font-weight: 500;
+  color: var(--muted);
+  transition: color 0.15s linear;
+  font-variant-numeric: tabular-nums;
+}
+
+.ces-inline {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+}
+
+.ces-track {
+  position: relative;
+  box-sizing: border-box;
+  height: 28px;
+  margin-top: 2px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.075);
+  cursor: pointer;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+[data-theme="light"] .ces-track {
+  background: rgba(15, 17, 21, 0.08);
+}
+
+.ces-row[data-energy="1"] .ces-track {
+  box-shadow: 0 0 calc(var(--ces-energy, 0) * 16px) rgba(168, 85, 247, 0.5);
+}
+
+.ces-track:focus-visible {
+  outline: 2px solid var(--ces-accent);
+  outline-offset: 2px;
+}
+
+.ces-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  border-radius: 14px 0 0 14px;
+  pointer-events: none;
+}
+
+.ces-tick {
+  position: absolute;
+  top: 50%;
+  width: 3px;
+  height: 3px;
+  margin: -1.5px 0 0 -1.5px;
+  border-radius: 50%;
+  background: rgba(235, 238, 242, 0.26);
+  pointer-events: none;
+}
+
+[data-theme="light"] .ces-tick {
+  background: rgba(15, 17, 21, 0.26);
+}
+
+.ces-tick[data-on="1"] {
+  background: rgba(255, 255, 255, 0.5);
+}
+
+[data-theme="light"] .ces-tick[data-on="1"] {
+  background: rgba(15, 17, 21, 0.5);
+}
+
+.ces-knob {
+  position: absolute;
+  top: 50%;
+  width: 28px;
+  height: 28px;
+  margin: -14px 0 0 -14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.34), 0 0 0 0.5px rgba(0, 0, 0, 0.06);
+  pointer-events: none;
+}
+
+.ces-ticks {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+/* 能量层：紫色星云 + 扫光，透明度 = 能量强度 */
+.ces-energy {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  border-radius: 14px 0 0 14px;
+  overflow: hidden;
+  pointer-events: none;
+  opacity: var(--ces-energy, 0);
+  transition: opacity 0.2s ease;
+  background: linear-gradient(90deg, #3b1178 0%, #6d28d9 30%, #9333ea 62%, #c084fc 100%);
+}
+
+.ces-energy__sweep {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(100deg, transparent 18%, rgba(255, 255, 255, 0.3) 50%, transparent 82%);
+  transform: translateX(100%);
+  animation: ces-sweep 2.4s linear infinite;
+}
+
+@keyframes ces-sweep {
+  0% {
+    transform: translateX(100%);
+  }
+  100% {
+    transform: translateX(-100%);
+  }
+}
+
+/* 星尘单独一层：不跟星云一起淡入 */
+.ces-stars {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  border-radius: 14px 0 0 14px;
+  overflow: hidden;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+
+.ces-star {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 3px;
+  margin-top: -1.5px;
+  pointer-events: none;
+  animation-name: ces-star-sweep;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+
+.ces-star__dot {
+  position: absolute;
+  left: 100%;
+  top: 0;
+  width: 3px;
+  height: 3px;
+  margin-left: -1.5px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 0 4px rgba(255, 255, 255, 0.85);
+  opacity: var(--ces-b, 1);
+  transform: scale(var(--ces-b, 1));
+}
+
+[data-theme="dark"] .ces-star__dot {
+  background: #f5f3ff;
+  box-shadow: 0 0 5px rgba(216, 180, 254, 0.95);
+}
+
+@keyframes ces-star-sweep {
+  0% {
+    transform: translate3d(0, 0, 0);
+    opacity: 0;
+  }
+  6% {
+    opacity: 1;
+  }
+  94% {
+    opacity: 1;
+  }
+  100% {
+    transform: translate3d(-100%, 0, 0);
+    opacity: 0;
+  }
+}
+
+[data-energy="0"] .ces-star,
+[data-energy="0"] .ces-energy__sweep {
+  animation-play-state: paused;
+}
+
+.ces-hint {
+  margin: 6px 0 0;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.02em;
+  color: var(--dim);
+}
+
+/* ── 设置面板：长按 / 右键打开 ───────────────────────────── */
+.ces-set {
+  position: fixed;
+  z-index: 2147483000;
+  box-sizing: border-box;
+  width: 300px;
+  max-width: calc(100vw - 16px);
+  padding: 12px 14px 13px;
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--line-strong);
+  box-shadow: var(--shadow-3);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+  animation: ces-set-in 0.14s var(--ease-out);
+}
+
+@keyframes ces-set-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.98);
+  }
+}
+
+.ces-set__title {
+  margin: 0 0 4px;
+  font-size: 13.5px;
+  font-weight: 600;
+}
+
+.ces-set__row {
+  margin: 0 0 10px;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--muted);
+}
+
+.ces-set__group-title {
+  margin: 0 0 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+}
+
+.ces-set__group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+
+.ces-set__group:last-of-type {
+  margin-bottom: 13px;
+}
+
+.ces-set__group label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  font-size: 12.5px;
+  color: var(--text-soft);
+  cursor: pointer;
+}
+
+.ces-set__group input[type="radio"] {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: #4d93f8;
+  flex: none;
+}
+
+.ces-set__actions {
+  display: flex;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.ces-set__actions button {
+  flex: 1;
+  min-height: 32px;
+  padding: 4px 6px;
+  border-radius: 7px;
+  border: 1px solid var(--line-strong);
+  background: transparent;
+  color: var(--text-soft);
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ces-set__actions button:hover {
+  background: var(--surface-2);
+}
+
+.ces-set__actions button:active {
+  background: var(--surface-3);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ces-energy {
+    transition: none;
+  }
+  .ces-energy__sweep {
+    display: none;
+  }
+}
+
+@media (max-width: 360px) {
+  .ces-set {
+    width: 284px;
+  }
+}

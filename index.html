@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <title>DeepSeek Harness · Mobile</title>
+    <meta name="description" content="DeepSeek Harness 的 Android 移动端宿主：Agent 循环、工具审批、插件装配与运行轨迹，为触屏重排。" />
+    <meta name="theme-color" content="#08090b" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="DSH Mobile" />
+
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="icon" type="image/png" href="./icons/icon-192.png" />
+    <link rel="apple-touch-icon" href="./icons/apple-180.png" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;700&family=Noto+Serif+SC:wght@500;600&display=swap"
+      rel="stylesheet"
+    />
+
+    <link rel="stylesheet" href="./styles/tokens.css" />
+    <link rel="stylesheet" href="./styles/base.css" />
+    <link rel="stylesheet" href="./styles/components.css" />
+    <link rel="stylesheet" href="./styles/effort.css" />
+    <link rel="stylesheet" href="./styles/screens.css" />
+  </head>
+  <body>
+    <div class="stage">
+      <div class="stage__atmosphere" aria-hidden="true"></div>
+      <div class="stage__grid" aria-hidden="true"></div>
+
+      <div class="stage__meta" aria-hidden="true">
+        <strong>DEEPSEEK HARNESS</strong>
+        <span>ANDROID RUNTIME / 0.8.0</span>
+        <span>MODEL + HARNESS = AGENT</span>
+      </div>
+
+      <div class="stage__word" aria-hidden="true">
+        <b>MOBILE HOST</b>
+        同一套 Agent 循环，<br />
+        为一块 6 英寸的屏幕重新排布。
+      </div>
+
+      <div class="stage__meta stage__meta--right" aria-hidden="true">
+        <strong>LOCAL SANDBOX</strong>
+        <span>PWA · OFFLINE READY</span>
+        <span>MIT LICENSE</span>
+      </div>
+
+      <div class="device">
+        <div class="app" id="app">
+          <header class="appbar" id="appbar"></header>
+
+          <main class="views" id="views">
+            <section class="view" data-view="chat" id="view-chat" aria-label="对话"></section>
+            <section class="view" data-view="workspace" id="view-workspace" aria-label="工作区"></section>
+            <section class="view" data-view="plugins" id="view-plugins" aria-label="插件"></section>
+            <section class="view" data-view="tasks" id="view-tasks" aria-label="任务"></section>
+            <section class="view" data-view="settings" id="view-settings" aria-label="设置"></section>
+          </main>
+
+          <nav class="tabbar" id="tabbar" role="tablist" aria-label="主导航"></nav>
+
+          <div class="scrim" id="scrim" aria-hidden="true"></div>
+          <aside class="drawer" id="drawer" aria-label="会话列表"></aside>
+          <div class="sheet-layer" id="sheet-layer"></div>
+          <div class="toast-layer" id="toast-layer" aria-live="polite"></div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="./scripts/app.js"></script>
+  </body>
+</html>

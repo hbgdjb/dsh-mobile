@@ -1,0 +1,13 @@
+{
+  "appId": "ai.deepseek.dsh.mobile",
+  "appName": "DSH",
+  "webDir": "www",
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "backgroundColor": "#08090b",
+    "allowMixedContent": false,
+    "captureInput": true
+  }
+}
