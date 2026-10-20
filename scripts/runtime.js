@@ -9,6 +9,7 @@ import {
   state,
   currentMode,
   readFile,
+  readDoc,
   fmtTime,
   currentModel,
   modelApiId,
@@ -20,9 +21,10 @@ import {
   setModelStatus,
   allModels,
   knownModelVision,
+  upsertCustomModel,
 } from "./store.js";
 import { trimMessages, estimateTokens } from "./context.js";
-import { toolSchemas, executeTool, availableToolNames } from "./tools.js";
+import { toolSchemas, executeTool, availableToolNames, inspectPath } from "./tools.js";
 import { nativeStream, nativeHttpAvailable } from "./native-http.js";
 import { isImagePath, imageMime, prepareImage } from "./image.js";
 
@@ -56,7 +58,7 @@ function buildSystemPrompt() {
     `【当前模式】${mode.name}模式 — ${mode.detail}`,
     `【权限】${state.settings.permission === "readonly" ? "只读" : state.settings.permission === "full" ? "完全访问" : "工作区写入"}`,
     `【工作区文件】${files.length ? files.join("、") : "空"}`,
-    `【附件目录】uploads/ 里是用户从手机选来随消息发送的文件（纯文本会直接附在消息里；PDF / Office / 图片等二进制只在工作区，需要时用工具处理）。`,
+    `【附件目录】uploads/ 里是用户随消息发来的文件：纯文本直接附在正文；APK / PDF / Office / 压缩包会附上类型、头部字节与内部条目摘要；图片按视觉消息发送。需要更多细节用 fs_inspect 或 fs_read(format="hex")，不要用 cat 读二进制。`,
     `【资料库】${
       library.length
         ? `${library.join("、")}（长期保存的重要资料，跨会话可用；先用 library_list 查看，再用 library_read 读取）`
@@ -80,6 +82,7 @@ function buildSystemPrompt() {
     "4. 工具失败时先解释原因，再换一条路径重试；不要重复完全相同的调用。",
     "5. 最终回答结论先行，中文，简洁；适合对比的内容用 Markdown 表格，不要堆砌客套话。",
     "6. 不要声称执行了没有实际调用的工具。",
+    "7. 终端是白名单命令，不是完整 Linux：不要 cp 到 /tmp 再用 od；看二进制结构用 fs_inspect，看字节用 fs_read(format=\"hex\")，复制/移动/删除用 cp / mv / rm。",
   ].join("\n");
 }
 
@@ -123,7 +126,11 @@ function decodeTextBase64(b64) {
 
 /**
  * 把附件内容拼到用户消息后面：纯文本直接内联，二进制只给路径说明。
- * 附件本身已经落在工作区 uploads/，模型也可随时用 fs_read / shell 再去读。
+ *
+ * 附件有两种来源：
+ *   - workspace：本地导入的文件，落在工作区 uploads/，模型可用 fs_read / shell 再去读
+ *   - library：资料库里的文件，模型可用 library_read 读取
+ * 因此这里按 area 决定从哪个区域取内容。
  */
 async function withAttachments(text, attachments, { vision = false } = {}) {
   const list = Array.isArray(attachments) ? attachments : [];
@@ -135,16 +142,42 @@ async function withAttachments(text, attachments, { vision = false } = {}) {
   const blocks = [];
   let budget = ATTACH_BUDGET_MAX;
 
+  // 读一个附件：按 area 到对应区域取
+  const readAttachment = async (a) => {
+    const area = a.area === "library" ? "library" : "workspace";
+    if (area === "library") {
+      try {
+        return await readDoc("library", a.path);
+      } catch {
+        return null;
+      }
+    }
+    return readFile(a.path);
+  };
+
   for (const a of others) {
     const name = a.name || a.path;
+    const area = a.area === "library" ? "library" : "workspace";
     if (!TEXT_ATTACH_RE.test(a.path || "")) {
+      // 二进制不再只给路径：直接附上类型、头字节与压缩包目录，模型不必再去试探
+      let detail = "";
+      try {
+        const info = await inspectPath(a.path, { maxEntries: 16, area });
+        if (info?.text) detail = `\n${info.text}`;
+      } catch {
+        /* 摘要失败就退回一句话 */
+      }
+      const hint =
+        area === "library"
+          ? "可用 library_read 读取。"
+          : "可用 fs_inspect 查看结构，fs_read(format=\"hex\") 看字节。";
       blocks.push(
-        `【附件：${name}（${a.path}，${fmtBytes(Number(a.size) || 0)}）】二进制文件，内容未内联。需要时用工具读取或处理，不要凭空描述其中的内容。`
+        `【附件：${name}（${a.path}，${fmtBytes(Number(a.size) || 0)}）】二进制，正文未内联。${detail || hint}`
       );
       continue;
     }
     try {
-      const doc = await readFile(a.path);
+      const doc = await readAttachment(a);
       if (!doc) {
         blocks.push(`【附件：${name}（${a.path}）】读取失败。`);
         continue;
@@ -187,7 +220,7 @@ async function withAttachments(text, attachments, { vision = false } = {}) {
   let sent = 0;
   for (const a of images.slice(0, VISION_MAX_IMAGES)) {
     try {
-      const doc = await readFile(a.path);
+      const doc = await readAttachment(a);
       if (!doc || doc.encoding !== "base64") throw new Error("图片没有按二进制保存");
       const img = await prepareImage(doc.content, a.mime || doc.mime || imageMime(a.path));
       parts.push({ type: "image_url", image_url: { url: img.dataUrl } });
@@ -353,6 +386,20 @@ function httpHint(status) {
   );
 }
 
+/** 端点拒绝 reasoning_effort 时，自动关掉该模型的透传并留下可操作提示。 */
+function effortFallback(active, detail) {
+  const text = String(detail || "");
+  if (!/reasoning[\s_-]*effort|reasoning\b|thinking|思考/i.test(text)) return "";
+  if (!active || active.supportsEffort === false) return "";
+  try {
+    const raw = (state.settings.customModels || []).find((m) => m.id === active.id);
+    if (raw) upsertCustomModel({ ...raw, supportsEffort: false });
+  } catch {
+    /* 保存失败不影响提示 */
+  }
+  return "（该模型不接受 reasoning_effort，已自动关闭推理强度透传并保存；请重发本条消息）";
+}
+
 async function chatOnce({ messages, tools, signal, onText, onReasoning, onUsage }) {
   const active = currentModel();
   if (!active) throw new Error("还没有添加模型。到 设置 → 模型管理 里添加一个，选好供应方一分钟就能接上。");
@@ -385,8 +432,8 @@ async function chatOnce({ messages, tools, signal, onText, onReasoning, onUsage 
     stream_options: { include_usage: true },
     temperature,
     ...(Number(active.maxTokens) > 0 ? { max_tokens: Number(active.maxTokens) } : {}),
-    // 只有显式声明支持 reasoning_effort 的模型才透传，避免 4xx
-    ...(active.supportsEffort
+    // 默认透传 reasoning_effort；模型明确标为不支持时才省略，避免 4xx
+    ...(active.supportsEffort !== false
       ? {
           reasoning_effort:
             { off: "minimal", low: "low", high: "high", max: "high" }[state.settings.reasoning] || "high",
@@ -449,7 +496,7 @@ async function chatOnce({ messages, tools, signal, onText, onReasoning, onUsage 
       addDiagnostic(diag);
       recorded = true;
       setModelStatus(active.id, { ok: false, status: code, error: detail, model });
-      if (code) throw new Error(`${httpHint(code)}${detail ? ` · ${detail}` : ""}${imageHint}`);
+      if (code) throw new Error(`${httpHint(code)}${detail ? ` · ${detail}` : ""}${imageHint}${effortFallback(active, detail)}`);
       throw new Error(
         `无法连接模型服务：${detail}。请检查 Base URL、网络与证书；Android 端已走原生请求，不再受跨域限制。`
       );
@@ -502,7 +549,7 @@ async function chatOnce({ messages, tools, signal, onText, onReasoning, onUsage 
       addDiagnostic({ ...diag, status, ms: Date.now() - started, error: detail || `HTTP ${status}` });
       recorded = true;
       setModelStatus(active.id, { ok: false, status, error: detail, model });
-      throw new Error(`${httpHint(status)}${detail ? ` · ${detail}` : ""}${imageHint}`);
+      throw new Error(`${httpHint(status)}${detail ? ` · ${detail}` : ""}${imageHint}${effortFallback(active, detail)}`);
     }
     const { finish, raw, sawEvent } = await readSSE(res, {
       onText,
@@ -669,7 +716,7 @@ async function liveRun({ session, text, msg, attachments, signal, ctx }) {
     history.pop();
   }
   const active = currentModel();
-  const vision = active ? (active.vision ?? knownModelVision(modelApiId(active))) : false;
+  const vision = active ? active.vision !== false : false;
   const built = await withAttachments(text, attachments, { vision });
   msg.media = built.media; // 让界面能显示"图片发了几张 / 是否被跳过"
   const userContent = built.content;
@@ -680,13 +727,16 @@ async function liveRun({ session, text, msg, attachments, signal, ctx }) {
   ];
   const windowTokens = modelContextWindow();
 
-  const maxSteps = Math.max(1, Math.min(12, state.settings.maxSteps || 8));
+  const maxSteps = Math.max(1, Math.min(100, state.settings.maxSteps || 24));
 
   for (let step = 0; step < maxSteps; step++) {
     if (signal.aborted) throw new DOMException("Aborted", "AbortError");
     msg.steps = step + 1;
     let streamed = "";
     let reasoning = "";
+    // 本步推理的起止时刻：用于在 UI 上显示「已思考 X」
+    let reasonStart = 0;
+    let reasonEnd = 0;
 
     // 每步请求前按窗口预算裁剪较早回合；完整 convo 仍保留在本轮内
     const trimmed = trimMessages(convo, windowTokens);
@@ -711,12 +761,20 @@ async function liveRun({ session, text, msg, attachments, signal, ctx }) {
       onReasoning(delta) {
         reasoning += delta;
         msg.reasoning += delta;
+        // 记录本步推理的起止时刻，供 UI 显示「已思考 X」
+        if (!reasonStart) reasonStart = Date.now();
+        reasonEnd = Date.now();
         ctx.onChange();
       },
       onUsage(u) {
         if (u.total_tokens) msg.tokens = u.total_tokens;
       },
     });
+
+    // 累计本步推理耗时（多步时累加），UI 上显示为「已思考 X」
+    if (reasonEnd > reasonStart) {
+      msg.reasoningMs = (msg.reasoningMs || 0) + (reasonEnd - reasonStart);
+    }
 
     if (!calls.length) {
       msg.content = msg.content.trim();
@@ -863,19 +921,43 @@ async function minimalRequest({ url, headers, payload, timeoutSec = 60, method =
   return { status: res.status, raw };
 }
 
-/** 拉取端点的可用模型列表（OpenAI 兼容 GET /models），带备用路径与明确错误。 */
+/** 从各种常见响应结构里取出模型 ID 列表。 */
+function parseModelIds(raw) {
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  const pick = (v) => (Array.isArray(v) ? v : Array.isArray(v?.data) ? v.data : Array.isArray(v?.models) ? v.models : null);
+  const list = pick(data) || pick(data?.result) || pick(data?.response) || [];
+  return list
+    .map((m) => (typeof m === "string" ? m : m?.id || m?.name || m?.model))
+    .filter((x) => typeof x === "string" && x.trim())
+    .sort((a, b) => a.localeCompare(b));
+}
+
+const shortUrl = (u) => String(u || "").replace(/^https?:\/\//, "").slice(0, 72);
+
+/** 拉取端点的可用模型列表（OpenAI 兼容 GET /models），多路径探测并汇总失败原因。 */
 export async function fetchModelList({ baseUrl, apiKey }) {
   if (!baseUrl) throw new Error("先填 Base URL");
-  if (!apiKey) throw new Error("先在「账号 → 对应服务」里填好 Key，才能获取模型列表");
+  if (!apiKey) throw new Error("先填这个服务的 API Key，才能获取可用模型");
+
   const base = String(baseUrl).trim().replace(/\/+$/, "");
+  // 端点形态各异：/v1、/compatible-mode/v1、/api/paas/v4、纯域名……逐个形态试
+  const roots = new Set([base]);
+  const stripped = base.replace(/\/v\d+$/i, "");
+  if (stripped !== base) roots.add(stripped);
+  const urls = [];
+  roots.forEach((r) => {
+    urls.push(`${r}/models`);
+    if (!/\/v\d+$/i.test(r)) urls.push(`${r}/v1/models`);
+  });
+  const unique = Array.from(new Set(urls)).slice(0, 6);
 
-  // 主路径 + 备用路径：有的网关 /models 只在 /v1（或不在 /v1）下
-  const candidates = [`${base}/models`];
-  if (/\/v\d+$/.test(base)) candidates.push(`${base.replace(/\/v\d+$/, "")}/models`);
-  else if (!/\/v\d+$/.test(base.replace(/\/v\d+$/, ""))) candidates.push(`${base}/v1/models`);
-
-  let lastErr = null;
-  for (const url of candidates) {
+  const tried = [];
+  for (const url of unique) {
     try {
       const { status, raw } = await minimalRequest({
         url,
@@ -884,45 +966,27 @@ export async function fetchModelList({ baseUrl, apiKey }) {
         timeoutSec: 30,
       });
       if (status === 401 || status === 403 || status === 402) {
-        // Key 问题换路径也没用，直接给出明确指引
         const detail = errorDetail(raw);
         throw new Error(`${httpHint(status)}${detail ? ` · ${detail}` : ""}`);
       }
       if (status < 200 || status >= 300) {
-        lastErr = new Error(`HTTP ${status}${errorDetail(raw) ? ` · ${errorDetail(raw)}` : ""}`);
+        tried.push(`${shortUrl(url)} → HTTP ${status}`);
         continue;
       }
-      let ids = [];
-      try {
-        const data = JSON.parse(raw);
-        const list = Array.isArray(data?.data)
-          ? data.data
-          : Array.isArray(data?.models)
-          ? data.models
-          : Array.isArray(data)
-          ? data
-          : [];
-        ids = list
-          .map((m) => (typeof m === "string" ? m : m?.id || m?.name))
-          .filter((x) => typeof x === "string" && x.trim())
-          .sort((a, b) => a.localeCompare(b));
-      } catch {
-        lastErr = new Error("端点返回的内容无法解析为模型列表");
-        continue;
-      }
+      const ids = parseModelIds(raw);
       if (!ids.length) {
-        lastErr = new Error("端点没有返回任何模型");
+        tried.push(`${shortUrl(url)} → 200 但列表为空`);
         continue;
       }
       return ids;
     } catch (err) {
-      // Key 类错误直接抛出；其余记录后尝试备用路径
-      if (/API Key|余额|权限/.test(err.message || "")) throw err;
-      lastErr = err;
+      // Key 类错误换路径也没用，直接抛给用户
+      if (/API Key|余额|权限|无效/.test(err.message || "")) throw err;
+      tried.push(`${shortUrl(url)} → ${err.message || "请求失败"}`);
     }
   }
   throw new Error(
-    `${lastErr?.message || "获取失败"}。该端点可能不提供 /models 接口，可改用下方常用模型 ID 或手动填写`
+    `这个端点没有返回模型列表（${tried.slice(0, 3).join("；")}）。很多网关不提供 /models，直接点下方「常用模型」即可，不必手动填 ID。`
   );
 }
 
@@ -946,7 +1010,7 @@ export async function testModel(modelOrId) {
   const payload = {
     model: apiModel,
     messages: [{ role: "user", content: "ping" }],
-    max_tokens: 4,
+    max_tokens: 16,
     stream: false,
   };
   let result;

@@ -40,13 +40,13 @@ npx cap sync android
 
 cd android
 echo "sdk.dir=$SDK" > local.properties
-sed -i 's/versionName "1.0"/versionName "0.16.1"/' app/build.gradle || true
-sed -i 's/versionCode 1/versionCode 38/' app/build.gradle || true
+sed -i 's/versionName "1.0"/versionName "0.21.6"/' app/build.gradle || true
+sed -i 's/versionCode 1/versionCode 49/' app/build.gradle || true
 
 echo "→ 注入原生 HTTP 桥"
 JAVA_DIR="app/src/main/java/ai/deepseek/dsh/mobile"
 mkdir -p "$JAVA_DIR"
-for f in DshHttpBridge DshHudState DshHudBridge DshHudService DshBotView DshFsBridge MainActivity; do
+for f in DshHttpBridge DshHudState DshHudBridge DshHudService DshBotView DshFsBridge DshKeepAliveService DshKeepAliveBridge DshPowerBridge MainActivity; do
   cp "$ROOT/android/java/$f.java" "$JAVA_DIR/$f.java"
 done
 
@@ -77,6 +77,14 @@ if 'android.permission.SYSTEM_ALERT_WINDOW' not in s:
         '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n'
         '    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />',
     )
+# 前台服务权限：Agent 运行期间靠它保活，避免被系统回收导致任务中断
+if 'android.permission.FOREGROUND_SERVICE' not in s:
+    s = s.replace(
+        '<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />',
+        '<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />\n'
+        '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n'
+        '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />',
+    )
 if '<service android:name=".DshHudService"' not in s:
     s = s.replace(
         '</application>',
@@ -86,9 +94,41 @@ if '<service android:name=".DshHudService"' not in s:
         '    />\n'
         '</application>',
     )
+# 保活前台服务：Agent 跑任务时把进程优先级提起来
+if 'DshKeepAliveService' not in s:
+    s = s.replace(
+        '</application>',
+        '    <service\n'
+        '        android:name=".DshKeepAliveService"\n'
+        '        android:exported="false"\n'
+        '        android:foregroundServiceType="dataSync"\n'
+        '    />\n'
+        '</application>',
+    )
+# ---- 后台保活相关权限 ----
+# WAKE_LOCK：保活服务持 PARTIAL_WAKE_LOCK，避免 CPU 休眠打断 SSE 流式读取。
+# REQUEST_IGNORE_BATTERY_OPTIMIZATIONS：弹系统面板请用户把应用加进
+#   "忽略电池优化"白名单（用户提的"允许后台耗电"对应的就是这个）。
+#   注意：这个权限 Play 商店会审核，自用 / 侧载 APK 无此限制。
+extra_perms = [
+    'android.permission.WAKE_LOCK',
+    'android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS',
+]
+for perm in extra_perms:
+    if perm not in s:
+        s = s.replace(
+            '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />',
+            '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n'
+            '    <uses-permission android:name="' + perm + '" />',
+        )
+# 前台服务类型保持 dataSync：
+#   Android 15 的 dataSync 6 小时/24h 硬限制只对 targetSdk 35+ 生效，
+#   本应用 targetSdk 34，不受该限制影响。
+#   而 specialUse 在 API 34+ 还必须额外声明
+#   <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" .../>，
+#   漏了会在 startForeground 时直接抛异常，得不偿失。
 m.write_text(s)
 PY
-
 if [ "$MIRROR" = "1" ]; then
   echo "→ 启用国内镜像"
   python3 - <<'PY'
@@ -125,7 +165,7 @@ echo "→ Gradle 构建 Debug APK"
 ./gradlew assembleDebug --no-daemon
 
 APK="$WORK/android/app/build/outputs/apk/debug/app-debug.apk"
-VERSION="0.16.1"
+VERSION="0.21.6"
 if [ -f "$APK" ]; then
   mkdir -p "$ROOT/android/out"
   cp "$APK" "$ROOT/android/out/dsh-mobile-$VERSION-debug.apk"

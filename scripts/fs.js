@@ -309,8 +309,24 @@ export async function importFromPhone(area, subdir = "") {
       try {
         const files = [...(input.files || [])];
         const out = [];
+        // 同名不覆盖：原生端会自己改名，浏览器端这里补上同样的行为，
+        // 否则第二次导入同名文件会把第一次的悄悄顶掉，用户以为"文件没加上"。
+        const taken = new Set((await listDocs(area)).map((d) => d.path));
+        const uniquePath = (name) => {
+          const path0 = subdir ? `${subdir}/${name}` : name;
+          if (!taken.has(path0)) return path0;
+          const dot = name.lastIndexOf(".");
+          const stem = dot > 0 ? name.slice(0, dot) : name;
+          const ext = dot > 0 ? name.slice(dot) : "";
+          for (let i = 1; i < 1000; i += 1) {
+            const cand = subdir ? `${subdir}/${stem}-${i}${ext}` : `${stem}-${i}${ext}`;
+            if (!taken.has(cand)) return cand;
+          }
+          return path0;
+        };
         for (const file of files) {
-          const path = subdir ? `${subdir}/${file.name}` : file.name;
+          const path = uniquePath(file.name);
+          taken.add(path);
           // 文本类按文本落盘：模型侧才能直接读到正文，而不是一坨 base64
           const meta = isTextPath(file.name)
             ? await writeDoc(area, path, await file.text())

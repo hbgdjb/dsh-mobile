@@ -1,5 +1,9 @@
 import { initUI } from "./ui.js";
 import { initFiles } from "./store.js";
+import { installCrashGuard } from "./crash-guard.js";
+
+// 先装兜底：越早装，越能抓到启动阶段的异常
+installCrashGuard();
 
 // Capacitor / Android WebView：系统状态栏已占据顶部空间，避免重复留白
 if (window.Capacitor?.isNativePlatform?.()) {

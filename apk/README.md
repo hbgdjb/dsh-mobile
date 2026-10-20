@@ -2,11 +2,10 @@
 
 | 文件 | 版本 | 说明 |
 |---|---|---|
-| `DSH-Mobile-0.12.4.apk` | v0.12.4 | 旧构建，**低于当前源码版本 v0.16.1** |
+| `DSH-Mobile-0.21.6.apk` | **v0.21.6**（versionCode 49） | 与当前源码版本一致 |
 
-> ⚠️ 这个 APK 是早期构建产物，功能比当前源码少（源码已到 v0.16.1）。
-> 想要最新版本，请按 [`../README.md`](../README.md) 第 9 节「Android 打包」从源码自行构建，
-> 或等这里更新。
+> 旧版本（v0.12.4）已从仓库移除，需要的话可在 git 历史里找回：
+> `git log --diff-filter=D -- apk/`
 
 ## 安装
 
@@ -19,6 +18,7 @@
 | 项 | 值 |
 |---|---|
 | 包名 | `ai.deepseek.dsh.mobile` |
-| versionCode | 26 |
+| versionCode / versionName | 49 / 0.21.6 |
 | minSdk / targetSdk | 22 / 34 |
 | 权限 | `INTERNET`、`SYSTEM_ALERT_WINDOW`、`POST_NOTIFICATIONS`、`VIBRATE` |
+| MD5 | `5425efae60d9f19dcae1d1b3e86a20dd` |

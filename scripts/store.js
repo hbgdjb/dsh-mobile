@@ -596,13 +596,15 @@ const DEFAULT_STATE = () => ({
     modelOverrides: {},
     /** 最近一次连接结果：{ [modelId]: { ok, ms, at, status, error, model } } */
     modelStatus: {},
+    /** 按服务商缓存的可用模型清单：{ [providerKey]: { ids, baseUrl, ts } } */
+    modelCatalog: {},
     keys: Object.fromEntries(Object.keys(PROVIDERS).map((k) => [k, ""])),
     contextWindow: 128000,
     reasoning: "high",
     mode: "standard",
     permission: "workspace",
     approval: "ask",
-    maxSteps: 8,
+    maxSteps: 24,
     theme: "dark",
     motion: true,
     searchEndpoint: "",
@@ -687,6 +689,9 @@ function load() {
       if (!parsed.settings.modelStatus || typeof parsed.settings.modelStatus !== "object") {
         parsed.settings.modelStatus = {};
       }
+      if (!parsed.settings.modelCatalog || typeof parsed.settings.modelCatalog !== "object") {
+        parsed.settings.modelCatalog = {};
+      }
       if (!parsed.settings.keys || typeof parsed.settings.keys !== "object") {
         parsed.settings.keys = {};
       }
@@ -701,6 +706,11 @@ function load() {
       // 迁移后不再保留旧字段，避免同一把 Key 在导出里出现两次
       if (parsed.settings.apiKey !== undefined) parsed.settings.apiKey = "";
       if (parsed.settings.requestTimeout === undefined) parsed.settings.requestTimeout = 60;
+      // 默认步数 8 → 24：老配置一次性提升，之后仍可在设置里手动调低
+      if (parsed.settings.stepsBoosted !== true) {
+        parsed.settings.maxSteps = Math.max(24, Number(parsed.settings.maxSteps) || 0);
+        parsed.settings.stepsBoosted = true;
+      }
       if (parsed.settings.notifyOnDone === undefined) parsed.settings.notifyOnDone = true;
       if (parsed.settings.haptics === undefined) parsed.settings.haptics = true;
       if (parsed.settings.fontScale === undefined) parsed.settings.fontScale = 1;
@@ -752,12 +762,15 @@ function load() {
     );
     if (parsed.stats && parsed.stats.tokens === 128400) parsed.stats = { runs: 0, tools: 0, tokens: 0 };
 
-    return {
+    // 会话正文：优先从分片键读取；旧版本（单键存储）则从 parsed.sessions 迁移过来
+    const loaded = loadSessions(parsed);
+
+    const result = {
       ...base,
       ...parsed,
       settings: { ...base.settings, ...(parsed.settings || {}) },
       // 种子只在首次出现，后续以用户数据为准
-      sessions: Array.isArray(parsed.sessions) ? parsed.sessions : base.sessions,
+      sessions: loaded,
       files: parsed.files && typeof parsed.files === "object" ? parsed.files : base.files,
       library: parsed.library && typeof parsed.library === "object" ? parsed.library : {},
       fsBackend: typeof parsed.fsBackend === "string" ? parsed.fsBackend : "",
@@ -769,18 +782,214 @@ function load() {
         ? parsed.diagnostics
         : base.diagnostics,
     };
+
+    // 崩溃/被系统杀掉后，状态里会残留 status="running" 的消息与工具。
+    // 这些运行已经不存在了（对应的 AbortController 随进程一起没了），
+    // 如果不收拾，重开后消息会永远转圈、而且停不下来——用户描述的"记录坏死"就是这么来的。
+    healInterruptedRuns(result);
+
+    return result;
   } catch {
     return DEFAULT_STATE();
   }
+}
+
+/** 读取分片会话；兼容旧单键格式并做一次性迁移。 */
+function loadSessions(parsed) {
+  const index = Array.isArray(parsed.sessions) ? parsed.sessions : [];
+  const out = [];
+  let migrated = false;
+
+  for (const entry of index) {
+    // 新格式：index 里只有 {id,title,updatedAt}
+    const sid = entry?.id;
+    if (!sid) continue;
+    const frag = readJson(`${LS_SESSIONS}.${sid}`, null);
+    if (frag && Array.isArray(frag.messages)) {
+      out.push({ ...entry, ...frag });
+    } else {
+      // 旧格式：会话全文就在主键里
+      const legacy = entry.messages ? entry : null;
+      if (legacy) {
+        out.push(legacy);
+        migrated = true;
+      } else {
+        out.push({ ...entry, messages: [], createdAt: entry.createdAt || Date.now(), mode: entry.mode || "standard" });
+      }
+    }
+  }
+
+  // 主键里还残留完整会话（迁移前的老数据）→ 全部转成分片
+  if (index.some((s) => Array.isArray(s.messages) && s.messages.length)) migrated = true;
+
+  if (migrated) {
+    for (const s of out) {
+      if (!s.messages?.length) continue;
+      writeJson(`${LS_SESSIONS}.${s.id}`, s);
+    }
+    // 迁移完成后立刻把主键瘦身（去掉内联的会话正文），
+    // 否则老用户的主键会一直带着几百 KB 正文，
+    // 后续每次写入都可能被配额卡住——这正是"记录坏死"的起点。
+    try {
+      const light = { ...parsed, sessions: parsed.sessions.map((s) => ({ id: s.id, title: s.title, updatedAt: s.updatedAt })) };
+      writeJson(LS_KEY, light);
+    } catch {
+      /* 忽略 */
+    }
+  }
+
+  const active = localStorage.getItem(LS_ACTIVE);
+  if (active) parsed.activeSessionId = active;
+
+  return out;
+}
+
+/**
+ * 自愈：把上次进程异常退出留下的 "running" 状态收敛掉。
+ * 消息 → stopped（并注明是异常中断），工具 → stopped，任务记录 → error。
+ */
+function healInterruptedRuns(st) {
+  let healed = 0;
+  for (const s of st.sessions || []) {
+    for (const m of s.messages || []) {
+      if (m.status === "running") {
+        m.status = "stopped";
+        m.error = m.error || "上次运行被系统中断（应用被回收或崩溃）。已保留已生成的内容，可重新提问继续。";
+        m.interrupted = true;
+        healed++;
+      }
+      for (const t of m.tools || []) {
+        if (t.status === "running" || t.status === "waiting") {
+          t.status = "stopped";
+          t.interrupted = true;
+        }
+      }
+    }
+  }
+  for (const r of st.runs || []) {
+    if (r.status === "running") {
+      r.status = "error";
+      r.error = "运行被系统中断";
+      healed++;
+    }
+  }
+  if (healed) {
+    // 立刻把自愈结果写回，避免下次启动又看到 running
+    try {
+      setTimeout(() => {
+        save(true);
+      }, 0);
+    } catch {
+      /* 忽略 */
+    }
+  }
+  return healed;
+}
+
+/* ---------------- 落盘 ---------------- */
+
+/**
+ * 状态分片存储。
+ *
+ * 之前整个 state（含所有会话全文、工具输出、诊断）挤在一个 localStorage 键里，
+ * 一边流式输出一边全量 JSON.stringify，几 MB 就会撞上 5MB 上限；
+ * setItem 抛配额异常后只被 console.warn 吞掉，于是内存里的新状态再也写不进去，
+ * 重开应用就回到一份"坏数据"——表现就是记录乱掉、停不下来。
+ *
+ * 现在改成：
+ *   - LS_KEY      设置 / 模型 / 文件索引等轻量状态（常驻）
+ *   - LS_SESSIONS 每个会话一个键，单独读写，互不拖累
+ *   - LS_ACTIVE   当前会话 id
+ * 写入超限时按会话逐个降级（先丢最旧会话），保证设置与模型永远不会丢。
+ */
+const LS_SESSIONS = "dsh.mobile.sessions.v1";
+const LS_ACTIVE = "dsh.mobile.active.v1";
+
+/** 会话正文在内存里的上限：超出后只保留头部，工具输出另存。 */
+const SESSION_CHARS_CAP = 400000;
+
+function readJson(key, fallback = null) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJson(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch (err) {
+    console.warn("持久化失败：", key, err);
+    return false;
+  }
+}
+
+/** 把一个会话的体积压到可落盘的规模。 */
+function compactSession(s) {
+  const copy = { ...s, messages: (s.messages || []).slice() };
+  let total = 0;
+  for (const m of copy.messages) {
+    total += (m.content || "").length + (m.reasoning || "").length;
+    if (m.tools?.length) {
+      // 工具输出只留前 800 字，完整内容在应用内仍可从内存取
+      copy.messages = copy.messages.map((x) =>
+        x === m
+          ? { ...x, tools: x.tools.map((t) => ({ ...t, output: String(t.output || "").slice(0, 800) })) }
+          : x
+      );
+    }
+  }
+  if (total > SESSION_CHARS_CAP) {
+    // 超量：从最早的消息开始裁正文，保留最后 8 条完整
+    const keepTail = 8;
+    let acc = 0;
+    copy.messages = copy.messages.map((m, i) => {
+      const isTail = i >= copy.messages.length - keepTail;
+      if (isTail) {
+        acc += (m.content || "").length;
+        return m;
+      }
+      const text = String(m.content || "");
+      if (acc + text.length > SESSION_CHARS_CAP) {
+        acc += text.length;
+        return { ...m, content: text.slice(0, 4000) + "\n…（历史内容已裁剪以节省空间）", trimmed: true };
+      }
+      acc += text.length;
+      return m;
+    });
+  }
+  return copy;
+}
+
+/**
+ * 极端降级版本：只保留每条消息的正文骨架（工具输出清空、正文截到 400 字），
+ * 用于配额已经见底、常规压缩仍然写不进去的情况。
+ */
+function tinySession(s) {
+  return {
+    ...s,
+    messages: (s.messages || []).map((m) => ({
+      id: m.id,
+      role: m.role,
+      ts: m.ts,
+      status: m.status,
+      content: String(m.content || "").slice(0, 400),
+      tools: (m.tools || []).map((t) => ({ id: t.id, name: t.name, status: t.status, output: "" })),
+    })),
+  };
 }
 
 export const state = load();
 
 const listeners = new Set();
 let saveTimer = null;
-
-// 首次启动 / 内置插件升级：把迁移后的状态落盘，避免每次启动重复迁移
-save(true);
+let sessionSaveTimers = new Map();
+/** 有新内容、还没落盘的会话 id */
+const dirtySessions = new Set();
 
 export function subscribe(fn) {
   listeners.add(fn);
@@ -791,17 +1000,82 @@ export function emit(detail) {
   listeners.forEach((fn) => fn(detail));
 }
 
+/** 会话正文单独落盘，节流 1.2s：流式期间只写当前会话。 */
+function saveSession(sid) {
+  const s = state.sessions.find((x) => x.id === sid);
+  if (!s) return;
+  const key = `${LS_SESSIONS}.${sid}`;
+  if (!writeJson(key, compactSession(s))) {
+    // 配额爆了：先删最旧的会话（保留当前会话），再试一次
+    const others = state.sessions.filter((x) => x.id !== sid).sort((a, b) => a.updatedAt - b.updatedAt);
+    for (const o of others) {
+      try {
+        localStorage.removeItem(`${LS_SESSIONS}.${o.id}`);
+      } catch {
+        /* 忽略 */
+      }
+      if (writeJson(key, compactSession(s))) break;
+    }
+    // 还是写不下：进一步瘦身，至少把"会话存在 + 最近内容"保住
+    if (!writeJson(key, tinySession(s))) {
+      console.warn("会话正文落盘失败，已降级为最小快照：", sid);
+    }
+  }
+  dirtySessions.delete(sid);
+}
+
+function scheduleSessionSave(sid) {
+  dirtySessions.add(sid);
+  clearTimeout(sessionSaveTimers.get(sid));
+  sessionSaveTimers.set(
+    sid,
+    setTimeout(() => {
+      sessionSaveTimers.delete(sid);
+      saveSession(sid);
+    }, 1200)
+  );
+}
+
 export function save(immediate = false) {
   clearTimeout(saveTimer);
   const write = () => {
-    try {
-      localStorage.setItem(LS_KEY, JSON.stringify(state));
-    } catch (err) {
-      console.warn("持久化失败：", err);
+    // 1) 轻量状态：不含会话正文
+    const light = { ...state, sessions: state.sessions.map((s) => ({ id: s.id, title: s.title, updatedAt: s.updatedAt })) };
+    if (!writeJson(LS_KEY, light)) {
+      // 轻量部分都写不进去：清诊断历史再试一次（设置与模型必须保住）
+      state.diagnostics = { requests: [] };
+      writeJson(LS_KEY, light);
     }
+    try {
+      localStorage.setItem(LS_ACTIVE, state.activeSessionId || "");
+    } catch {
+      /* 忽略 */
+    }
+    // 2) 只重写"脏"会话，避免每次流式更新都全量序列化所有历史
+    for (const sid of [...dirtySessions]) saveSession(sid);
   };
   if (immediate) write();
   else saveTimer = setTimeout(write, 180);
+}
+
+/** 会话内容变化时调用：只标记该会话为脏，由节流器落盘。 */
+export function saveSessionNow(sid) {
+  scheduleSessionSave(sid);
+}
+
+/**
+ * 立即落盘（不等节流）。
+ *
+ * 用于"页面即将转入后台"这种一次性时刻：此时进程随时可能被系统回收，
+ * 而节流器那 1.2 秒的定时器在后台未必来得及触发，
+ * 结果就是已经流出来的内容全丢，回来只剩一个空壳。
+ */
+export function flushSessionNow(sid) {
+  if (!sid) return;
+  clearTimeout(sessionSaveTimers.get(sid));
+  sessionSaveTimers.delete(sid);
+  dirtySessions.add(sid);
+  saveSession(sid);
 }
 
 /* ---------------- 选择器 ---------------- */
@@ -938,6 +1212,31 @@ export function upsertCustomModel(model) {
   return model;
 }
 
+/* ---------------- 可用模型目录 ----------------
+   一次获取、长期复用：模型面板不再要求用户记 ID。 */
+
+/** 记住某服务商探测到的模型清单（按 baseUrl 区分端点）。 */
+export function rememberModelCatalog(slot, baseUrl, ids) {
+  const key = slot || "custom";
+  const map = state.settings.modelCatalog || (state.settings.modelCatalog = {});
+  map[key] = {
+    baseUrl: String(baseUrl || "").replace(/\/+$/, ""),
+    ids: Array.from(new Set((ids || []).map(String).filter(Boolean))),
+    ts: Date.now(),
+  };
+  save(true);
+  return map[key];
+}
+
+/** 取某服务商缓存过的模型清单；endpoint 不匹配时返回空。 */
+export function catalogFor(slot, baseUrl = "") {
+  const row = (state.settings.modelCatalog || {})[slot || "custom"];
+  if (!row || !Array.isArray(row.ids)) return [];
+  const now = String(baseUrl || "").replace(/\/+$/, "");
+  if (now && row.baseUrl && row.baseUrl !== now) return [];
+  return row.ids;
+}
+
 /** 删除自定义模型；若正在使用，退回 DeepSeek Chat。 */
 export function removeCustomModel(id) {
   state.settings.customModels = (state.settings.customModels || []).filter((m) => m.id !== id);
@@ -1014,6 +1313,7 @@ export function forkSession(id) {
   state.sessions.unshift(copy);
   state.activeSessionId = copy.id;
   save(true);
+  writeJson(`${LS_SESSIONS}.${copy.id}`, compactSession(copy));
   emit({ type: "session:fork", id: copy.id });
   return copy;
 }
@@ -1021,6 +1321,12 @@ export function forkSession(id) {
 export function deleteSession(id) {
   state.sessions = state.sessions.filter((s) => s.id !== id);
   if (state.activeSessionId === id) state.activeSessionId = null;
+  try {
+    localStorage.removeItem(`${LS_SESSIONS}.${id}`);
+  } catch {
+    /* 忽略 */
+  }
+  dirtySessions.delete(id);
   save(true);
   emit({ type: "session:delete", id });
 }
@@ -1041,6 +1347,7 @@ export function addMessage(sessionId, msg) {
     s.title = msg.content.replace(/\s+/g, " ").slice(0, 22);
   }
   save();
+  scheduleSessionSave(sessionId);
   return msg;
 }
 
@@ -1055,6 +1362,52 @@ const normalizePath = (p) =>
     .replace(/\.{2,}\//g, "")
     .replace(/\/{2,}/g, "/")
     .trim();
+
+/** 路径指纹：忽略全/半角括号、空白、URL 编码与大小写差异。 */
+export function pathKey(p) {
+  let s = String(p || "").replace(/\\/g, "/");
+  try {
+    s = decodeURIComponent(s);
+  } catch {
+    /* 含非法百分号时保留原样 */
+  }
+  return s
+    .replace(/[（]/g, "(")
+    .replace(/[）]/g, ")")
+    .replace(/[［]/g, "[")
+    .replace(/[］]/g, "]")
+    .replace(/[＋]/g, "+")
+    .replace(/[／]/g, "/")
+    .replace(/[\u00a0\u3000\s]+/g, "")
+    .normalize("NFC")
+    .toLowerCase();
+}
+
+/** 在候选路径中找到用户真正指的那个；找不到返回空串。 */
+export function matchFilePath(candidates, raw, opts = {}) {
+  const want = normalizePath(raw);
+  if (!want) return "";
+  const list = (candidates || [])
+    .map((x) => normalizePath(typeof x === "string" ? x : x && x.path))
+    .filter(Boolean);
+  if (list.includes(want)) return want;
+  const key = pathKey(want);
+  let hits = list.filter((p) => pathKey(p) === key);
+  if (!hits.length && !want.includes("/") && opts.basename !== false) {
+    // 只给了文件名：允许在任意子目录下找同名文件
+    hits = list.filter((p) => pathKey(p.slice(p.lastIndexOf("/") + 1)) === key);
+  }
+  if (!hits.length) return "";
+  if (hits.length === 1) return hits[0];
+  // 同名多份：优先 uploads/，其次路径最短
+  const up = hits.filter((p) => p.startsWith("uploads/"));
+  return (up.length ? up : hits).sort((a, b) => a.length - b.length)[0];
+}
+
+/** 解析为已存在的真实路径；解析不到则返回规范化原值（用于新建文件）。 */
+export function resolveWorkspacePath(path) {
+  return matchFilePath(Object.keys(state.files || {}), path) || normalizePath(path);
+}
 
 export let filesReady = false;
 
@@ -1115,7 +1468,7 @@ export const fileExists = (path) => !!state.files[normalizePath(path)];
 
 /** 读取工作区文件；不存在返回 null。 */
 export async function readFile(path) {
-  const p = normalizePath(path);
+  const p = resolveWorkspacePath(path);
   if (!p) return null;
   try {
     return await FS.readDoc("workspace", p);
@@ -1125,7 +1478,8 @@ export async function readFile(path) {
 }
 
 export async function writeFile(path, content) {
-  const p = normalizePath(path);
+  // 写入不跨目录兜底：避免 `report.md` 误覆盖 uploads/report.md
+  const p = matchFilePath(Object.keys(state.files || {}), path, { basename: false }) || normalizePath(path);
   if (!p) throw new Error("路径不能为空");
   let previous = null;
   try {
@@ -1141,7 +1495,7 @@ export async function writeFile(path, content) {
 }
 
 export async function deleteFile(path) {
-  const p = normalizePath(path);
+  const p = resolveWorkspacePath(path);
   if (!p) return;
   await FS.deleteDoc("workspace", p);
   delete state.files[p];
@@ -1357,6 +1711,19 @@ export async function resetAll() {
     await FS.clearArea("library");
   } catch (err) {
     console.warn("清空文件目录失败：", err);
+  }
+  // 分片会话要逐个删，否则重置后老会话会"复活"
+  for (const s of state.sessions || []) {
+    try {
+      localStorage.removeItem(`${LS_SESSIONS}.${s.id}`);
+    } catch {
+      /* 忽略 */
+    }
+  }
+  try {
+    localStorage.removeItem(LS_ACTIVE);
+  } catch {
+    /* 忽略 */
   }
   localStorage.removeItem(LS_KEY);
   location.reload();

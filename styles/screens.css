@@ -53,6 +53,31 @@
   color: var(--dim);
 }
 
+/* 渲染窗口：折叠更早的消息，避免长会话把 DOM 撑爆 */
+.chat__more {
+  display: block;
+  width: calc(100% - var(--gutter) * 2);
+  margin: 6px auto;
+  padding: 7px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 999px;
+  background: var(--panel-2);
+  color: var(--dim);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.chat__more:active {
+  background: var(--panel-3);
+}
+
+/* 空会话：容器仍带 .messages（保持布局规则一致），但首页空态自带内边距，
+   这里把容器的内边距与 gap 归零，避免两套内边距叠加导致左右被挤压。 */
+.messages--empty {
+  display: block;
+  padding: 0;
+  gap: 0;
+}
+
 /* 首页空态 */
 .home {
   padding: 6px var(--gutter) 28px;
@@ -980,55 +1005,6 @@
   text-transform: uppercase;
 }
 
-.suggest {
-  border-top: 1px solid var(--line);
-}
-
-.suggest__row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  width: 100%;
-  min-height: 54px;
-  padding: 12px 2px;
-  border-bottom: 1px solid var(--line);
-  text-align: left;
-  transition: background var(--dur-1);
-}
-
-.suggest__row:hover {
-  background: rgba(233, 237, 245, 0.03);
-}
-
-.suggest__row:active {
-  background: rgba(233, 237, 245, 0.05);
-}
-
-.suggest__icon {
-  width: 30px;
-  height: 30px;
-  flex: none;
-  border-radius: 9px;
-  border: 1px solid var(--line);
-  background: var(--surface);
-  display: grid;
-  place-items: center;
-  color: var(--muted);
-}
-
-.suggest__title {
-  flex: 1;
-  min-width: 0;
-  font-size: 13px;
-  color: var(--text-soft);
-  line-height: 1.5;
-}
-
-.suggest__chev {
-  color: var(--dim);
-  flex: none;
-}
-
 /* 插件行 */
 .plugin-row {
   display: flex;
@@ -1323,6 +1299,33 @@
 }
 
 /* ---------------- 模型管理 ---------------- */
+
+.model-group + .model-group {
+  margin-top: 18px;
+}
+
+.model-group__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.model-group__head .eyebrow:last-child {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.model-group__rest {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 10px 0 2px;
+}
+
+.model-group__rest .chip {
+  font-size: 12px;
+}
 
 .model-manage {
   display: flex;

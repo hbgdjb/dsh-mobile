@@ -26,6 +26,8 @@ import {
   removeCustomModel,
   upsertMcpServer,
   removeMcpServer,
+  saveSessionNow,
+  flushSessionNow,
   replaceFiles,
   resetAll,
   MODES,
@@ -33,6 +35,8 @@ import {
   PROVIDER_COUNT,
   knownModelCtx,
   knownModelVision,
+  rememberModelCatalog,
+  catalogFor,
   hasModels,
   allModels,
   apiKeyForCurrent,
@@ -66,7 +70,7 @@ import {
 } from "./store.js";
 import { icon } from "./icons.js";
 import { isTextPath } from "./fs.js";
-import { isImagePath, imageMime } from "./image.js";
+import { isImagePath, imageMime, prepareThumb, prepareImage } from "./image.js";
 import { renderMarkdown, plainText } from "./markdown.js";
 import { availableToolNames } from "./tools.js";
 import {
@@ -80,6 +84,13 @@ import { runAgent, testConnection, testProvider, testModel, fetchModelList, spaw
 import { mcpDiscover } from "./mcp.js";
 import { downloadBase64 } from "./office.js";
 import { hudRender, hudPermissionGranted, nativeHudAvailable } from "./hud.js";
+import {
+  keepAliveStart,
+  keepAliveStop,
+  requestBatteryExemption,
+  openBatterySettings,
+  openAutoStartSettings,
+} from "./keep-alive.js";
 import { SAFETY_RULES } from "./safety.js";
 import {
   renderHome,
@@ -109,6 +120,7 @@ const ui = {
   testing: false,
   testResult: null,
   lastBuilt: null,
+  renderFrom: null, // 渲染窗口起点（消息下标）
   workspaceTab: "workspace",
   attachments: [],   // 待随消息发送的附件 [{path,name,size}]
   msgNodes: new Map(), // 消息 id -> DOM，供增量渲染复用
@@ -170,6 +182,57 @@ export function initUI() {
 
   initNativeBack();
   startHudLoop();
+  installLifecycleHooks();
+}
+
+/* ---------------- 生命周期钩子 ---------------- */
+
+/**
+ * 切后台 / 回前台的收尾。
+ *
+ * - 切后台：立刻把正在流式的内容落盘。Android 随时可能因为内存把进程回收，
+ *   之前只在运行结束才写盘，中途被杀就整段白跑。
+ * - 回前台：如果状态里还挂着"孤儿运行"（执行器随进程一起没了），
+ *   自动把它收尾成"已停止"，界面不会一直转圈，用户也能继续发消息。
+ */
+function installLifecycleHooks() {
+  window.addEventListener("dsh:flush", () => {
+    // 切后台这一刻进程随时可能被回收：必须立即落盘，不能等 1.2s 节流器
+    const s = activeSession();
+    if (s) flushSessionNow(s.id);
+    save(true);
+  });
+
+  window.addEventListener("dsh:resume", () => {
+    // 关键：只有"内存里已经没有执行器"才叫孤儿运行。
+    // 之前这里无条件把 running 状态的消息判为中断，导致——
+    // 任务其实好好地在跑（只是切后台时流式渲染被节流、肉眼看不到进度），
+    // 用户切回来却看到"上次运行被系统中断"，还把它停掉了。
+    // 这是"切后台任务就停"在应用侧的直接成因之一。
+    if (ui.run) {
+      // 任务还在：只是把界面重新拉起来，不动执行器
+      updateMessages();
+      renderAppbar();
+      return;
+    }
+    const orphan = orphanRunning();
+    if (orphan) {
+      orphan.status = "stopped";
+      orphan.error = "上次运行被系统中断（应用在后台被回收）。已保留已生成的内容。";
+      orphan.interrupted = true;
+      for (const t of orphan.tools || []) {
+        if (t.status === "running" || t.status === "waiting") t.status = "stopped";
+      }
+      const s = activeSession();
+      if (s) saveSessionNow(s.id);
+      save(true);
+      lastSendKind = "";
+      updateSendState();
+      updateMessages();
+      renderAppbar();
+      toast("上次运行被系统中断，已自动收尾", "err");
+    }
+  });
 }
 
 /* ---------------- Android 返回手势 ---------------- */
@@ -390,7 +453,7 @@ function renderChat(root, anchor = "bottom") {
         ${
           s && s.messages.length
             ? `<div class="messages" id="messages"></div>`
-            : `<div id="messages">${renderHome()}</div>`
+            : `<div class="messages messages--empty" id="messages">${renderHome()}</div>`
         }
         <button class="scroll-anchor" id="scroll-anchor" data-act="scroll-bottom" aria-label="回到底部">${icon("arrowDown", "icon--sm")}</button>
       </div>
@@ -398,6 +461,8 @@ function renderChat(root, anchor = "bottom") {
     </div>`;
 
   ui.msgNodes = new Map(); // DOM 是全新的，旧的节点引用作废
+  releaseThumbs($("#messages")); // 释放上一屏的图片内存
+  ui.renderFrom = Math.max(0, (s?.messages.length || 0) - RENDER_WINDOW);
 
   const scroller = $("#chat-scroll");
   scroller.addEventListener("scroll", () => {
@@ -664,7 +729,7 @@ function attachmentChips() {
     .map(
       (a, i) => `<span class="attach-chip" title="${esc(a.path)}">
         ${icon("file", "icon--xs")}
-        <span class="attach-chip__name" data-act="preview-attachment" data-path="${esc(a.path)}" data-name="${esc(a.name || a.path)}" title="点击预览">${esc(a.name || a.path)}</span>
+        <span class="attach-chip__name" data-act="preview-attachment" data-path="${esc(a.path)}" data-name="${esc(a.name || a.path)}" data-area="${esc(a.area || "workspace")}" title="点击预览">${esc(a.name || a.path)}</span>
         <span class="attach-chip__size">${attachSize(a.size)}</span>
         <button class="attach-chip__x" data-act="remove-attachment" data-index="${i}" aria-label="移除附件">${icon("x", "icon--xs")}</button>
       </span>`
@@ -681,17 +746,19 @@ function refreshAttachmentStrip() {
 }
 
 function addAttachment(item) {
-  if (!item?.path) return;
-  if (ui.attachments.some((a) => a.path === item.path)) {
+  if (!item?.path) return false;
+  const area = item.area === "library" ? "library" : "workspace";
+  if (ui.attachments.some((a) => a.path === item.path && (a.area || "workspace") === area)) {
     toast("这个文件已经在附件里了");
-    return;
+    return false;
   }
   if (ui.attachments.length >= ATTACH_MAX) {
     toast(`一条消息最多带 ${ATTACH_MAX} 个附件`, "err");
-    return;
+    return false;
   }
-  ui.attachments.push(item);
+  ui.attachments.push({ ...item, area });
   refreshAttachmentStrip();
+  return true;
 }
 
 /* ---------------- 消息增量渲染 ----------------
@@ -702,14 +769,22 @@ function addAttachment(item) {
 
 const BODY_FRAME_MS = 70; // 流式中正文最短重排间隔（长文本自动放宽）
 
+/**
+ * 一次最多渲染多少条消息。
+ * 超过的部分折叠成"展开更早的 N 条消息"，
+ * 避免长会话把上千个 DOM 节点（含缩略图与工具卡片）全塞进 WebView 内存。
+ */
+const RENDER_WINDOW = 60;
+
 function attachmentChipHtml(a) {
   const name = a.name || a.path;
   const size = attachSize(a.size);
+  const area = a.area === "library" ? "library" : "workspace";
   // 注意：气泡是 white-space: pre-wrap，模板里的换行会被当成可见空行撑高卡片，必须写成一行
   if (isImagePath(a.path)) {
-    return `<button class="msg__thumb" data-act="preview-attachment" data-path="${esc(a.path)}" data-name="${esc(name)}" aria-label="查看图片 ${esc(name)}"><img data-thumb="${esc(a.path)}" alt="${esc(name)}" loading="lazy"><span class="msg__thumb-bar"><span class="msg__file-name">${esc(name)}</span><span class="msg__file-size">${size}</span></span></button>`;
+    return `<button class="msg__thumb" data-act="preview-attachment" data-path="${esc(a.path)}" data-name="${esc(name)}" data-area="${area}" aria-label="查看图片 ${esc(name)}"><img data-thumb="${esc(a.path)}" data-area="${area}" alt="${esc(name)}" loading="lazy"><span class="msg__thumb-bar"><span class="msg__file-name">${esc(name)}</span><span class="msg__file-size">${size}</span></span></button>`;
   }
-  return `<button class="msg__file" data-act="preview-attachment" data-path="${esc(a.path)}" data-name="${esc(name)}" aria-label="查看文件 ${esc(name)}">${icon("file", "icon--xs")}<span class="msg__file-name">${esc(name)}</span><span class="msg__file-size">${size}</span></button>`;
+  return `<button class="msg__file" data-act="preview-attachment" data-path="${esc(a.path)}" data-name="${esc(name)}" data-area="${area}" aria-label="查看文件 ${esc(name)}">${icon("file", "icon--xs")}<span class="msg__file-name">${esc(name)}</span><span class="msg__file-size">${size}</span></button>`;
 }
 
 function userMsgHtml(m) {
@@ -719,19 +794,70 @@ function userMsgHtml(m) {
   }</div></div>`;
 }
 
-/** 缩略图懒加载：气泡里的 img[data-thumb] 读工作区原图填 src。 */
-async function hydrateThumbs(root) {
+/**
+ * 缩略图懒加载。
+ *
+ * 之前直接用原图 base64 当 src，一张手机截图就有 2–4 MB 常驻在 DOM 里；
+ * 加上长会话的全量消息节点，WebView 渲染进程很容易被系统 OOM 杀掉
+ * （表现为"执行任务时应用突然退到桌面"）。
+ *
+ * 现在改为：
+ *   1) 压到长边 320px 的 JPEG 再放进 <img>，内存降一到两个数量级；
+ *   2) 用 IntersectionObserver 只在滚进视口时才加载；
+ *   3) 换会话 / 重渲染时主动释放旧图，避免历史图无限累积。
+ */
+const thumbObserver =
+  typeof IntersectionObserver === "function"
+    ? new IntersectionObserver(
+        (entries) => {
+          for (const e of entries) {
+            if (!e.isIntersecting) continue;
+            const img = e.target;
+            thumbObserver.unobserve(img);
+            loadThumb(img);
+          }
+        },
+        { rootMargin: "200px" }
+      )
+    : null;
+
+async function loadThumb(img) {
+  const path = img.dataset.thumb;
+  if (!path) return;
+  const area = img.dataset.area === "library" ? "library" : "workspace";
+  try {
+    const doc = await readDoc(area, path);
+    if (!doc) return;
+    const mime = doc.mime || imageMime(path);
+    let src = `data:${mime};base64,${doc.content}`;
+    // 压小：失败也不影响展示，退回原图
+    try {
+      const thumb = await prepareThumb(doc.content, mime);
+      if (thumb?.dataUrl) src = thumb.dataUrl;
+    } catch {
+      /* 保留原图 */
+    }
+    if (img.isConnected) img.src = src;
+  } catch {
+    img.closest(".msg__thumb")?.classList.add("msg__thumb--missing");
+  }
+}
+
+function hydrateThumbs(root) {
   if (!root) return;
   for (const img of root.querySelectorAll("img[data-thumb]:not([data-loaded])")) {
     img.dataset.loaded = "1";
-    const path = img.dataset.thumb;
-    try {
-      const doc = await readDoc("workspace", path);
-      if (!doc) continue;
-      img.src = `data:${doc.mime || imageMime(path)};base64,${doc.content}`;
-    } catch {
-      img.closest(".msg__thumb")?.classList.add("msg__thumb--missing");
-    }
+    if (thumbObserver) thumbObserver.observe(img);
+    else loadThumb(img);
+  }
+}
+
+/** 释放当前气泡里的图片内存（切换会话、滚动离开时调用）。 */
+function releaseThumbs(root) {
+  if (!root) return;
+  for (const img of root.querySelectorAll("img[data-thumb]")) {
+    if (img.src && img.src.startsWith("data:")) img.removeAttribute("src");
+    img.dataset.loaded = "";
   }
 }
 
@@ -751,7 +877,11 @@ function headHtml(m, running) {
     <span class="msg__name">DSH</span>
     <span class="msg__stamp">${fmtTime(m.ts)}</span>
     ${running ? `<span class="msg__stamp mono" style="color:var(--accent-bright);margin-left:auto">STEP ${m.steps || 1}</span>` : ""}
-    ${m.status === "stopped" ? `<span class="tag" style="margin-left:auto">已停止</span>` : ""}`;
+    ${
+      m.status === "stopped"
+        ? `<span class="tag" style="margin-left:auto">${m.interrupted ? "已被系统中断" : "已停止"}</span>`
+        : ""
+    }`;
 }
 
 function extraHtml(m) {
@@ -774,16 +904,82 @@ function extraHtml(m) {
   }`;
 }
 
-function reasoningHtml(m, running, open) {
-  const show = m.reasoning && (state.settings.showReasoning || running);
-  if (!show) return "";
-  return `<div class="reasoning" data-open="${open}">
+/* 思考区采用「外壳一次建好 + 之后只增量改文本」的渲染方式。
+   早先的做法是把整段思考过程拼成 HTML 塞进 innerHTML，
+   深度思考流式输出时每个 delta 都会重建整棵子树，
+   展开状态下的 .reasoning__text 因此反复销毁重建，
+   它的 fadeIn 动画也跟着不停重播 —— 表现就是「展开思考过程时频闪」。
+   这里把外壳与内容彻底分开：外壳只在首次出现时创建，
+   之后只改 data-open、标题文字和 .reasoning__text 的文本节点。 */
+
+/** 思考区标题：运行中显示「正在思考…」，结束后显示实际思考耗时。 */
+function reasoningLabel(m, running) {
+  if (running) return "正在思考…";
+  if (m.reasoningMs) return `已思考 ${fmtClock(m.reasoningMs)}`;
+  return "思考过程";
+}
+
+/** 思考区外壳。内容留空，由 patchReasoning 增量填。 */
+function reasoningShell(m, open) {
+  return `<div class="reasoning" data-open="${open ? "true" : "false"}">
     <button class="reasoning__toggle" data-act="toggle-reason" data-id="${m.id}">
       ${icon("chevron", "icon--xs reasoning__chev")}
-      <span>${m.reasoningMs ? `已思考 ${fmtClock(m.reasoningMs)}` : running ? "正在思考…" : "思考过程"}</span>
+      <span class="reasoning__label"></span>
     </button>
-    <div class="reasoning__text">${esc(m.reasoning)}</div>
+    <div class="reasoning__text"></div>
   </div>`;
+}
+
+/* 增量更新思考区。
+   关键约束：外壳 .reasoning 一旦建好就不能被替换。
+   只要 .reasoning__text 这个节点还在，展开状态下的 fadeIn 动画就不会重播；
+   反之若整棵子树被重建，动画会随新节点一起从头播放，
+   深度思考流式输出时每个 delta 重建一次 —— 视觉上就是持续频闪。 */
+function patchReasoning(el, m, running, open) {
+  const slot = el.querySelector(":scope > .reasoning-slot");
+  if (!slot) return;
+
+  const show = !!(m.reasoning && (state.settings.showReasoning || running));
+  let box = slot.querySelector(":scope > .reasoning");
+  if (!show) {
+    // 不该显示时整块移除，避免残留空壳占位
+    if (box) {
+      box.remove();
+    }
+    return;
+  }
+
+  if (!box) {
+    slot.innerHTML = reasoningShell(m, open);
+    box = slot.firstElementChild;
+  }
+
+  // 展开态：只在真正变化时改属性。改属性才会重播淡入动画，属于用户主动操作
+  const openStr = open ? "true" : "false";
+  if (box.dataset.open !== openStr) box.dataset.open = openStr;
+
+  // 标题
+  const label = box.querySelector(".reasoning__label");
+  const want = reasoningLabel(m, running);
+  if (label.textContent !== want) label.textContent = want;
+
+  // 正文：只往末尾追加增量，不整段替换。
+  // 整段替换会让浏览器重新排版整块文字，展开状态下肉眼能看出抖动。
+  const textEl = box.querySelector(".reasoning__text");
+  let node = textEl._reasonNode;
+  if (!node || node.parentNode !== textEl) {
+    textEl.textContent = "";
+    node = document.createTextNode("");
+    textEl.appendChild(node);
+    textEl._reasonNode = node;
+  }
+  const shown = node.nodeValue || "";
+  const full = String(m.reasoning || "");
+  if (full.length > shown.length && full.startsWith(shown)) {
+    node.appendData(full.slice(shown.length));
+  } else if (full !== shown) {
+    node.nodeValue = full;
+  }
 }
 
 function bodyHtml(m, running) {
@@ -793,6 +989,22 @@ function bodyHtml(m, running) {
 }
 
 function tailHtml(m, done, tools) {
+  // 被系统中断：不当作错误处理，也不出"测试连接"这类误导按钮，
+  // 只说明发生了什么，并给一个"继续"入口。
+  if (m.interrupted) {
+    const note = `<div class="msg__notice">${icon("alert", "icon--xs")} ${esc(m.error || "本次运行被系统中断。")}</div>`;
+    return `${note}${
+      done && (m.duration || tools.length)
+        ? `<button class="runmeta" data-act="trace" data-id="${m.id}" style="background:none;border:0;width:100%;text-align:left;cursor:pointer">
+             <span class="runmeta__item">${icon("clock", "icon--xs")}<b>${fmtClock(m.duration)}</b></span>
+             <span class="runmeta__item"><b>${tools.length}</b> 次工具</span>
+             <span class="runmeta__item"><b>${fmtTokens(m.tokens)}</b> tok</span>
+             <span class="runmeta__item" style="color:var(--accent-bright)">轨迹 ${icon("chevron", "icon--xs")}</span>
+           </button>`
+        : ""
+    }`;
+  }
+
   const err = m.error
     ? `<div class="msg__error">${icon("alert", "icon--sm")}<span>${esc(m.error)}</span></div>
        <div class="msg__error-actions">
@@ -906,12 +1118,7 @@ function patchAssistant(el, m) {
     el.dataset.sigExtra = extra;
   }
 
-  const reason = reasoningHtml(m, running, open);
-  if (el.dataset.sigReason !== reason) {
-    el.querySelector(":scope > .reasoning-slot").innerHTML = reason;
-    el.dataset.sigReason = reason;
-  }
-
+  patchReasoning(el, m, running, open);
   patchTools(el.querySelector(":scope > .tools-slot"), m.tools || []);
 
   // 正文是流式里变化最频繁的部分：按时间片节流，避免每个 token 都重排 Markdown
@@ -958,9 +1165,22 @@ function updateMessages() {
   if (!s || !box) return;
 
   if (!s.messages.length) {
+    // 空会话：渲染首页空态。
+    // 注意容器必须是 .messages（带 padding/gap 的消息布局），
+    // 否则一旦有消息进来，容器的布局规则会与首页空态对不上。
+    box.className = "messages messages--empty";
     box.innerHTML = renderHome();
     ui.msgNodes = new Map();
     return;
+  }
+
+  // 有消息了：把首页空态整块移除。
+  // 之前只是往容器里"追加"消息节点，首页空态（.home）会残留在消息列表下方，
+  // 表现为"发完一句话底下空出整整一屏，底部不是最新消息"。
+  if (box.classList.contains("messages--empty")) {
+    box.className = "messages";
+    box.innerHTML = "";
+    ui.msgNodes = new Map();
   }
 
   const nearBottom = ui.pinned;
@@ -982,7 +1202,32 @@ function updateMessages() {
   const seen = new Set();
   let prev = head;
 
-  for (const m of s.messages) {
+  // 渲染窗口：只渲染最近 RENDER_WINDOW 条消息。
+  // 长会话把上百条消息（含工具卡片、Markdown、缩略图）全塞进 DOM，
+  // 是渲染进程内存爆炸的另一半原因。这里默认只渲染尾部，
+  // 更早的内容折叠成一行提示，需要时点开。
+  const total = s.messages.length;
+  // renderFrom 是用户手动展开到的位置；没有手动展开时只留尾部窗口。
+  // 注意要允许 renderFrom 继续往前扩（load-earlier），所以这里不能用 total-RENDER_WINDOW 钳制。
+  const from = Math.max(0, Math.min(ui.renderFrom ?? total - RENDER_WINDOW, total - 1));
+  const hidden = from;
+
+  if (hidden > 0) {
+    let more = box.querySelector(":scope > .chat__more");
+    if (!more) {
+      more = document.createElement("button");
+      more.className = "chat__more";
+      more.dataset.act = "load-earlier";
+      head.insertAdjacentElement("afterend", more);
+    }
+    more.textContent = `展开更早的 ${hidden} 条消息`;
+    more.hidden = false;
+    prev = more;
+  } else {
+    box.querySelector(":scope > .chat__more")?.remove();
+  }
+
+  for (const m of s.messages.slice(from)) {
     seen.add(m.id);
     let el = nodes.get(m.id);
     if (!el || el.parentNode !== box) {
@@ -1119,11 +1364,29 @@ function autoGrow() {
 }
 
 let lastSendKind = "";
+
+/**
+ * 是否有"孤儿运行"：状态里标记为 running，但内存里已经没有对应的执行器。
+ *
+ * 判据必须是"消息状态是 running **且** 当前没有执行器"，
+ * 只看消息状态会把正在正常跑的任务误判成孤儿——
+ * 切后台时流式渲染被节流，用户看不到进度，以为死了；
+ * 回到前台又把它当孤儿收尾，任务就真的停了。
+ */
+function orphanRunning() {
+  if (ui.run) return null; // 执行器还在，任务活着
+  const s = activeSession();
+  if (!s) return null;
+  const m = [...(s.messages || [])].reverse().find((x) => x.status === "running");
+  return m || null;
+}
+
 function updateSendState() {
   const btn = $("#send-btn");
   if (!btn) return;
   // 以输入框实时内容判断，避免镜像缓存与 DOM 脱节导致按钮永远禁用
-  const kind = ui.run ? "stop" : composerValue().trim() || ui.attachments.length ? "send" : "off";
+  const orphan = orphanRunning();
+  const kind = ui.run || orphan ? "stop" : composerValue().trim() || ui.attachments.length ? "send" : "off";
   if (kind === lastSendKind) return; // 每次按键不重建按钮 DOM
   lastSendKind = kind;
   if (kind === "stop") {
@@ -1154,12 +1417,16 @@ async function sendMessage(text) {
   const raw = String(text || "").trim();
   const attachments = ui.attachments.slice();
   if ((!raw && !attachments.length) || ui.run) return;
+  // 孤儿运行（上次进程被回收，状态还停在 running）：先自动收尾再发
+  if (orphanRunning()) {
+    stopRunAction();
+  }
   const content = raw || "请看这些附件。";
 
   // 图片不会被发送时先提醒，避免"以为发了、模型其实没看到"
   if (attachments.some((a) => /\.(png|jpe?g|webp|gif|bmp)$/i.test(a.path))) {
     const active = currentModel();
-    const vision = active ? (active.vision ?? knownModelVision(modelApiId(active))) : false;
+    const vision = active ? active.vision !== false : false;
     if (!vision) toast("当前模型未开启「图片输入」，图片不会发送", "err");
   }
 
@@ -1195,8 +1462,15 @@ async function sendMessage(text) {
   ui.attachments = [];
   refreshAttachmentStrip();
   ui.pinned = true;
-  if (ui.lastBuilt === s.id && $("#messages")) {
+  // 增量插入只在"已经有消息的会话"里安全：
+  // 空会话的容器里还躺着首页空态（.home），往上追加消息会让首页残留在下方，
+  // 表现为"发完一句底下空出整整一屏"。所以空会话一律整页重建。
+  const box = $("#messages");
+  const wasEmpty = !box || !!box.querySelector(".home");
+  if (ui.lastBuilt === s.id && box && !wasEmpty) {
     // 已有会话：只把两条新消息插进去，别把整段历史重建一遍
+    // 新消息进来后，渲染窗口回到"最近 N 条"，避免展开态把新内容挤出窗口
+    ui.renderFrom = Math.max(0, s.messages.length - RENDER_WINDOW);
     updateMessages();
     const sc = $("#chat-scroll");
     if (sc) sc.scrollTop = sc.scrollHeight;
@@ -1211,6 +1485,9 @@ async function sendMessage(text) {
   updateSendState();
   hudSync();
   hudCue("start"); // 小球跳一下，表示开工
+  // 任务期间拉起前台服务：用户切到别的应用时系统不会随手回收我们的进程，
+  // 正在跑的这次运行不会"莫名其妙断在半路"
+  keepAliveStart();
 
   try {
     await runAgent({
@@ -1222,6 +1499,10 @@ async function sendMessage(text) {
       onChange: () => {
         if (state.activeSessionId === ui.run?.sessionId) scheduleMessages();
         hudSync();
+        // 流式期间持续落盘（内部有 1.2s 节流）：
+        // 之前只在运行结束时才写盘，进程被系统杀掉时整段输出全丢，
+        // 重开后只剩一个空壳消息，这就是"记录坏死"的一部分。
+        saveSessionNow(s.id);
       },
       requestApproval,
       spawnSubagent: (task) => spawnSubagentOnce(task, controller.signal),
@@ -1232,6 +1513,9 @@ async function sendMessage(text) {
   } finally {
     ui.run = null;
     updateSendState();
+    keepAliveStop();
+    saveSessionNow(s.id);
+    save(true);
     if (msg.status === "done" && !msg.error) {
       state.stats.runs += 1;
       state.stats.tools += msg.tools.length;
@@ -1257,15 +1541,38 @@ async function sendMessage(text) {
 }
 
 function stopRunAction() {
-  if (!ui.run) return;
-  ui.run.controller.abort();
-  ui.run = null;
-  updateSendState();
-  toast("已停止本次运行");
-  setTimeout(() => {
+  // 正常情况：内存里有执行器，直接 abort
+  if (ui.run) {
+    ui.run.controller.abort();
+    ui.run = null;
+    keepAliveStop();
+    updateSendState();
+    toast("已停止本次运行");
+    setTimeout(() => {
+      updateMessages();
+      renderAppbar();
+    }, 80);
+    return;
+  }
+  // 孤儿运行：执行器随进程一起没了（被系统回收 / 崩溃后重开），
+  // 但消息状态还停在 running——此时必须能手动收尾，否则永远转圈、也永远发不出新消息。
+  const orphan = orphanRunning();
+  if (orphan) {
+    orphan.status = "stopped";
+    orphan.error = "本次运行已被手动终止（应用之前被系统回收或异常退出）。";
+    orphan.interrupted = true;
+    for (const t of orphan.tools || []) {
+      if (t.status === "running" || t.status === "waiting") t.status = "stopped";
+    }
+    const s = activeSession();
+    if (s) saveSessionNow(s.id);
+    save(true);
+    lastSendKind = "";
+    updateSendState();
     updateMessages();
     renderAppbar();
-  }, 80);
+    toast("已清理中断的运行", "ok");
+  }
 }
 
 /* ---------------- 审批 ---------------- */
@@ -1316,7 +1623,7 @@ function closeImageViewer() {
   ui.imageViewer = false;
 }
 
-function openImageViewer(path, name) {
+function openImageViewer(path, name, area = "workspace") {
   closeImageViewer();
   ui.imageViewer = true;
   const el = document.createElement("div");
@@ -1333,8 +1640,8 @@ function openImageViewer(path, name) {
     <div class="img-viewer__foot">
       <span class="img-viewer__meta" id="img-meta">${esc(path)}</span>
       <div class="img-viewer__actions">
-        <button class="btn btn--ghost btn--sm" data-act="export-file" data-area="workspace" data-path="${esc(path)}">${icon("download", "icon--xs")} 保存到手机</button>
-        <button class="btn btn--ghost btn--sm" data-act="open-file" data-area="workspace" data-path="${esc(path)}">${icon("file", "icon--xs")} 文件信息</button>
+        <button class="btn btn--ghost btn--sm" data-act="export-file" data-area="${esc(area)}" data-path="${esc(path)}">${icon("download", "icon--xs")} 保存到手机</button>
+        <button class="btn btn--ghost btn--sm" data-act="open-file" data-area="${esc(area)}" data-path="${esc(path)}">${icon("file", "icon--xs")} 文件信息</button>
       </div>
     </div>`;
   els.app.appendChild(el);
@@ -1348,7 +1655,7 @@ function openImageViewer(path, name) {
     else if (e.target.classList?.contains("img-viewer__img")) e.target.classList.toggle("is-zoom");
   });
 
-  readDoc("workspace", path)
+  readDoc(area, path)
     .then((doc) => {
       const img = new Image();
       img.className = "img-viewer__img";
@@ -1361,7 +1668,17 @@ function openImageViewer(path, name) {
       img.onerror = () => {
         stage.innerHTML = `<div class="img-viewer__hint">这张图片无法显示（可能是 WebView 不支持的格式）</div>`;
       };
-      img.src = `data:${doc.mime || imageMime(path)};base64,${doc.content}`;
+      // 预览用压缩版（长边 1568px、约 1.2MB）而不是原始 base64：
+      // 原图 4MB 的 data URL 常驻内存，很容易把 WebView 渲染进程顶爆。
+      // 用户点"保存到手机"拿到的仍是原图。
+      const mime = doc.mime || imageMime(path);
+      prepareImage(doc.content, mime)
+        .then((t) => {
+          img.src = t?.dataUrl || `data:${mime};base64,${doc.content}`;
+        })
+        .catch(() => {
+          img.src = `data:${mime};base64,${doc.content}`;
+        });
     })
     .catch(() => {
       stage.innerHTML = `<div class="img-viewer__hint">读取失败：文件可能已被删除</div>`;
@@ -1603,23 +1920,38 @@ function modelSheet() {
 }
 
 function modelListSheet() {
-  return sheetFrame({
-    title: "选择模型",
-    desc: "切换后回到上一页；每行的状态来自最近一次请求或测试。",
-    body: allModels().map(
-      (m) => `
-      <button class="card card--interactive" data-act="set-model" data-value="${m.id}" style="margin-bottom:7px;${m.id === state.settings.model ? "border-color:var(--accent-line);background:var(--accent-soft)" : ""}">
+  // 顺序与「设置 → 模型管理」完全一致：按厂牌分组，厂牌顺序同设置里的大类顺序。
+  const groups = groupModelsByProvider(allModels());
+  const active = state.settings.model;
+
+  const row = (m) => `
+      <button class="card card--interactive" data-act="set-model" data-value="${m.id}" style="margin-bottom:7px;${m.id === active ? "border-color:var(--accent-line);background:var(--accent-soft)" : ""}">
         <div class="card__row">
-          <span class="avatar ${m.id === state.settings.model ? "avatar--accent" : ""}" style="font-size:9px">${esc(m.provider.slice(0, 3).toUpperCase())}</span>
+          <span class="avatar ${m.id === active ? "avatar--accent" : ""}" style="font-size:9px">${esc(PROVIDER_META[m.providerKey || "custom"]?.short || "CUS")}</span>
           <div style="flex:1;min-width:0">
             <div class="card__title">${esc(m.label)} ${m.tag ? `<span class="tag">${m.tag}</span>` : ""}</div>
             <div class="card__sub">${esc(m.provider)} · ${fmtContext(m.ctx)} · ${esc(hostOf(modelBaseUrl(m)))}</div>
             <div style="margin-top:4px">${statusPill(m.id, { compact: true })}</div>
           </div>
-          ${m.id === state.settings.model ? icon("check", "icon--sm") : icon("chevron", "icon--sm")}
+          ${m.id === active ? icon("check", "icon--sm") : icon("chevron", "icon--sm")}
         </div>
-      </button>`
-    ).join(""),
+      </button>`;
+
+  return sheetFrame({
+    title: "选择模型",
+    desc: "按厂牌分组，顺序与设置里一致；切换后回到上一页，每行的状态来自最近一次请求或测试。",
+    body: groups
+      .map(
+        (g) => `
+      <div class="model-group">
+        <div class="model-group__head">
+          <span class="eyebrow">${esc(g.meta.name)}</span>
+          <span class="eyebrow">${g.models.length} 个</span>
+        </div>
+        ${g.models.map(row).join("")}
+      </div>`
+      )
+      .join(""),
   });
 }
 
@@ -1649,6 +1981,7 @@ function applyModelSelection(value) {
   renderAppbar();
   if (ui.view === "chat") renderMain(true);
   if (ui.view === "settings") renderMain(true);
+  verifyModel(model.id);
   return model;
 }
 
@@ -1676,6 +2009,40 @@ const PROVIDER_META = Object.fromEntries(
     },
   ])
 );
+
+/* 厂牌（大类）的全局顺序。
+   设置里的「账号与服务」「模型管理」以及会话上方的「选择模型」都用这一份顺序，
+   三处看到的厂牌排列完全一致，用户在任意入口切换模型都不会重新找位置。 */
+const PROVIDER_ORDER = Object.keys(PROVIDERS);
+
+/** 厂牌在顺序表里的下标；不在表内（历史数据里的未知厂牌）排到最后。 */
+function providerRank(slot) {
+  const i = PROVIDER_ORDER.indexOf(slot);
+  return i < 0 ? PROVIDER_ORDER.length : i;
+}
+
+/**
+ * 把模型列表按厂牌分组，组内按 model id 排。
+ * 返回 [{ slot, meta, models }]，组序 = PROVIDER_ORDER（当前厂牌同样按此表定位，不置顶）。
+ * 「设置 → 模型管理」与「会话上方 → 选择模型」共用，保证顺序一致。
+ */
+function groupModelsByProvider(list) {
+  const groups = new Map();
+  (list || []).forEach((m) => {
+    const slot = m.providerKey || "custom";
+    if (!groups.has(slot)) groups.set(slot, []);
+    groups.get(slot).push(m);
+  });
+  return [...groups.keys()]
+    .sort((a, b) => providerRank(a) - providerRank(b))
+    .map((slot) => ({
+      slot,
+      meta: PROVIDER_META[slot] || PROVIDER_META.custom,
+      models: [...groups.get(slot)].sort((a, b) =>
+        String(modelApiId(a)).localeCompare(String(modelApiId(b)), "en", { numeric: true })
+      ),
+    }));
+}
 
 function fmtDate(ms) {
   try {
@@ -1819,11 +2186,54 @@ function modelManageRow(m) {
 
 function modelsSheet() {
   const list = allModels();
+  const cur = currentModel();
+  const curSlot = cur ? cur.providerKey || "custom" : "deepseek";
+
+  // 分组顺序与「会话上方 → 选择模型」一致：都用 PROVIDER_ORDER（大类顺序）。
+  // 组内仍然把当前模型顶到第一位，方便直接看到自己在用哪个。
+  let groups = groupModelsByProvider(list);
+  if (!groups.length) groups = [{ slot: curSlot, meta: PROVIDER_META[curSlot] || PROVIDER_META.custom, models: [] }];
+
+  const sortRows = (arr) =>
+    [...arr].sort((a, b) => {
+      if (a.id === cur?.id) return -1;
+      if (b.id === cur?.id) return 1;
+      return String(modelApiId(a)).localeCompare(String(modelApiId(b)), "en", { numeric: true });
+    });
+
+  const html = groups
+    .map((g) => {
+      const k = g.slot;
+      const meta = g.meta;
+      const rows = sortRows(g.models);
+      const base = String((rows[0] && modelBaseUrl(rows[0])) || meta.baseUrl || "").replace(/\/+$/, "");
+      const catalog = catalogFor(k, base);
+      const pool = (catalog.length ? catalog : (meta.suggest || []).map((m) => (typeof m === "string" ? m : m.id))).filter(Boolean);
+      const have = new Set(rows.map((m) => modelApiId(m)));
+      const rest = pool.filter((id) => !have.has(id)).slice(0, 10);
+      return `
+        <div class="model-group">
+          <div class="model-group__head">
+            <span class="eyebrow">${esc(meta.name)}</span>
+            <span class="eyebrow">${rows.length} 个已添加${catalog.length ? " · 端点清单" : ""}</span>
+          </div>
+          ${rows.length ? rows.map(modelManageRow).join("") : `<p class="field__hint">这个厂还没有模型，点下面的 ＋ 直接加入。</p>`}
+          ${
+            rest.length
+              ? `<div class="cm-model-list model-group__rest">
+                   ${rest.map((id) => `<button class="chip" data-act="use-catalog-model" data-value="${esc(id)}" data-slot="${esc(k)}">＋ ${esc(id)}${knownModelCtx(id) ? ` · ${fmtContext(knownModelCtx(id))}` : ""}</button>`).join("")}
+                 </div>`
+              : ""
+          }
+        </div>`;
+    })
+    .join("");
+
   return sheetFrame({
     title: "模型管理",
-    desc: "模型由你自己添加；供应方信息已备好，选一下就能预填端点。",
+    desc: "按厂牌分组：点已添加的即切换，点 ＋ 即加入并切换；切换后会自动测一次连接。",
     body: `
-      ${list.length ? list.map(modelManageRow).join("") : `<div class="empty-line"><b>还没有模型</b>点下方按钮添加第一个；选供应方后端点与常用模型 ID 会自动预填。</div>`}
+      ${html}
       <button class="btn btn--primary btn--block" style="margin-top:12px" data-act="new-custom-model">${icon("plus", "icon--xs")} 添加模型</button>
       <p class="field__hint" style="margin-top:10px;line-height:1.7">只支持 OpenAI 兼容协议；每个模型可单独改上下文、端点与采样参数，点闪电测试连接。</p>`,
   });
@@ -1833,8 +2243,8 @@ function modelsSheet() {
 function modelParamsSheet(data = {}) {
   const isNew = !data.id;
   const existing = isNew ? null : allModels().find((m) => m.id === data.id);
-  // 未显式设置时按已知模型推断（GLM-5.3-Flash / GPT-4o / Qwen-VL 等默认开启）
-  const visionOn = existing ? (existing.vision ?? knownModelVision(modelApiId(existing))) : false;
+  // 新建默认开启；已有模型只有显式关过才关
+  const visionOn = existing ? existing.vision !== false : true;
   const isCustomEntry = !!existing;
   const defaults = existing?.defaults;
   const temp = typeof existing?.temperature === "number" ? existing.temperature : "";
@@ -1874,6 +2284,12 @@ function modelParamsSheet(data = {}) {
         }
       </div>
 
+      <div class="field">
+        <label class="field__label" for="cm-key">API Key</label>
+        <input class="input mono" id="cm-key" type="password" value="${esc(keyOf(slot))}" placeholder="粘贴 Key，自动保存并拉取可用模型" autocomplete="off" spellcheck="false">
+        <p class="field__hint">只保存在本机。同一服务的模型共用一个 Key，填一次就够。</p>
+      </div>
+
       <div class="cm-suggest" id="cm-suggest">
         ${suggest.map(suggestChip).join("")}
       </div>
@@ -1884,13 +2300,9 @@ function modelParamsSheet(data = {}) {
       </div>
       <div class="field">
         <label class="field__label" for="cm-model">模型 ID</label>
-        <input class="input mono" id="cm-model" value="${esc(existing?.apiModel || "")}" placeholder="${esc(typeof suggest[0] === "string" ? suggest[0] : suggest[0]?.id || "gpt-4.1-mini")}" spellcheck="false">
-        <p class="field__hint">会原样放进请求体的 <code>model</code> 字段；填好端点与 Key 后可自动获取端点提供的模型。</p>
-        <div class="model-fetch">
-          <button class="btn btn--ghost btn--sm" data-act="fetch-models">${icon("refresh", "icon--xs")} 获取此端点的可用模型</button>
-          <span class="eyebrow" id="cm-models-count"></span>
-        </div>
-        <div id="cm-models" class="cm-models"></div>
+        <input class="input mono" id="cm-model" value="${esc(existing?.apiModel || "")}" placeholder="${esc(typeof suggest[0] === "string" ? suggest[0] : suggest[0]?.id || "从下方列表点一个")}" spellcheck="false">
+        <p class="field__hint">不用记 ID：填好 Key 会自动列出可用模型，点一下就填好并切换。</p>
+        <div id="cm-models" class="cm-models"><p class="field__hint">填入 Key 后自动获取；也可以直接点上方「常用模型」。</p></div>
       </div>
       <div class="field">
         <label class="field__label" for="cm-base">Base URL</label>
@@ -1922,10 +2334,10 @@ function modelParamsSheet(data = {}) {
       </div>
       <div class="settings__row" style="padding:4px 0 10px">
         <div class="settings__row-main">
-          <div class="settings__row-title">支持 reasoning_effort</div>
-          <div class="settings__row-sub">只有服务端明确支持时才透传推理强度</div>
+          <div class="settings__row-title">透传推理强度</div>
+          <div class="settings__row-sub">默认开启；端点拒绝 reasoning_effort 时会自动关闭</div>
         </div>
-        <button class="switch" role="switch" aria-checked="${!!existing?.supportsEffort}" aria-label="支持 reasoning_effort" data-act="toggle-cm-effort" data-toggle="cm-effort"></button>
+        <button class="switch" role="switch" aria-checked="${existing ? existing.supportsEffort !== false : true}" aria-label="透传推理强度" data-act="toggle-cm-effort" data-toggle="cm-effort"></button>
       </div>
       <div class="settings__row" style="padding:0 0 10px">
         <div class="settings__row-main">
@@ -2081,23 +2493,42 @@ function commandSheet() {
 }
 
 function attachSheet() {
-  const files = listFiles();
+  const lib = listLibrary();
   const busy = !!ui.importingFiles;
+  const picked = ui.attachments;
   return sheetFrame({
     title: "添加文件",
-    desc: "从手机选任意文件，或挑工作区里已有的。纯文本直接读给模型；图片在支持视觉的模型上会按图片发送；PDF / Office 只放进工作区，由 Agent 用工具处理。",
+    desc: "从手机选，或从资料库里挑已有的。选好直接进这条消息的附件，不再经工作区转一手。",
     body: `
       <button class="btn btn--primary btn--block" data-act="pick-phone-files" ${busy ? "disabled" : ""}>
         ${icon("download", "icon--sm")} ${busy ? "正在导入…" : "从手机选择文件"}
       </button>
-      <p class="field__hint" style="margin:8px 0 16px">文件复制到工作区 <code>uploads/</code>，之后还能在工作区里继续引用。</p>
+      <p class="field__hint" style="margin:8px 0 16px">
+        纯文本直接读给模型；图片在支持视觉的模型上会按图片发送；PDF / Office 只随消息附上，由 Agent 用工具处理。
+      </p>
 
-      <div class="section-label">工作区文件</div>
       ${
-        files.length
-          ? files
+             picked.length
+               ? `<div class="section-label">已选 ${picked.length} 个</div>
+                  ${picked
+                    .map(
+                      (a, i) => `<div class="file-row">
+                        <span class="fileicon">${esc((a.name || a.path).split(".").pop()?.slice(0, 3).toUpperCase() || "FILE")}</span>
+                        <span class="file-row__name">${esc(a.name || a.path)}</span>
+                        <span class="file-row__meta">${a.area === "library" ? "资料库 · " : ""}${attachSize(a.size)}</span>
+                        <button class="attach-chip__x" data-act="remove-attachment" data-index="${i}" aria-label="移除">${icon("x", "icon--xs")}</button>
+                      </div>`
+                    )
+                    .join("")}`
+               : ""
+           }
+
+      <div class="section-label">资料库</div>
+      ${
+        lib.length
+          ? lib
               .map(
-                (f) => `<button class="file-row" data-act="attach-file" data-path="${esc(f.path)}">
+                (f) => `<button class="file-row" data-act="attach-file" data-area="library" data-path="${esc(f.path)}">
                   <span class="fileicon">${esc((f.path.split(".").pop() || "").slice(0, 3).toUpperCase())}</span>
                   <span class="file-row__name">${esc(f.path)}</span>
                   <span class="file-row__meta">${attachSize(f.size)}</span>
@@ -2105,12 +2536,7 @@ function attachSheet() {
                 </button>`
               )
               .join("")
-          : `<div class="empty-line">工作区还没有文件<br>点上面从手机选一个</div>`
-      }
-      ${
-        ui.attachments.length
-          ? `<p class="field__hint" style="margin-top:14px">已选 ${ui.attachments.length} 个附件，最多 ${ATTACH_MAX} 个。</p>`
-          : ""
+          : `<div class="empty-line">资料库还没有文件<br>去「工作区 → 资料库」导入，或让 Agent 存入</div>`
       }
     `,
   });
@@ -2606,6 +3032,14 @@ function bindEvents() {
   els.app.addEventListener("change", (e) => {
     const t = e.target;
 
+    // 表单内直接填 Key：存下并立刻拉取可用模型
+    if (t.id === "cm-key") {
+      const slot = $("#cm-provider")?.value || "custom";
+      setSettings({ keys: { ...state.settings.keys, [slot]: t.value.trim() } });
+      if (t.value.trim()) runFormModelFetch({ force: true });
+      return;
+    }
+
     // 手填 / 修改模型 ID：已知模型自动带出真实上下文窗口
     if (t.id === "cm-model") {
       const kc = knownModelCtx(t.value);
@@ -2636,6 +3070,17 @@ function bindEvents() {
         scenes.innerHTML = `${(meta.endpoints || []).length ? '<span class="eyebrow">端点场景</span>' : ""}${(meta.endpoints || [])
           .map((e) => `<button class="chip" data-act="pick-scene" data-url="${esc(e.baseUrl)}">${esc(e.label)}</button>`)
           .join("")}`;
+      }
+      const nextKey = keyOf(t.value);
+      const keyInput = $("#cm-key");
+      if (keyInput) keyInput.value = nextKey;
+      if (nextKey) {
+        setTimeout(() => {
+          if (ui.sheet?.type === "custom-model") runFormModelFetch({ force: true });
+        }, 80);
+      } else {
+        const box = $("#cm-models");
+        if (box) box.innerHTML = `<p class="field__hint">填上这个服务的 API Key，就会自动列出可用模型。</p>`;
       }
       const modelInput = $("#cm-model");
       if (modelInput && meta.suggest?.length) {
@@ -2788,6 +3233,31 @@ async function runModelTest(id, candidate, boxSelector) {
   }
 }
 
+/* 切换 / 保存后自动验活：成功静默，失败提示；60 秒内不重复测同一个模型 */
+const verifyInflight = new Set();
+async function verifyModel(id, { announce = false } = {}) {
+  const model = allModels().find((m) => m.id === id);
+  if (!model || verifyInflight.has(id)) return;
+  if (!apiKeyFor(model)) {
+    if (announce) toast("所属服务还没有 Key", "err");
+    return;
+  }
+  const prev = modelStatusOf(id);
+  if (prev?.ok && Date.now() - Number(prev.at || 0) < 60000) return;
+  verifyInflight.add(id);
+  try {
+    const r = await testModel(model);
+    if (announce) toast(`连接正常 · ${fmtClock(r.ms)}`, "ok");
+  } catch (err) {
+    toast(`连接失败：${err.message || "未知错误"}`, "err");
+  } finally {
+    verifyInflight.delete(id);
+    if (ui.sheet?.type === "models") renderSheet();
+    else if (ui.view === "settings") renderMain(true);
+    else if (ui.view === "chat") refreshChatMeta();
+  }
+}
+
 function saveModelParams(id) {
   const f = readModelForm();
   const slot = $("#cm-provider")?.value || "custom";
@@ -2827,6 +3297,40 @@ function saveModelParams(id) {
   renderMain(true);
   openSheet("models");
   toast(`已保存：${f.label || f.apiModel}`, "ok");
+  verifyModel(nextId, { announce: true });
+}
+
+/** 从可用清单直接建条目（可选立即切换）：用户不必记模型 ID。 */
+function addModelFromCatalog(apiModel, { slot, baseUrl, activate = true } = {}) {
+  const s = slot || $("#cm-provider")?.value || ui.sheet?.data?.slot || "custom";
+  const meta = PROVIDER_META[s] || PROVIDER_META.custom;
+  const base = String(baseUrl || $("#cm-base")?.value.trim() || meta.baseUrl || "").replace(/\/+$/, "");
+  const exists = allModels().find(
+    (m) => modelApiId(m) === apiModel && (m.providerKey || "custom") === s
+  );
+  const model =
+    exists ||
+    upsertCustomModel({
+      id: `cm_${Date.now().toString(36)}`,
+      label: apiModel,
+      apiModel,
+      baseUrl: base,
+      ctx: knownModelCtx(apiModel) || Number(meta.defaultCtx) || 128000,
+      provider: meta.name,
+      providerKey: s,
+      custom: true,
+      supportsEffort: true,
+      vision: true,
+    });
+  if (activate) {
+    setSettings({ model: model.id });
+    setModelStatus(model.id, null);
+    ui.lastBuilt = null;
+    renderAppbar();
+    renderMain(true);
+    verifyModel(model.id);
+  }
+  return model;
 }
 
 /* 端点可用模型探测与选择（同一端点 10 分钟内复用缓存，避免触发限流） */
@@ -2838,6 +3342,11 @@ async function runFormModelFetch({ force = false } = {}) {
   if (!box) return;
   const baseUrl = $("#cm-base")?.value.trim();
   const slot = $("#cm-provider")?.value || "custom";
+  const key = keyOf(slot);
+  if (!key) {
+    box.innerHTML = `<p class="field__hint">填上这个服务的 API Key，就会自动列出可用模型。</p>`;
+    return;
+  }
   const cacheKey = `${slot}|${baseUrl}`;
   const cached = modelListCache.get(cacheKey);
   if (!force && cached && Date.now() - cached.ts < MODEL_LIST_TTL) {
@@ -2846,15 +3355,17 @@ async function runFormModelFetch({ force = false } = {}) {
   }
   box.innerHTML = `<p class="field__hint" style="display:flex;align-items:center;gap:6px">${icon("loader", "icon--sm icon--loader")} 正在获取模型列表…</p>`;
   try {
-    const ids = await fetchModelList({ baseUrl, apiKey: keyOf(slot) });
+    const ids = await fetchModelList({ baseUrl, apiKey: key });
     modelListCache.set(cacheKey, { ids, ts: Date.now() });
+    rememberModelCatalog(slot, baseUrl, ids);
     renderFormModels(ids);
     box.dataset.models = JSON.stringify(ids);
   } catch (err) {
     modelListCache.delete(cacheKey);
     box.innerHTML = `<div class="model-test model-test--err">${icon("alert", "icon--sm")}
-      <div><b>获取失败</b><p>${esc(err.message || "未知错误")}</p></div></div>
-      <button class="btn btn--ghost btn--sm" style="margin-top:8px" data-act="fetch-models">${icon("refresh", "icon--xs")} 重试</button>`;
+      <div><b>没有取到模型列表</b><p>${esc(err.message || "未知错误")}</p></div></div>
+      <button class="btn btn--ghost btn--sm" style="margin-top:8px" data-act="fetch-models">${icon("refresh", "icon--xs")} 重试</button>
+      <p class="field__hint" style="margin-top:8px">不影响使用：直接点上方「常用模型」，或手动填一个 ID。</p>`;
   }
 }
 
@@ -3067,7 +3578,8 @@ async function onClick(e) {
     }
 
     case "quick":
-      // 建议卡片只填入输入框，由用户确认后再发送；避免在消息区误触直接跑一段预设提示词
+      // 通用「填入预设提示词」能力：只填输入框，由用户确认后再发送，避免误触直接跑一段预设提示词。
+      // 首页的推荐问题已移除，这里保留入口以备其它地方复用。
       closeDrawer();
       closeSheet();
       setComposerValue(String(target.dataset.prompt || ""));
@@ -3090,6 +3602,17 @@ async function onClick(e) {
       const sc = $("#chat-scroll");
       if (sc) sc.scrollTop = sc.scrollHeight;
       ui.pinned = true;
+      return;
+    }
+
+    case "load-earlier": {
+      // 渲染窗口往前扩一批：一次 60 条，避免一次全量又把内存顶爆
+      const s = activeSession();
+      if (!s) return;
+      const cur = ui.renderFrom ?? Math.max(0, s.messages.length - RENDER_WINDOW);
+      ui.renderFrom = Math.max(0, cur - RENDER_WINDOW);
+      releaseThumbs($("#messages"));
+      updateMessages();
       return;
     }
 
@@ -3210,13 +3733,21 @@ async function onClick(e) {
       return;
 
     case "pick-detected-model": {
+      const picking = target.dataset.value || "";
+      // 新建：点一下即加入并切换，不用再点保存
+      if (!ui.sheet?.data?.id) {
+        addModelFromCatalog(picking, { activate: true });
+        openSheet("models");
+        toast(`已切换到 ${picking}`);
+        return;
+      }
       const input = $("#cm-model");
       if (input) {
-        input.value = target.dataset.value || "";
+        input.value = picking;
         input.focus();
       }
       // 已知模型自动带出真实上下文窗口
-      const kc = Number(target.dataset.ctx) || knownModelCtx(target.dataset.value);
+      const kc = Number(target.dataset.ctx) || knownModelCtx(picking);
       if (kc > 0) {
         const ctxInput = $("#cm-ctx");
         if (ctxInput) ctxInput.value = String(Math.round(kc / 1000));
@@ -3224,6 +3755,14 @@ async function onClick(e) {
       document.querySelectorAll(".cm-model-list .chip").forEach((chip) => {
         chip.classList.toggle("chip--accent", chip === target);
       });
+      return;
+    }
+
+    case "use-catalog-model": {
+      const apiModel = target.dataset.value || "";
+      addModelFromCatalog(apiModel, { slot: target.dataset.slot, activate: true });
+      openSheet("models");
+      toast(`已切换到 ${apiModel}`);
       return;
     }
 
@@ -3247,9 +3786,16 @@ async function onClick(e) {
     }
 
     case "pick-suggest-model": {
+      const picking = target.dataset.value || "";
+      if (!ui.sheet?.data?.id) {
+        addModelFromCatalog(picking, { activate: true });
+        openSheet("models");
+        toast(`已切换到 ${picking}`);
+        return;
+      }
       const input = $("#cm-model");
       if (input) {
-        input.value = target.dataset.value || "";
+        input.value = picking;
         input.focus();
       }
       const ctx = Number(target.dataset.ctx);
@@ -3304,6 +3850,32 @@ async function onClick(e) {
         }
       }
       return;
+
+    case "request-battery-exemption": {
+      // 「允许后台耗电」：弹系统面板让用户把应用加进"忽略电池优化"白名单
+      if (!requestBatteryExemption()) {
+        toast("当前系统不支持自动跳转，请到系统设置里手动放行", "err");
+        return;
+      }
+      toast("请在系统弹窗中选择「允许」");
+      return;
+    }
+
+    case "open-battery-settings": {
+      if (!openBatterySettings()) {
+        toast("无法打开系统省电设置页", "err");
+        return;
+      }
+      return;
+    }
+
+    case "open-autostart-settings": {
+      if (!openAutoStartSettings()) {
+        toast("该系统没有独立的自启动设置，可在「系统省电策略设置」里一并放行", "err");
+        return;
+      }
+      return;
+    }
 
     case "connect-model":
       closeSheet();
@@ -3477,7 +4049,11 @@ async function onClick(e) {
       return;
 
     case "max-steps": {
-      const next = Math.max(2, Math.min(20, state.settings.maxSteps + Number(value)));
+      const cur = Number(state.settings.maxSteps) || 24;
+      const dir = Number(value) < 0 ? -1 : 1;
+      // 步进随数值增大：20 以下 ±2，60 以下 ±5，再往上 ±10
+      const step = cur < 30 ? 2 : cur < 60 ? 5 : 10;
+      const next = Math.max(4, Math.min(100, cur + dir * step));
       setSettings({ maxSteps: next });
       renderMain(true);
       return;
@@ -3816,10 +4392,16 @@ async function onClick(e) {
         if (!added.length) {
           toast("没有选择文件");
         } else {
+          let n = 0;
           for (const f of added) {
+            const before = ui.attachments.length;
             addAttachment({ path: f.path, name: f.path.split("/").pop(), size: f.size });
+            if (ui.attachments.length > before) n += 1;
           }
-          toast(`已添加 ${added.length} 个文件`);
+          // 直接进对话框：关掉面板，让用户看到附件已经挂在输入框上方
+          closeSheet();
+          $("#composer-input")?.focus();
+          toast(n ? `已添加 ${n} 个文件到这条消息` : "这些文件已经在附件里了", n ? "ok" : "");
         }
       } catch (err) {
         const msg = err.message || "导入失败";
@@ -3827,6 +4409,7 @@ async function onClick(e) {
         else toast(msg, "err");
       } finally {
         ui.importingFiles = false;
+        // 失败/取消时面板还开着，要重绘把"正在导入…"状态解掉
         if (ui.sheet?.type === "attach") renderSheet();
       }
       return;
@@ -3835,9 +4418,10 @@ async function onClick(e) {
     case "preview-attachment": {
       const path = target.dataset.path;
       const name = target.dataset.name || path.split("/").pop();
+      const area = target.dataset.area === "library" ? "library" : "workspace";
       if (!path) return;
-      if (isImagePath(path)) openImageViewer(path, name);
-      else openSheet("file", { path, area: "workspace" });
+      if (isImagePath(path)) openImageViewer(path, name, area);
+      else openSheet("file", { path, area });
       return;
     }
 
@@ -3847,8 +4431,10 @@ async function onClick(e) {
 
     case "attach-file": {
       const path = target.dataset.path;
-      const meta = listFiles().find((f) => f.path === path);
-      addAttachment({ path, name: path.split("/").pop(), size: meta?.size || 0 });
+      const area = target.dataset.area === "library" ? "library" : "workspace";
+      const list = area === "library" ? listLibrary() : listFiles();
+      const meta = list.find((f) => f.path === path);
+      addAttachment({ path, name: path.split("/").pop(), size: meta?.size || 0, area });
       closeSheet();
       $("#composer-input")?.focus();
       return;

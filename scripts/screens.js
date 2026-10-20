@@ -34,6 +34,7 @@ import { fmtContext } from "./context.js";
 import { icon } from "./icons.js";
 import { plainText } from "./markdown.js";
 import { availableToolNames } from "./tools.js";
+import { powerStatus, powerAvailable } from "./keep-alive.js";
 
 const esc = (s) =>
   String(s ?? "")
@@ -65,47 +66,12 @@ export function renderHome() {
   const mode = currentMode();
   const tools = availableToolNames().length;
 
-  const suggestions = [
-    {
-      icon: "fileText",
-      title: "写一份周会提纲",
-      prompt: "帮我写一份周会提纲，按「结论 → 归因 → 动作」排序，存成 notes/周会提纲.md。",
-    },
-    {
-      icon: "download",
-      title: "从零建一张季度数据表",
-      prompt: "帮我建一张季度销售表（区域 × 季度），先生成 CSV，再补一列环比并标出异常。",
-    },
-    {
-      icon: "puzzle",
-      title: "写一个番茄钟插件",
-      prompt: "用创造模式写一个番茄钟插件，要求能在会话里悬浮计时，25 分钟一轮。",
-    },
-  ];
-
   return `
   <div class="home">
     <div class="home__hero reveal">
-      <span class="home__eyebrow">DSH MOBILE · ${esc(mode.name)}模式</span>
+      <span class="home__eyebrow">DSH MOBILE · ${esc(mode.name)}模式 · ${tools} 个工具</span>
       <h1 class="home__title">你只管说，<br>它负责做完。</h1>
       <p class="home__sub">读写文件、跑命令、改内容，动手前先问你。</p>
-    </div>
-
-    <div class="home__section reveal">
-      <span>试试</span>
-      <span>${tools} 个工具</span>
-    </div>
-    <div class="suggest reveal">
-      ${suggestions
-        .map(
-          (q) => `
-        <button class="suggest__row" data-act="quick" data-prompt="${esc(q.prompt)}">
-          <span class="suggest__icon">${icon(q.icon, "icon--sm")}</span>
-          <span class="suggest__title">${esc(q.title)}</span>
-          ${icon("chevron", "icon--xs suggest__chev")}
-        </button>`
-        )
-        .join("")}
     </div>
 
     ${
@@ -163,9 +129,12 @@ export function renderWorkspace(tab = "workspace") {
         ? order
             .map((group) => {
               const list = groups.get(group);
+              // uploads/ 是聊天附件的落盘位置，标出来避免和 Agent 产物混淆
+              const groupLabel =
+                group === "" ? "根目录" : group === "uploads" ? "uploads/ · 聊天附件" : group + "/";
               return `
         <div class="workspace__group">
-          <div class="workspace__group-head">${group === "" ? "根目录" : group + "/"} · ${list.length}</div>
+          <div class="workspace__group-head">${groupLabel} · ${list.length}</div>
           ${list
             .map((f) => {
               const k = fileKind(f.path);
@@ -445,6 +414,53 @@ export const SETTINGS_CATS = [
 export const SETTINGS_CAT_MAP = Object.fromEntries(SETTINGS_CATS.map((c) => [c.id, c]));
 
 /** 设置首页：大类列表，每项带一句实时摘要。 */
+/**
+ * 「后台保活」设置区块。
+ *
+ * 这一段是给"切到后台任务自动停止"这个问题准备的。
+ * 应用侧能做的三件事都已经做了（渲染进程保活、唤醒锁、前台服务），
+ * 剩下的是系统层面那层"电池优化 / 厂商省电策略"——应用无权自行绕过，
+ * 只能把状态如实告诉用户，并给出直达系统设置页的入口。
+ *
+ * 状态怎么读：
+ *   batteryIgnored —— 是否在"忽略电池优化"白名单里
+ *   keepAlive     —— 保活前台服务此刻是否在跑（跑任务时才会亮）
+ */
+function backgroundKeepAliveSection() {
+  if (!powerAvailable()) return "";
+  const st = powerStatus();
+  const ignored = !!st.batteryIgnored;
+  const maker = st.manufacturer || "";
+  // 国产 ROM 的省电策略比标准 Doze 更凶，提示语要说清楚
+  const isDomestic = /xiaomi|redmi|poco|huawei|honor|oppo|oneplus|realme|vivo|meizu|lenovo|zte/i.test(maker);
+
+  const statusLine = ignored
+    ? "已加入电池优化白名单，后台运行不受限"
+    : isDomestic
+    ? `尚未加入白名单，${maker} 的省电策略可能冻结后台任务`
+    : "尚未加入白名单，系统可能在后台限制网络与唤醒";
+
+  return `
+    <div class="settings__group">
+      <div class="settings__group-head">后台保活</div>
+      <div class="settings__row settings__row--stack">
+        <div class="settings__row-title" style="margin-bottom:4px">后台运行状态</div>
+        <div class="settings__row-sub" style="margin-bottom:10px">${esc(statusLine)}</div>
+        ${
+          ignored
+            ? `<div class="settings__row-sub" style="color:var(--ok,#5ac08a)">✓ 电池优化已放行</div>`
+            : `<button class="btn btn--primary btn--block" style="margin-bottom:8px" data-act="request-battery-exemption">${icon("shield", "icon--xs")} 允许后台耗电（加入白名单）</button>`
+        }
+        <button class="btn btn--ghost btn--block" style="margin-bottom:8px" data-act="open-battery-settings">${icon("gear", "icon--xs")} 打开系统省电策略设置</button>
+        <button class="btn btn--ghost btn--block" data-act="open-autostart-settings">${icon("arrowUp", "icon--xs")} 允许自启动</button>
+        <p class="field__hint" style="margin-top:10px">
+          应用已在运行时开启前台服务与唤醒锁，渲染进程也不会被系统降级回收。<br>
+          剩下这层是系统与厂商的省电策略，只能由你手动放行；放行后长任务切到后台也能继续跑。
+        </p>
+      </div>
+    </div>`;
+}
+
 function settingsHome() {
   return `
   <div class="settings scroll">
@@ -625,7 +641,7 @@ export function renderSettings(cat = null) {
       <div class="settings__row">
         <div class="settings__row-main">
           <div class="settings__row-title">单次最大步数</div>
-          <div class="settings__row-sub">工具调用回合上限，防止失控</div>
+          <div class="settings__row-sub">工具调用回合上限，默认 24，最高 100</div>
         </div>
         <div style="display:flex;align-items:center;gap:6px">
           <button class="icon-btn icon-btn--sm" data-act="max-steps" data-value="-2" aria-label="减少">${icon("minus", "icon--sm")}</button>
@@ -707,6 +723,7 @@ export function renderSettings(cat = null) {
         </div>
         <button class="switch" role="switch" aria-checked="${s.haptics}" aria-label="触感反馈" data-act="toggle-haptics"></button>
       </div>
+      ${backgroundKeepAliveSection()}
       <div class="settings__row settings__row--stack">
         <div class="settings__row-title">网络代理</div>
         <p class="field__hint">跟随系统代理。WebView 不支持应用内代理；需要代理时请在 Android 系统或路由器层配置。</p>
