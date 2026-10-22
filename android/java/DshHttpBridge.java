@@ -70,7 +70,10 @@ public class DshHttpBridge {
             conn.setRequestMethod(method);
             conn.setConnectTimeout(20000);
             conn.setReadTimeout(Math.max(15, timeoutSec) * 1000);
-            conn.setDoOutput(true);
+            // doOutput 只能在有请求体时才开。
+            // HttpURLConnection.setDoOutput(true) 会把方法从 GET 悄悄改成 POST
+            // （JDK 实现里就是这么干的），而「拉取插件清单」必须是真的 GET。
+            conn.setDoOutput(hasBody);
             conn.setDoInput(true);
             conn.setUseCaches(false);
             conn.setRequestProperty("Accept", "text/event-stream, application/json");

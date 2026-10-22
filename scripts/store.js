@@ -62,11 +62,16 @@ export const PERMISSIONS = {
 };
 
 /**
- * 模型目录：每个条目都带**真实的 API model id 与默认端点**。
- * 选中模型时会把 baseUrl 切到该端点；设置里仍可手动覆盖。
- * 只列 OpenAI 兼容协议的服务 —— Claude 官方不是该协议，需要兼容网关时用「自定义模型」。
+ * 应用版本号。
+ *
+ * 只用于**展示**（设置页、关于页）和 MCP clientInfo ——
+ * 真正的版本判定看 APK 的 versionName / versionCode。
+ *
+ * 之前这里一直停在 0.16.1，而 APK 已经到了 0.36.0，
+ * 导致设置页显示的版本是错的、MCP 握手报出去的也是旧版本。
+ * 从 0.37.0 起与 APK 版本保持一致。
  */
-export const APP_VERSION = "0.16.1";
+export const APP_VERSION = "0.37.0";
 
 /**
  * 不再预置任何模型：模型全部由用户在「模型管理」里自行添加。
@@ -616,8 +621,17 @@ const DEFAULT_STATE = () => ({
     haptics: true,
     requestTimeout: 60,
     hudEnabled: false,
+    memoryEnabled: true,
     mcpServers: [],
     profileName: "本机用户",
+    /**
+     * Node 插件运行时开关。
+     *
+     * 默认开启：运行时**已下载**的情况下，应用启动会拉起它。
+     * 没下载时不会自动下（88 MB 太大，不能替用户做主）——
+     * 那件事要用户自己去设置页点。
+     */
+    nodeEnabled: true,
   },
   sessions: seedSessions(),
   activeSessionId: null,
@@ -626,6 +640,13 @@ const DEFAULT_STATE = () => ({
   fsBackend: "",
   fsRoot: "",
   plugins: seedPlugins(),
+  /**
+   * Node 插件清单（从 Node 运行时读来的）。
+   *
+   * 不落盘 —— 它是运行时的状态，Node 重启后自己会重新报上来。
+   * 落盘反而会造成"界面上显示有插件，其实已经没了"的错觉。
+   */
+  nodePlugins: [],
   automations: seedAutomations(),
   runs: seedRuns(),
   stats: { runs: 0, tools: 0, tokens: 0 },
@@ -1702,6 +1723,17 @@ export function setSettings(patch) {
   Object.assign(state.settings, patch);
   save();
   emit({ type: "settings", patch });
+}
+
+/**
+ * 更新 Node 插件清单。
+ *
+ * 不落盘 —— 插件清单是**运行时状态**：Node 重启后它自己会重新报上来。
+ * 落盘反而会造成「界面上还显示着插件，其实已经没了」的错觉。
+ */
+export function setNodePlugins(list) {
+  state.nodePlugins = Array.isArray(list) ? list : [];
+  emit({ type: "node:plugins", plugins: state.nodePlugins });
 }
 
 export async function resetAll() {

@@ -52,8 +52,7 @@ if (typeof window !== "undefined") {
  * 发起原生流式 POST。
  * @returns {boolean} 是否已交由原生桥处理（false 表示应回退 fetch）
  */
-export function nativeStream({
-  url,
+export function nativeStream({  url,
   headers,
   body,
   method = "POST",
@@ -114,4 +113,62 @@ export function nativeStream({
     fail(err);
   }
   return true;
+}
+
+/**
+ * 取一个纯文本资源（GET），返回完整字符串。
+ *
+ * 为什么需要它：WebView 里的 fetch 会被 CORS 挡住第三方域名
+ * （预算是从 capacitor://localhost 发出的，第三方服务器不会放行）。
+ * 而「从任意 URL 安装插件」必须能拉到清单与代码 —— 所以 APK 内走原生桥，
+ * 原生侧用 HttpURLConnection，不受同源策略约束。
+ *
+ * 浏览器 / PWA 没有原生桥，回退到 fetch，此时只能装同源或允许跨域的地址。
+ *
+ * @returns {Promise<{ok:boolean, status:number, text:string, error?:string}>}
+ */
+export async function nativeGetText(url, { timeoutSec = 30, headers = {} } = {}) {
+  if (!nativeHttpAvailable()) {
+    try {
+      const res = await fetch(url, { headers, redirect: "follow" });
+      const text = await res.text();
+      return { ok: res.ok, status: res.status, text, error: res.ok ? "" : `HTTP ${res.status}` };
+    } catch (err) {
+      return { ok: false, status: 0, text: "", error: err.message || String(err) };
+    }
+  }
+
+  return new Promise((resolve) => {
+    let text = "";
+    let status = 0;
+    let settled = false;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      resolve({ ok: status >= 200 && status < 300, status, text });
+    };
+    nativeStream({
+      url,
+      method: "GET",
+      headers: { Accept: "application/json, text/javascript, text/plain, */*", ...headers },
+      timeoutSec,
+      onStatus: (s) => {
+        status = s;
+      },
+      onChunk: (c) => {
+        text += c;
+      },
+      onEnd: done,
+      onError: (err) => {
+        if (settled) return;
+        settled = true;
+        resolve({
+          ok: false,
+          status: Number(err?.httpStatus) || 0,
+          text,
+          error: err?.message || "原生网络请求失败",
+        });
+      },
+    });
+  });
 }

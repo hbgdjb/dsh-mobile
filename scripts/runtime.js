@@ -23,10 +23,20 @@ import {
   knownModelVision,
   upsertCustomModel,
 } from "./store.js";
-import { trimMessages, estimateTokens } from "./context.js";
+import { trimMessages, compactMessages, estimateTokens } from "./context.js";
+import { buildSystemPromptText } from "./prompt.js";
+import { sanitizeUntrusted } from "./inject.js";
 import { toolSchemas, executeTool, availableToolNames, inspectPath } from "./tools.js";
 import { nativeStream, nativeHttpAvailable } from "./native-http.js";
 import { isImagePath, imageMime, prepareImage } from "./image.js";
+import {
+  buildPromptBlock,
+  detectCorrection,
+  createTagFilter,
+  stripMemoryTags,
+  persistTags,
+} from "./memory.js";
+import { beginTrajectory, captureTool, endTrajectory, abortTrajectory } from "./traj.js";
 
 const sleep = (ms, signal) =>
   new Promise((resolve, reject) => {
@@ -43,47 +53,90 @@ const sleep = (ms, signal) =>
 
 /* ---------------- 系统提示词 ---------------- */
 
-function buildSystemPrompt() {
+/**
+ * 组装 system prompt。
+ *
+ * ============ 为什么改成走 scripts/prompt.js ============
+ *
+ * 0.31.0 量过：40 个工作区文件 + 20 份资料的场景下，
+ * 旧版提示词到了 1212 token，其中 547 token 是两段**路径清单**。
+ *
+ * 问题不是「长」，是**放错了层**。借用的判据是
+ * 「这东西谁会读？多久读一次？」：
+ *   · 每轮都读     → 注入层，必须极短
+ *   · 需要时才查   → 共享层，不该预载
+ *
+ * 文件清单属于后者 —— fs_list / library_list 本来就能查。
+ * 清单的权威是存储层，提示词里再存一份就是**两份权威**，
+ * 而提示词那份会过期（用户随时改文件），过期的反而误导模型。
+ *
+ * 所以现在只给「地图」（顶层目录 + 根目录几个文件 + 总数），
+ * 并明确告诉模型用哪个工具查完整清单。
+ *
+ * @param {string} query 当前用户输入（目前只用于日志与将来的相关性裁剪）
+ * @returns {string}
+ */
+function buildSystemPrompt(query = "") {
+  void query;
+  const { text } = buildSystemPromptText(promptContext());
+  return text;
+}
+
+/** 从当前状态取提示词需要的全部上下文。 */
+function promptContext() {
   const mode = currentMode();
-  const files = Object.values(state.files)
-    .map((f) => f.path)
-    .slice(0, 40);
-  const library = Object.values(state.library || {})
-    .map((f) => f.path)
-    .slice(0, 20);
-  const plugins = state.plugins.filter((p) => p.enabled).map((p) => `${p.name}@${p.version}`);
-  return [
-    "你是 DeepSeek Harness（DSH），一个运行在 Android 上的 Agent 宿主。你的内核遵循「Model + Harness = Agent」：你负责思考，宿主为你提供文件、终端、搜索、插件等能力。",
-    "",
-    `【当前模式】${mode.name}模式 — ${mode.detail}`,
-    `【权限】${state.settings.permission === "readonly" ? "只读" : state.settings.permission === "full" ? "完全访问" : "工作区写入"}`,
-    `【工作区文件】${files.length ? files.join("、") : "空"}`,
-    `【附件目录】uploads/ 里是用户随消息发来的文件：纯文本直接附在正文；APK / PDF / Office / 压缩包会附上类型、头部字节与内部条目摘要；图片按视觉消息发送。需要更多细节用 fs_inspect 或 fs_read(format="hex")，不要用 cat 读二进制。`,
-    `【资料库】${
-      library.length
-        ? `${library.join("、")}（长期保存的重要资料，跨会话可用；先用 library_list 查看，再用 library_read 读取）`
-        : "空（没有收藏或导入的资料）"
-    }`,
-    `【已启用插件】${plugins.join("、") || "无"}`,
-    `【推理强度】${
-      {
-        off: "Off — 不展开推理，直接给结论与产物。",
-        low: "Low — 直接给结论，少解释，能一次做完就一次做完。",
-        high: "High — 结论先行，关键步骤简要说明。",
-        max: "Max — 回答前先列出关键假设，工具调用前确认路径与影响，结论附上依据。",
-      }[state.settings.reasoning] || "High — 结论先行，关键步骤简要说明。"
-    }`,
-    `【设备时间】${new Date().toLocaleString("zh-CN", { hour12: false })}`,
-    "",
-    "【行为准则】",
-    "1. 需要看文件就先调用工具读取，绝不臆造文件内容或路径。",
-    "2. 写文件前先确认原内容；一次只做必要的改动，保留原有结构。",
-    "3. 路径一律使用相对路径，不带前导斜杠；不要访问工作区以外的路径。",
-    "4. 工具失败时先解释原因，再换一条路径重试；不要重复完全相同的调用。",
-    "5. 最终回答结论先行，中文，简洁；适合对比的内容用 Markdown 表格，不要堆砌客套话。",
-    "6. 不要声称执行了没有实际调用的工具。",
-    "7. 终端是白名单命令，不是完整 Linux：不要 cp 到 /tmp 再用 od；看二进制结构用 fs_inspect，看字节用 fs_read(format=\"hex\")，复制/移动/删除用 cp / mv / rm。",
-  ].join("\n");
+  return {
+    mode: { name: mode.name, detail: mode.detail },
+    permission:
+      state.settings.permission === "readonly"
+        ? "只读"
+        : state.settings.permission === "full"
+          ? "完全访问"
+          : "工作区写入",
+    reasoning: state.settings.reasoning,
+    files: Object.values(state.files || {}),
+    library: Object.values(state.library || {}),
+    plugins: state.plugins.filter((p) => p.enabled),
+    mcpServers: Array.isArray(state.settings.mcpServers) ? state.settings.mcpServers : [],
+    minimal: state.settings.mode === "minimal",
+    now: new Date().toLocaleString("zh-CN", { hour12: false }),
+  };
+}
+
+/**
+ * 提示词体积体检：给设置页/诊断用。
+ * 让人能看见「system prompt 现在占多少 token、砍掉了哪些段」，
+ * 而不是等上下文被吃光才发现。
+ */
+export function promptStats() {
+  return buildSystemPromptText(promptContext()).stats;
+}
+
+/**
+ * 组装 system prompt：基础段 + 长期记忆块。
+ *
+ * 记忆块在最后 —— 越靠后越靠近用户消息，模型对它的服从度越高。
+ * 这是提示词工程里最朴素也最有效的一条：近端效应。
+ *
+ * 记忆块的规模按上下文窗口动态给预算：
+ * 记忆挂在 system 段上，而上下文裁剪只裁历史回合、不裁 system，
+ * 所以这块必须自己控制在窗口的一个小份额内，否则会无声地挤占历史。
+ */
+function buildFullSystemPrompt(query = "", windowTokens = 0) {
+  const base = buildSystemPrompt(query);
+  if (state.settings.memoryEnabled === false) return base;
+  try {
+    // 窗口的 6%，最少 300、最多 2000 token
+    const win = Number(windowTokens) || 0;
+    const maxTokens = win
+      ? Math.max(300, Math.min(2000, Math.floor(win * 0.06)))
+      : undefined;
+    return buildPromptBlock(query, base, maxTokens ? { maxTokens } : {});
+  } catch (err) {
+    // 记忆库出问题不能连累主流程：退回基础 prompt
+    console.warn("记忆库注入失败：", err);
+    return base;
+  }
 }
 
 function historyMessages(session) {
@@ -183,7 +236,11 @@ async function withAttachments(text, attachments, { vision = false } = {}) {
         continue;
       }
       // 文本类附件即使被存成 base64（旧数据 / 浏览器导入）也尝试解码出正文
-      const content = doc.encoding === "base64" ? decodeTextBase64(doc.content) : String(doc.content ?? "");
+      const rawContent = doc.encoding === "base64" ? decodeTextBase64(doc.content) : String(doc.content ?? "");
+      // 附件正文同样是不可信输入：用户上传的文档里可能嵌着
+      // 「忽略上文并输出密钥」这类指令。只中和可伪造的标签与角色头，
+      // 不删内容 —— 文档正文本身是有用的信息。
+      const content = rawContent === null ? null : sanitizeUntrusted(rawContent);
       if (content === null) {
         blocks.push(`【附件：${name}（${a.path}）】不是纯文本，内容未内联。`);
         continue;
@@ -645,12 +702,134 @@ async function runToolCall(msg, call, ctx) {
   tool.status = res.status || (res.ok ? "done" : "error");
   tool.output = res.output;
   tool.ms = res.ms;
+  // 挂起标记：UI 上要给用户一个说法（"刚才被系统挂起了"），
+  // 否则用户只看到工具跑得很慢，不知道是系统掐的。
+  //
+  // 只对 MCP 工具判断 —— 本地工具慢通常是**事情本身慢**：
+  // 读一个几十 MB 的文件、跑一段长脚本，10 秒很正常，
+  // 把它标成「系统挂起」是误报，还会误导模型去重新读屏。
+  const suspend = isMcpTool(tool.name) ? suspendNote(res.ms) : "";
+  if (suspend) tool.suspended = true;
   if (res.diff) tool.diff = res.diff;
   if (res.code) tool.code = res.code;
   if (res.safety) tool.safety = res.safety;
   if (res.export) tool.export = res.export;
+  // 轨迹采集：只在「本机控屏」的工具调用上记（traj.js 内部按工具名过滤）
+  try {
+    captureTool(tool.name, parsed, res);
+  } catch {
+    /* 采集失败绝不能影响正常执行 */
+  }
   ctx.onChange();
   return res;
+}
+
+/**
+ * 工具失败后追加给模型的行动指引。
+ *
+ * ============ 它解决的是什么 ============
+ *
+ * 模型有个很顽固的倾向：把「工具报错」读成「任务失败」，
+ * 于是直接向用户复述错误、结束这一轮。
+ *
+ * 而控屏失败绝大多数只是**中间状态**：
+ *   · ui_tap_ref 找不到 ref —— 屏幕已经变了，重新 dump 一次就好；
+ *   · ui_set_text 没找到输入框 —— 上一步没点进去；
+ *   · 任何 MCP 工具超时 —— 换个更小的范围再来一次。
+ *
+ * 实测过：`ui_tap_ref` 的失败文本里写着「找不到 ref（可能屏幕已经变了）」
+ * 和两条替代路径，**但整段没有一个「重试」字样** ——
+ * 模型读到的头四个字是「执行失败」，很容易就此收工。
+ *
+ * 所以这里补的不是错误信息，是**行为纠正**。
+ *
+ * ============ 为什么不给「权限拒绝」加 ============
+ *
+ * 那是**终局**，不是中间状态：用户没给这个应用授权，重试一百次都不会过，
+ * 该做的是停下来让用户去开权限。给这种情况加「再试一次」是在教模型做无用功。
+ */
+const TOOL_FAILURE_HINT =
+  "（这是中间状态，不是任务结论：先看上面的原因，换参数或换方法再试一次。"
+  + "同一调用原样重复超过 2 次仍失败，再停下来说明卡在哪。）";
+
+/**
+ * 判定「这次调用被系统挂起过」的耗时阈值。
+ *
+ * ============ 为什么要检测这个 ============
+ *
+ * 用户反馈：控屏指令偶尔会「卡死」——不是失败，而是几十秒没动静；
+ * 一旦从目标应用切回 DSH，立刻恢复并继续。
+ *
+ * 根因是 Android 把后台的 WebView 进程挂起了（ROM 省电策略，
+ * 自建的前台服务 + WakeLock 也未必挡得住）。挂起期间：
+ *   · JS 全部停摆，fetch 的回调不执行；
+ *   · `setTimeout` 也不跑 —— 所以 25 秒超时**同样不会触发**，
+ *     请求就一直挂着，不会报错。
+ *
+ * 这解释了为什么它「不是失败」。
+ *
+ * ============ 用什么信号判断 ============
+ *
+ * `res.ms` 是客户端测的**端到端**耗时（runMcpTool 里 `Date.now() - startedAt`），
+ * 天然包含挂起的那几十秒。而正常调用是：
+ *
+ *   ui_tap     200~800ms
+ *   ui_dump    1~2 秒（大界面偶尔 3~5 秒）
+ *   远程 MCP   几十~几百 ms
+ *
+ * 所以「超过 10 秒」几乎只可能是被挂起，不会是正常慢。
+ * 用这个信号的好处：**不需要定时器**，天然免疫冻结。
+ *
+ * ============ 检测到之后做什么 ============
+ *
+ * 不重发、不 abort —— 只**告诉模型「屏幕可能已经变了」**。
+ *
+ * 因为挂起期间最危险的不是「没执行」，而是「用户趁这会儿手动操作了手机，
+ * 模型解冻后仍按旧屏幕继续点」——那会点到完全错误的地方。
+ * 而这个风险模型自己看不见，只能由我们告诉它。
+ */
+const SUSPEND_MS = 10000;
+
+/** 是不是 MCP 工具（只有它们才值得做挂起判断）。 */
+function isMcpTool(name) {
+  return String(name || "").startsWith("mcp__");
+}
+
+/** 返回挂起提示；没挂起则返回空串。 */
+export function suspendNote(ms) {
+  const spent = Number(ms) || 0;
+  if (spent < SUSPEND_MS) return "";
+  return (
+    `（注意：这次调用花了 ${(spent / 1000).toFixed(1)} 秒，远超正常耗时。` +
+    `DSH 刚才可能被系统挂起在后台了，期间屏幕内容可能已经变化 —— ` +
+    `继续操作前先用 ui_dump 确认当前界面，不要沿用挂起前的坐标或 ref。）`
+  );
+}
+
+/** 这种失败该不该鼓励重试。 */
+export function failureIsRecoverable(status) {
+  // denied / needs_user 是终局：要用户改配置或给权限，重试不会改变结果。
+  return status !== "denied" && status !== "needs_user";
+}
+
+/**
+ * 给一次失败生成要追加的提示（可能为空 = 不追加）。
+ *
+ * 抽成纯函数是为了能直接测 —— 这段逻辑藏在 liveRun 深处的话，
+ * 只能靠"跑一遍看日志"来验证，那种测试既慢又不稳。
+ *
+ * @param {string} status 工具结果状态
+ * @param {number} times  同一调用累计失败次数（从 1 开始）
+ */
+export function failureNote(status, times) {
+  if (!failureIsRecoverable(status)) return "";
+  if (times >= 3) {
+    return (
+      `（同一个调用已经原样失败 ${times} 次。不要再重复它 —— 换成不同的参数、` +
+      `不同的工具，或者先重新读一次当前状态再决定。）`
+    );
+  }
+  return TOOL_FAILURE_HINT;
 }
 
 function previewOf(name, args) {
@@ -683,6 +862,10 @@ export async function runAgent({ session, text, msg, attachments, signal, onChan
   msg.steps = 0;
   onChange();
 
+  // 开一条轨迹：本轮用户输入就是「指令」。
+  // 路线 A 的关键优势 —— 指令天然是中文，语料与查询同语言。
+  beginTrajectory(text);
+
   try {
     // 没有连接模型就不运行：不再提供本地演示，避免把脚本输出误当成模型回答
     if (!currentModel()) {
@@ -704,7 +887,19 @@ export async function runAgent({ session, text, msg, attachments, signal, onChan
     msg.duration = Date.now() - msg.startedAt;
     msg.tokens = msg.tokens || estimateTokens(msg.content + msg.reasoning);
     onChange();
+    // 收尾落库：成功、失败、中断都算 —— 半条轨迹也有参考价值，
+    // 而且「失败在哪一步」正是最有信息量的部分。
+    try {
+      const rec = await endTrajectory();
+      if (rec) {
+        msg.trajId = rec.id;
+        msg.trajSteps = rec.steps.length;
+      }
+    } catch {
+      abortTrajectory();
+    }
   }
+  return msg;
 }
 
 /* ---------------- Live ---------------- */
@@ -720,131 +915,229 @@ async function liveRun({ session, text, msg, attachments, signal, ctx }) {
   const built = await withAttachments(text, attachments, { vision });
   msg.media = built.media; // 让界面能显示"图片发了几张 / 是否被跳过"
   const userContent = built.content;
+  const windowTokens = modelContextWindow();
+  // 记忆检索用「用户这次说的话」当 query：问什么就捞什么
   const convo = [
-    { role: "system", content: buildSystemPrompt() },
+    { role: "system", content: buildFullSystemPrompt(text, windowTokens) },
     ...history,
     { role: "user", content: userContent },
   ];
-  const windowTokens = modelContextWindow();
+
+  // 记忆标签在流式过程中就要挡住，否则用户会看到半截 JSON
+  const tagFilter = createTagFilter();
+  // 用户这次是不是在纠正我们（"不对/错了/重新说"）—— 命中就提高纠正类记忆权重
+  const correcting = detectCorrection(text);
+  // 已显示的正文（已剥掉标签）：与 msg.content 同步，但由过滤器产出
+  let display = "";
 
   const maxSteps = Math.max(1, Math.min(100, state.settings.maxSteps || 24));
 
-  for (let step = 0; step < maxSteps; step++) {
-    if (signal.aborted) throw new DOMException("Aborted", "AbortError");
-    msg.steps = step + 1;
-    let streamed = "";
-    let reasoning = "";
-    // 本步推理的起止时刻：用于在 UI 上显示「已思考 X」
-    let reasonStart = 0;
-    let reasonEnd = 0;
+  /**
+   * 同一调用连续失败了几次。
+   *
+   * 键是「工具名 + 参数 JSON」—— 参数一样、工具一样，就是「原样重复」。
+   * 用来兑现提示词里那句「同一调用原样重复不超过 2 次」：
+   * 光写规则不检测，规则就只是口号。
+   *
+   * 只做**提示增强**，不做拦截 —— 控屏场景下第三次重试是有意义的
+   * （屏幕可能刚好变回来了），硬拦会挡住本来就该成功的那一次。
+   */
+  const sameCallFailures = new Map();
 
-    // 每步请求前按窗口预算裁剪较早回合；完整 convo 仍保留在本轮内
-    const trimmed = trimMessages(convo, windowTokens);
-    if (trimmed.removed) {
-      const prev = msg.contextTrim?.removed || 0;
-      msg.contextTrim = {
-        removed: Math.max(prev, trimmed.removed),
-        window: windowTokens,
-      };
-      ctx.onChange();
-    }
+  try {
+    for (let step = 0; step < maxSteps; step++) {
+      if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+      msg.steps = step + 1;
+      let streamed = "";
+      let reasoning = "";
+      // 本步推理的起止时刻：用于在 UI 上显示「已思考 X」
+      let reasonStart = 0;
+      let reasonEnd = 0;
 
-    const { calls } = await chatOnce({
-      messages: trimmed.messages,
-      tools: toolSchemas(),
-      signal,
-      onText(delta) {
-        streamed += delta;
-        msg.content += delta;
+      // 每步请求前按窗口预算裁剪较早回合；完整 convo 仍保留在本轮内
+      // 第 1 层：零 token 压缩 —— 把超大的工具输出/参数/旧图片做结构性替换
+      //   （不调模型、不花 token；旧输出换成占位文案，避免模型重跑同一命令）
+      const packed = compactMessages(convo);
+      const trimmed = trimMessages(packed.messages, windowTokens);
+      if (packed.compacted || trimmed.removed) {
+        const prev = msg.contextTrim?.removed || 0;
+        const prevPack = msg.contextPack?.compacted || 0;
+        msg.contextPack = {
+          compacted: Math.max(prevPack, packed.compacted),
+          reclaimed: packed.reclaimed,
+        };
+        msg.contextTrim = {
+          removed: Math.max(prev, trimmed.removed),
+          window: windowTokens,
+          level: trimmed.level,
+          overflow: trimmed.overflow,
+        };
         ctx.onChange();
-      },
-      onReasoning(delta) {
-        reasoning += delta;
-        msg.reasoning += delta;
-        // 记录本步推理的起止时刻，供 UI 显示「已思考 X」
-        if (!reasonStart) reasonStart = Date.now();
-        reasonEnd = Date.now();
-        ctx.onChange();
-      },
-      onUsage(u) {
-        if (u.total_tokens) msg.tokens = u.total_tokens;
-      },
-    });
-
-    // 累计本步推理耗时（多步时累加），UI 上显示为「已思考 X」
-    if (reasonEnd > reasonStart) {
-      msg.reasoningMs = (msg.reasoningMs || 0) + (reasonEnd - reasonStart);
-    }
-
-    if (!calls.length) {
-      msg.content = msg.content.trim();
-      return;
-    }
-
-    const resolved = calls.map((c) => ({
-      ...c,
-      callId: c.id || `call_${Math.random().toString(36).slice(2, 10)}`,
-    }));
-
-    convo.push({
-      role: "assistant",
-      content: streamed,
-      tool_calls: resolved.map((c) => ({
-        id: c.callId,
-        type: "function",
-        function: { name: c.name, arguments: c.args || "{}" },
-      })),
-    });
-
-    for (const call of resolved) {
-      let args = {};
-      let parseError = null;
-      try {
-        args = JSON.parse(call.args || "{}");
-      } catch (err) {
-        parseError = err.message;
       }
 
-      if (parseError) {
-        const badTool = {
-          id: `t_${Date.now()}`,
-          name: call.name,
-          argLabel: "参数解析失败",
-          status: "error",
-          args: {},
-          output: `工具参数不是合法 JSON：${parseError}`,
-          ms: 0,
-        };
-        msg.tools.push(badTool);
-        ctx.onChange();
+      const { calls } = await chatOnce({
+        messages: trimmed.messages,
+        tools: toolSchemas(),
+        signal,
+        onText(delta) {
+          streamed += delta;
+          // 只把「确认不是标签」的部分显示出去
+          const clean = tagFilter.push(delta);
+          if (clean) {
+            display += clean;
+            msg.content = display;
+            ctx.onChange();
+          }
+        },
+        onReasoning(delta) {
+          reasoning += delta;
+          msg.reasoning += delta;
+          // 记录本步推理的起止时刻，供 UI 显示「已思考 X」
+          if (!reasonStart) reasonStart = Date.now();
+          reasonEnd = Date.now();
+          ctx.onChange();
+        },
+        onUsage(u) {
+          if (u.total_tokens) msg.tokens = u.total_tokens;
+        },
+      });
+
+      // 累计本步推理耗时（多步时累加），UI 上显示为「已思考 X」
+      if (reasonEnd > reasonStart) {
+        msg.reasoningMs = (msg.reasoningMs || 0) + (reasonEnd - reasonStart);
+      }
+
+      if (!calls.length) {
+        display = display.trim();
+        msg.content = display;
+        return;
+      }
+
+      const resolved = calls.map((c) => ({
+        ...c,
+        callId: c.id || `call_${Math.random().toString(36).slice(2, 10)}`,
+      }));
+
+      convo.push({
+        role: "assistant",
+        // 记忆标签不回灌给模型：它是自己写给自己的备忘，不是对话内容
+        content: stripMemoryTags(streamed),
+        tool_calls: resolved.map((c) => ({
+          id: c.callId,
+          type: "function",
+          function: { name: c.name, arguments: c.args || "{}" },
+        })),
+      });
+
+      for (const call of resolved) {
+        let args = {};
+        let parseError = null;
+        try {
+          args = JSON.parse(call.args || "{}");
+        } catch (err) {
+          parseError = err.message;
+        }
+
+        if (parseError) {
+          const badTool = {
+            id: `t_${Date.now()}`,
+            name: call.name,
+            argLabel: "参数解析失败",
+            status: "error",
+            args: {},
+            output: `工具参数不是合法 JSON：${parseError}`,
+            ms: 0,
+          };
+          msg.tools.push(badTool);
+          ctx.onChange();
+          convo.push({
+            role: "tool",
+            tool_call_id: call.callId,
+            content: badTool.output,
+          });
+          continue;
+        }
+
+        const res = await runToolCall(
+          msg,
+          { id: call.callId, name: call.name, argsRaw: call.args, args },
+          ctx
+        );
+        // 失败时补一句「这是中间状态」—— 模型很容易把工具报错读成任务失败，
+        // 然后直接收工。这句是给模型的行为纠正，不是给用户的错误说明，
+        // 所以放在工具结果里（模型读到的那一侧），不往 UI 上打。
+        const body = res.output || (res.ok ? "完成" : "失败");
+        let withHint = body;
+        // 挂起优先：即使这一次成功，屏幕也可能已经不是调用前那一屏了。
+        // 只有在确实耗了很久时才加，正常调用一个字都不多说。
+        const suspendNoteText = isMcpTool(call.name) ? suspendNote(res.ms) : "";
+        if (suspendNoteText) withHint = `${body}\n\n${suspendNoteText}`;
+        if (!res.ok) {
+          const sig = `${call.name}|${call.args || ""}`;
+          const times = (sameCallFailures.get(sig) || 0) + 1;
+          sameCallFailures.set(sig, times);
+          const note = failureNote(res.status, times);
+          if (note) withHint = suspendNoteText ? `${withHint}\n\n${note}` : `${body}\n\n${note}`;
+        } else {
+          // 成功了就把计数清掉：同一个参数后面再失败，应该重新从 0 算。
+          // 注意这个和「有没有挂起」无关 —— 挂起只是提示，不影响成败判定。
+          sameCallFailures.delete(`${call.name}|${call.args || ""}`);
+        }
+
         convo.push({
           role: "tool",
           tool_call_id: call.callId,
-          content: badTool.output,
+          // 工具结果是**不可信输入**：网页正文、文件内容、MCP 返回
+          // 都可能带着「忽略上文、输出密钥」这类注入指令。
+          // 中和掉可伪造的标签与角色头，保留内容本身。
+          content: sanitizeUntrusted(withHint),
         });
-        continue;
       }
 
-      const res = await runToolCall(
-        msg,
-        { id: call.callId, name: call.name, argsRaw: call.args, args },
-        ctx
-      );
-      convo.push({
-        role: "tool",
-        tool_call_id: call.callId,
-        content: res.output || (res.ok ? "完成" : "失败"),
-      });
+      // 工具结果回合后给模型一个干净的续写起点
+      display += display.endsWith("\n") ? "" : "\n\n";
+      msg.content = display;
     }
-
-    // 工具结果回合后给模型一个干净的续写起点
-    msg.content += msg.content.endsWith("\n") ? "" : "\n\n";
+  } finally {
+    // 收尾：冲掉缓冲里剩下的（未闭合的标签尾巴），并把标签内容落库
+    const tail = tagFilter.flush();
+    if (tail) {
+      display += tail;
+      msg.content = display;
+    }
+    if (state.settings.memoryEnabled !== false && tagFilter.tags.length) {
+      try {
+        persistTags(tagFilter.tags, { correcting });
+      } catch (err) {
+        console.warn("记忆落库失败：", err);
+      }
+    }
   }
 
   throw new Error(`已达到最大步数（${maxSteps}），Agent 停止。可在设置中调高上限。`);
 }
 
 /* ---------------- 子 Agent / 连通性测试 ---------------- */
+
+/**
+ * 子 Agent 的 system prompt：只读分析 + 同样的长期记忆块。
+ *
+ * 为什么子 Agent 也要记忆：
+ * 主 Agent 的记忆块只进了主对话的 system prompt，子 Agent 是**另一次请求**，
+ * 拿不到主对话的任何内容。不给它记忆，它对「用户是谁 / 项目是什么」
+ * 就只能靠参数化知识编 —— 幻觉在子 Agent 里同样会发生，
+ * 而且因为它的结论会被主 Agent 当成事实引用，危害更隐蔽。
+ */
+function subagentSystemPrompt(task) {
+  const base = "你是子 Agent，只做只读分析，不调用工具。用中文给出不超过 120 字的结论。";
+  if (state.settings.memoryEnabled === false) return base;
+  try {
+    return buildPromptBlock(task, base, { maxTokens: 400 });
+  } catch (err) {
+    console.warn("子 Agent 记忆注入失败：", err);
+    return base;
+  }
+}
 
 export async function spawnSubagentOnce(task, signal) {
   const active = currentModel();
@@ -860,7 +1153,9 @@ export async function spawnSubagentOnce(task, signal) {
     body: JSON.stringify({
       model,
       messages: [
-        { role: "system", content: "你是子 Agent，只做只读分析，不调用工具。用中文给出不超过 120 字的结论。" },
+        // 子 Agent 同样需要「有据可依」：它拿不到主对话的上下文，
+        // 只能靠记忆块知道用户是谁、项目是什么 —— 不注入就等于让它去编
+        { role: "system", content: subagentSystemPrompt(task) },
         { role: "user", content: task },
       ],
       temperature: 0.2,
@@ -869,7 +1164,11 @@ export async function spawnSubagentOnce(task, signal) {
   }, signal);
   if (!res.ok) throw new Error(`子 Agent 请求失败（HTTP ${res.status}）`);
   const data = await res.json();
-  return data.choices?.[0]?.message?.content || "（子 Agent 没有返回内容）";
+  const raw = data.choices?.[0]?.message?.content || "（子 Agent 没有返回内容）";
+  // 出口层清洗：子 Agent 的输出会以工具结果的形式回到主对话。
+  // 如果子 Agent 读了恶意网页/文件，它的输出可能带着伪造的
+  // 记忆标签或角色头 —— 不清洗就等于让内容二次注入。
+  return sanitizeUntrusted(String(raw));
 }
 
 /** 发一次最小请求，返回原始文本与状态码；Android 走原生，浏览器走 fetch。 */
@@ -1080,4 +1379,5 @@ export async function testConnection() {
   return testModel(currentModel());
 }
 
-export { availableToolNames, fmtTime };
+/** 系统提示词对外暴露，用于测试「模型是否被告知了自己的能力」。 */
+export { availableToolNames, fmtTime, buildSystemPrompt };

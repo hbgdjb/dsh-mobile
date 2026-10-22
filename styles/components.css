@@ -2387,3 +2387,153 @@ html[data-density="compact"] .tool {
 .msg__file {
   white-space: normal;
 }
+
+/* ============================================================
+   语音输入（0.23.0）
+   ============================================================ */
+
+/* 录音条：替代「只弹一个 toast」的旧做法。
+   三件事必须一眼可见：
+     1) 它真的在听（音量条在动）
+     2) 它真的听懂了（实时转写）
+     3) 我能停下来（两个按钮） */
+.voice-strip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 6px 7px 10px;
+  margin-bottom: 6px;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-md);
+  background: linear-gradient(120deg, rgba(71, 99, 244, 0.14), rgba(71, 99, 244, 0.05));
+  animation: voiceIn 0.18s ease-out;
+}
+
+.voice-strip[hidden] {
+  display: none;
+}
+
+@keyframes voiceIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* 呼吸红点：表示正在录音 */
+.voice-strip__dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--danger);
+  box-shadow: 0 0 0 0 rgba(255, 107, 107, 0.5);
+  animation: voicePulse 1.4s ease-out infinite;
+}
+
+@keyframes voicePulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(255, 107, 107, 0.5);
+  }
+  70% {
+    box-shadow: 0 0 0 7px rgba(255, 107, 107, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(255, 107, 107, 0);
+  }
+}
+
+.voice-strip__main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+/* 音量条：5 根错相位的柱子，比单一进度条更像「在听人说话」 */
+.voice-strip__bars {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 2.5px;
+  height: 18px;
+}
+
+.voice-strip__bars i {
+  display: block;
+  width: 2.5px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--accent-bright);
+  opacity: 0.85;
+  transition: height 90ms linear;
+}
+
+.voice-strip__text {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-12);
+  line-height: 1.5;
+  color: var(--text-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.voice-strip__btn {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--r-sm);
+  color: var(--muted);
+  transition: background var(--dur-1) ease, color var(--dur-1) ease;
+}
+
+.voice-strip__btn:active {
+  transform: scale(0.92);
+}
+
+.voice-strip__btn:hover {
+  background: rgba(233, 237, 245, 0.08);
+  color: var(--text);
+}
+
+.voice-strip__btn--go {
+  color: var(--accent-bright);
+  background: rgba(71, 99, 244, 0.18);
+}
+
+/* 麦克风按钮的录音态 */
+.icon-btn.is-live {
+  color: var(--danger);
+  background: var(--danger-soft);
+  animation: micLive 1.6s ease-in-out infinite;
+}
+
+@keyframes micLive {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(255, 107, 107, 0.28);
+  }
+  50% {
+    box-shadow: 0 0 0 5px rgba(255, 107, 107, 0);
+  }
+}
+
+/* 系统开了「减少动态效果」时全部停掉 */
+.no-motion .voice-strip,
+.no-motion .voice-strip__dot,
+.no-motion .icon-btn.is-live {
+  animation: none;
+}
+
+.no-motion .voice-strip__bars i {
+  transition: none;
+}

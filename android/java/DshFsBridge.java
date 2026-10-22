@@ -368,8 +368,32 @@ public class DshFsBridge {
         });
     }
 
+    /**
+     * 区域目录。
+     *
+     * 三个区域：
+     *   library  —— 资料库（用户放的文件）
+     *   workspace —— 工作区（Agent 产出）
+     *   traj     —— 控屏轨迹库（0.34.0 新增）
+     *
+     * 为什么要单独的 traj 区域，而不是塞进 workspace：
+     * 轨迹是**机器生成的内部数据**，量级会持续增长（每条轨迹一个 JSON），
+     * 而且需要整目录导出成语料文件做离线评测。
+     * 混进 workspace 会把用户的工作区塞满内部文件 ——
+     * 导出、分享、同步都会被这些文件干扰。
+     *
+     * 它仍在应用专属外部目录下（/sdcard/Android/data/<包名>/files/traj/），
+     * 卸载即清除，不会残留到公共存储。
+     */
     private File areaDir(String area) {
-        String name = "library".equals(area) ? "library" : "workspace";
+        String name;
+        if ("library".equals(area)) {
+            name = "library";
+        } else if ("traj".equals(area)) {
+            name = "traj";
+        } else {
+            name = "workspace";
+        }
         File dir = new File(root, name);
         if (!dir.exists()) dir.mkdirs();
         return dir;

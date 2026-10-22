@@ -802,6 +802,51 @@
   background: linear-gradient(160deg, rgba(71, 99, 244, 0.09), var(--surface));
 }
 
+.a11y-steps {
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  padding: 10px 12px;
+  margin-bottom: 10px;
+}
+
+.a11y-steps__title {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+
+.a11y-steps__item {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.a11y-steps__item b:first-child {
+  display: inline-block;
+  min-width: 15px;
+  height: 15px;
+  line-height: 15px;
+  text-align: center;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 9.5px;
+  margin-right: 5px;
+}
+
+.a11y-steps__note {
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-radius: var(--r-sm);
+  padding: 7px 9px;
+  margin-top: 8px;
+}
+
 .key-warning {
   display: flex;
   gap: 8px;
@@ -1936,4 +1981,225 @@ html[data-density="compact"] .conn-banner {
   justify-content: center;
   margin-top: 14px;
   flex-wrap: wrap;
+}
+
+/* ---------------- 本机控制（白名单） ---------------- */
+
+.settings__row-btn {
+  flex: 0 0 auto;
+  border: 1px solid var(--line);
+  background: var(--surface-2, var(--surface));
+  color: var(--text);
+  font-size: 11.5px;
+  padding: 6px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.settings__row-btn:active {
+  transform: scale(0.97);
+}
+
+.local-apps {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  padding: 4px;
+  background: var(--surface);
+}
+
+.local-app {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: var(--r-sm, 8px);
+  cursor: pointer;
+  min-width: 0;
+}
+
+.local-app:active {
+  background: var(--surface-2, rgba(127, 127, 127, 0.08));
+}
+
+.local-app input[type="checkbox"] {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent, #3b82f6);
+}
+
+.local-app__label {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.local-app__pkg {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 46%;
+  font-size: 10.5px;
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: right;
+}
+
+/* ---------- 无障碍生命周期诊断（0.23.1） ---------- */
+
+/* 折叠起来，默认不占版面 —— 它只在排障时才需要看 */
+.a11y-diag {
+  margin-top: 12px;
+  border-top: 1px dashed var(--line);
+  padding-top: 10px;
+}
+
+.a11y-diag > summary {
+  font-size: var(--fs-12);
+  color: var(--dim);
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  user-select: none;
+}
+
+.a11y-diag > summary::-webkit-details-marker {
+  display: none;
+}
+
+.a11y-diag > summary::before {
+  content: "▸";
+  font-size: 9px;
+  color: var(--dim);
+  transition: transform var(--dur-1) ease;
+}
+
+.a11y-diag[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.a11y-diag__log {
+  margin: 8px 0 0;
+  padding: 9px 10px;
+  max-height: 220px;
+  overflow: auto;
+  border-radius: var(--r-sm);
+  background: var(--bg-deep);
+  border: 1px solid var(--line);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.7;
+  color: var(--text-soft);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* 环境自检表（0.23.2） */
+.a11y-check {
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  overflow: hidden;
+}
+
+.a11y-check__row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 9px;
+  font-size: 11.5px;
+  border-bottom: 1px solid var(--line);
+}
+
+.a11y-check__row:last-child {
+  border-bottom: 0;
+}
+
+.a11y-check__dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+.a11y-check__dot.is-ok {
+  background: var(--ok);
+}
+
+.a11y-check__dot.is-bad {
+  background: var(--danger);
+}
+
+.a11y-check__label {
+  flex: none;
+  width: 96px;
+  color: var(--muted);
+}
+
+.a11y-check__val {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-soft);
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 一句话结论（0.23.2） */
+.a11y-verdict {
+  margin-bottom: 10px;
+  padding: 9px 11px;
+  border-radius: var(--r-sm);
+  font-size: 12px;
+  line-height: 1.7;
+  border-left: 2px solid var(--line-strong);
+  background: rgba(233, 237, 245, 0.03);
+  color: var(--text-soft);
+}
+
+.a11y-verdict--ok {
+  border-left-color: var(--ok);
+  background: var(--ok-soft);
+  color: var(--text);
+}
+
+.a11y-verdict--warn {
+  border-left-color: var(--warn);
+  background: var(--warn-soft);
+  color: var(--text);
+}
+
+.a11y-verdict--bad {
+  border-left-color: var(--danger);
+  background: var(--danger-soft);
+  color: var(--text);
+}
+
+/* 通道标签（0.25.0）：区分高速 / 低速，避免用户误以为两个是同一个东西 */
+.ch-tag {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.4px;
+  color: var(--accent-bright);
+  background: rgba(71, 99, 244, 0.14);
+  border: 1px solid var(--accent-line);
+  vertical-align: middle;
 }

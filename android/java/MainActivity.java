@@ -68,10 +68,46 @@ public class MainActivity extends BridgeActivity {
                     new DshPowerBridge(getApplicationContext()),
                     "DshPower"
             );
+            // 本机 MCP：白名单读写 + 启停服务
+            getBridge().getWebView().addJavascriptInterface(
+                    new DshMcpBridge(getApplicationContext()),
+                    "DshMcp"
+            );
+            // 语音识别：WebView 里没有 Web Speech API，必须走系统 SpeechRecognizer
+            getBridge().getWebView().addJavascriptInterface(
+                    new DshSpeechBridge(this, getBridge().getWebView()),
+                    "DshSpeech"
+            );
+            // Node 插件运行时：DSH 的插件是进程内 npm 包，WebView 沙箱跑不了，
+            // 只能把真 Node 拉起来（独立进程，不影响这里的渲染）
+            //
+            // 传 WebView 进去：Node 的响应要通过它 evaluateJavascript 送回页面，
+            // 通道才有回路。
+            getBridge().getWebView().addJavascriptInterface(
+                    new DshNodeBridge(getApplicationContext(), getBridge().getWebView()),
+                    "DshNode"
+            );
             installCrashGuard(getBridge());
             keepRendererAlive();
+            // 登记 WebView：悬浮窗要用它把「发消息 / 停止」指令送回页面里的 JS。
+            //
+            // HUD 服务跑在主进程，和这里是同一个进程，所以直接持有引用即可，
+            // 不需要广播或 IPC。onDestroy 里会清掉。
+            DshHudState.webView = getBridge().getWebView();
+            // Node 通道同理：Node 的响应要送回页面。
+            DshNodeChannel.get().attach(getBridge().getWebView());
         }
         lockTextZoom();
+    }
+
+    @Override
+    public void onDestroy() {
+        // 清掉 WebView 引用：Activity 死了之后这个引用就是悬空的，
+        // 悬浮窗再调 sendCommand 会打到已销毁的 WebView 上。
+        DshHudState.webView = null;
+        // Node 通道同理 —— 它也持有 WebView 引用。
+        DshNodeChannel.get().detach();
+        super.onDestroy();
     }
 
     /**
@@ -169,6 +205,24 @@ public class MainActivity extends BridgeActivity {
     public void onResume() {
         super.onResume();
         lockTextZoom();
+        // 无障碍保活对齐：用户在系统设置里刚打开/关掉无障碍开关回到本应用时，
+        // 这里按系统权威状态同步保活前台服务的启停。
+        // （前台启动，合法，不会触发 Android 12+ 的后台 FGS 限制。）
+        try {
+            // 本机控制启用时，确保 :device 进程活着。
+            //
+            // 这个进程装的是无障碍服务 + MCP server。它平时由系统绑定无障碍时拉起，
+            // 但如果用户没开无障碍、或进程被清过，这里的幂等 start 能把它补回来。
+            // 传 enabled 而不是让它读 SharedPreferences —— 跨进程的 SharedPreferences
+            // 是进程内缓存，:device 那份可能是旧的。
+            if (DshMcpPolicy.isEnabled(this)) {
+                DshDeviceService.start(this, true);
+            }
+        } catch (Throwable ignored) {
+        }
+        // 无障碍保活与自愈任务已于 0.26.0 随无障碍通道一起删除。
+        // 现在界面操作只走 Shizuku：它的权限来自 ADB，落在 shell 进程，
+        // 不需要本进程常驻，也就不需要保活。
     }
 
     @Override
@@ -192,6 +246,12 @@ public class MainActivity extends BridgeActivity {
             if (settings.getTextZoom() != 100) settings.setTextZoom(100);
         } catch (Exception ignored) {
         }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        if (DshSpeechBridge.handlePermissionResult(requestCode, permissions, grantResults)) return;
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
     }
 
     /** 文件选择器 / 另存为 的结果转交给文件桥。 */

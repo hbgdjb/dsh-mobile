@@ -14,6 +14,7 @@ import {
   addMessage,
   activeSession,
   setSettings,
+  setNodePlugins,
   togglePlugin,
   installPlugin,
   toggleAutomation,
@@ -73,6 +74,13 @@ import { isTextPath } from "./fs.js";
 import { isImagePath, imageMime, prepareThumb, prepareImage } from "./image.js";
 import { renderMarkdown, plainText } from "./markdown.js";
 import { availableToolNames } from "./tools.js";
+import { searchOfficialPlugins } from "./plugin-manifest.js";
+import {
+  inspectPlugin,
+  installPluginPackage,
+  uninstallPlugin,
+  setPluginEnabled,
+} from "./plugin-install.js";
 import {
   mountEffortSlider,
   effortIndex,
@@ -80,8 +88,8 @@ import {
   effortColor,
 } from "./effort-slider.js";
 import { fmtContext } from "./context.js";
-import { runAgent, testConnection, testProvider, testModel, fetchModelList, spawnSubagentOnce } from "./runtime.js";
-import { mcpDiscover } from "./mcp.js";
+import { runAgent, testConnection, testProvider, testModel, fetchModelList, spawnSubagentOnce, promptStats } from "./runtime.js";
+import { mcpDiscoverWithRetry } from "./mcp.js";
 import { downloadBase64 } from "./office.js";
 import { hudRender, hudPermissionGranted, nativeHudAvailable } from "./hud.js";
 import {
@@ -91,7 +99,51 @@ import {
   openBatterySettings,
   openAutoStartSettings,
 } from "./keep-alive.js";
+import {
+  listAll as listMemories,
+  remove as removeMemory,
+  clearAll as clearMemories,
+  stats as memoryStats,
+  memoryBudget,
+  MEMORY_TYPES,
+} from "./memory.js";
+import {
+  localMcpAvailable,
+  localStatus,
+  localServerConfig,
+  setServerEnabled,
+  restartServer,
+  addAllowed,
+  removeAllowed,
+  getAllowedPackages,
+  openAppInfoSettings,
+  requestShizukuPermission,
+  connectShizuku,
+  openShizukuApp,
+  isPointerMarkEnabled,
+  setPointerMarkEnabled,
+} from "./mcp-local.js";
 import { SAFETY_RULES } from "./safety.js";
+import {
+  listIndex as listTrajIndex,
+  trajStats as trajStats,
+  setOutcome as setTrajOutcome,
+  removeTrajectory as removeTrajectory,
+  clearTrajectories as clearTrajectories,
+  searchTrajectories as searchTrajectories,
+  exportCorpus as exportTrajCorpus,
+} from "./traj.js";
+import { nodeBridgeAvailable, nodeStatus, nodeStart, nodeStop, nodeDownload, nodePing, nodeCall } from "./node-runtime.js";
+import { refreshNodeTools } from "./node-plugins.js";
+import {
+  startVoice,
+  stopVoice,
+  cancelVoice,
+  voiceState,
+  onVoiceEvent,
+  requestVoicePermission,
+  voiceDownloadModel,
+} from "./voice.js";
 import {
   renderHome,
   renderWorkspace,
@@ -100,6 +152,7 @@ import {
   renderSettings,
   SETTINGS_CAT_MAP,
   renderDrawer as renderDrawerHTML,
+  setVoiceDownload,
 } from "./screens.js";
 
 /* ---------------- 本地 UI 状态 ---------------- */
@@ -115,6 +168,8 @@ const ui = {
   reasoningOpen: new Set(),
   draft: "",
   composing: false,
+  // 组合输入的最近一次事件时刻：用来识别「compositionend 丢失」的残留标志
+  composingAt: 0,
   sheetTimer: null,
   confirmAction: null,
   testing: false,
@@ -127,6 +182,8 @@ const ui = {
   imageViewer: false,  // 图片查看器是否打开（返回键优先关它）
   settingsCat: null,
   pluginQuery: "",
+  pluginUrl: "",
+  pluginInspect: null,
   layer: false,
   hudCue: null, // 一次性动画事件（start / failed / limitHit），快照消费后清空
   hudBadge: null, // 持续徽标 {kind: "failed"|"limited", until}
@@ -160,6 +217,7 @@ export function initUI() {
   applyDisplaySettings();
 
   bindEvents();
+  initVoiceUi();
   subscribe((detail) => {
     if (detail?.type === "settings") {
       document.documentElement.dataset.theme = state.settings.theme;
@@ -183,6 +241,92 @@ export function initUI() {
   initNativeBack();
   startHudLoop();
   installLifecycleHooks();
+  startNodeRuntime();
+  startNodePoll();
+}
+
+/**
+ * 启动 Node 插件运行时。
+ *
+ * 用户选择的是"装了插件就自动起"，所以这里不等用户操作。
+ * 但延迟 1.2 秒：Node 启动要先解压运行时目录、再拉进程，
+ * 和首屏第一帧抢 CPU 会让冷启动肉眼可见地变慢。
+ *
+ * ============ 关键：没装运行时就不启动，也不下载 ============
+ *
+ * 运行时是 88 MB。应用启动时自动下载它，等于用户什么都没干
+ * 就被吃掉 88 MB 流量和 88 MB 存储。所以这里只判断"装没装"，
+ * 装了就起，没装就安静地等用户去设置页点下载。
+ */
+function startNodeRuntime() {
+  if (!nodeBridgeAvailable()) return; // 浏览器 / PWA：没有原生桥，不假装支持
+  if (state.settings.nodeEnabled === false) return;
+  setTimeout(() => {
+    const st = nodeStatus();
+    if (!st.available) {
+      console.warn("[node] 运行时不可用：", st.reason || st.error || "原生库未加载");
+      return;
+    }
+    if (!st.installed) {
+      // 没装：等用户在设置里点「下载运行时」
+      console.info("[node] 运行时未下载，等待用户手动下载");
+      return;
+    }
+    if (!st.running) nodeStart();
+  }, 1200);
+}
+
+/**
+ * 从 Node 运行时同步插件清单到界面状态。
+ *
+ * 清单来自 Node —— 它才是真正加载了插件的那一方。
+ * 页面这边的 state.plugins 只管 iframe 插件，两套分开。
+ */
+async function syncNodePluginList() {
+  if (!nodeBridgeAvailable()) return;
+  const st = nodeStatus();
+  if (!st.channelConnected) return;
+  try {
+    const r = await nodeCall("plugins.list", {});
+    setNodePlugins(Array.isArray(r?.plugins) ? r.plugins : []);
+  } catch {
+    /* 读不到就保持原样，不清空 —— 免得界面闪一下 */
+  }
+}
+
+/**
+ * 轮询 Node 运行时状态。
+ *
+ * ============ 为什么需要轮询 ============
+ *
+ * 语音模型的下载进度是原生侧主动 push 事件的（onVoiceEvent），
+ * 但 Node 运行时的下载是纯原生状态 —— 没有事件通道。
+ * 所以这里用低频轮询把「正在下载 42%」反映到设置页上。
+ *
+ * 频率 1 秒：88 MB 的下载要一两分钟，1 秒一跳足够看清在动，
+ * 又不至于每秒都重绘整页（那会卡）。
+ *
+ * 只在设置页且状态有变化时才重绘。
+ */
+let nodePollTimer = null;
+let nodePollLast = "";
+
+function startNodePoll() {
+  if (nodePollTimer) return;
+  nodePollTimer = setInterval(() => {
+    if (!nodeBridgeAvailable()) return;
+    const st = nodeStatus();
+    // 只有这几个字段变化时才需要重绘
+    const key = `${st.available}|${st.installed}|${st.downloading}|${st.running}|${st.percent}|${st.channelConnected}|${st.runtimeError || ""}`;
+    if (key === nodePollLast) return;
+    const wasConnected = nodePollLast.split("|")[6] === "true";
+    nodePollLast = key;
+    // 通道刚连上 → 拉一次插件清单（Node 起来时插件已经加载好了）
+    if (st.channelConnected && !wasConnected) {
+      syncNodePluginList();
+    }
+    if (ui.view === "settings") renderMain(true);
+  }, 1000);
 }
 
 /* ---------------- 生命周期钩子 ---------------- */
@@ -294,7 +438,8 @@ function initNativeBack() {
 
 /* ---------------- 外壳 ---------------- */
 
-function renderAll() {
+/** 全量重绘（切主题、切会话、重置后都会走这里）。导出供测试验证重渲染后的状态一致性。 */
+export function renderAll() {
   renderAppbar();
   renderTabbar();
   renderMain(true);
@@ -322,7 +467,7 @@ function renderAppbar() {
   } else if (ui.view === "plugins") {
     title = "插件";
     kicker = "";
-    actions = `<button class="icon-btn" data-act="plugin-search" aria-label="查找插件">${icon("search")}</button>`;
+    actions = `<button class="icon-btn" data-act="plugin-search" aria-label="安装插件">${icon("download")}</button>`;
   } else if (ui.view === "tasks") {
     title = "任务";
     kicker = "";
@@ -461,6 +606,7 @@ function renderChat(root, anchor = "bottom") {
     </div>`;
 
   ui.msgNodes = new Map(); // DOM 是全新的，旧的节点引用作废
+  voiceResync(); // composer 是新建的节点，录音条与麦克风按钮要重新贴状态
   releaseThumbs($("#messages")); // 释放上一屏的图片内存
   ui.renderFrom = Math.max(0, (s?.messages.length || 0) - RENDER_WINDOW);
 
@@ -551,12 +697,141 @@ async function testNotification() {
   toast("通知权限未授予，将使用应用内提醒", "ok");
 }
 
+/**
+ * 「我的记忆」面板。
+ *
+ * 这一页是整套方案里**最不能省**的一半。
+ * 记忆库如果只能写不能看，用户就无法纠正它 —— 而一份错了的记忆
+ * 比没有记忆更糟：模型会拿错误的事实去「有据可依」地回答。
+ *
+ * 所以提供：查看 / 单条删除 / 全部清空。
+ */
+function memorySheet() {
+  const list = listMemories();
+  const st = memoryStats();
+  const typeName = (t) => MEMORY_TYPES[t]?.label || "事实";
+  // 注入规模体检：让「记忆库会占多少上下文」变成看得见的事实，
+  // 而不是等对话变慢变贵了才反应过来
+  const budget = memoryBudget("");
+  const budgetLine = `<div class="diag-row"><div class="diag-row__sub">单次注入上限 ${budget.limits.maxEntries} 条 / 约 ${budget.limits.maxTokens} token · 超出部分按相关度丢弃</div></div>`;
+  const body = (list.length
+    ? list
+        .map(
+          (m) => `
+        <div class="diag-row">
+          <div class="diag-row__top">
+            <span class="tag ${m.type === "correction" ? "tag--on" : ""}">${esc(typeName(m.type))}</span>
+            <b>${esc(m.key)}</b>
+            <button class="icon-btn icon-btn--sm" data-act="delete-memory" data-key="${esc(m.key)}" aria-label="删除这条记忆">${icon("trash", "icon--sm")}</button>
+          </div>
+          <div class="diag-row__sub">${esc(m.value)}</div>
+          <div class="diag-row__sub">置信度 ${(m.confidence * 100).toFixed(0)}% · ${fmtRelative(m.updatedAt)}</div>
+        </div>`
+        )
+        .join("")
+    : `<div class="empty-line"><b>还没有任何记忆</b>记忆由对话自动积累：在对话里说出你的偏好、纠正模型的错误，或让它记录重要事实，都会被存下来。<br>这里也可以随时查看、删除或纠正它们。</div>`) + budgetLine;
+  return sheetFrame({
+    title: "我的记忆",
+    desc: `${st.total} 条 · 档案「${esc(st.profile)}」· 只存在本机。这些内容会被注入每次对话，用来替代模型自己的猜测。`,
+
+    body,
+    foot: `<button class="btn btn--ghost" data-act="clear-memories" style="flex:1">全部清空</button>`,
+  });
+}
+
+/**
+ * 控屏轨迹库（0.34.0）。
+ *
+ * ============ 为什么这个页面不能省 ============
+ *
+ * 轨迹是「机器从你的操作里学到的样本」，它的价值完全取决于**准不准**。
+ * 一条被误标成「成功」的轨迹，会在下次检索时被当成范例注入给模型 ——
+ * 于是错误被复制，而且越用越固。
+ *
+ * 所以这一页必须让用户能：
+ *   1. 逐条判定成功 / 失败（只有「成功」才进检索池）
+ *   2. 看到原文（指令 + 动作序列 + 应用版本）
+ *   3. 删掉不想要的
+ *   4. **用一句中文指令现场检索**，直接看命中率
+ *
+ * 第 4 条是这个页面的核心：它是「中文检索到底行不行」的人肉验证器。
+ */
+function trajSheet() {
+  const list = listTrajIndex();
+  const st = trajStats();
+  const query = (ui.trajQuery || "").trim();
+  const hits = query ? searchTrajectories(query, { limit: 8 }) : [];
+
+  const stats = `<div class="diag-row">
+    <div class="diag-row__top">
+      <span class="tag tag--on">${st.success}</span><b>已确认成功</b>
+      <span class="tag">${st.pending}</span><span>待确认</span>
+      <span class="tag">${st.fail}</span><span>失败</span>
+    </div>
+    <div class="diag-row__sub">共 ${st.total} 条 · ${st.steps} 个动作 · 只存在本机，落库前已脱敏（手机号 / 验证码 / 卡号 / 邮箱）</div>
+  </div>`;
+
+  const search = `<div class="field">
+    <label class="field__label" for="traj-q">用中文指令检索</label>
+    <input class="input" id="traj-q" placeholder="例如：打开微信搜一下天气" value="${esc(query)}" data-act="traj-search" autocomplete="off">
+    <p class="field__hint">${
+      query
+        ? hits.length
+          ? `命中 ${hits.length} 条（相似度 ${hits.map((h) => h.sim.toFixed(2)).join("、")}）`
+          : "没有命中。只有「已确认成功」的轨迹会进检索池 —— 先在下面把轨迹标成成功。"
+        : "输入一句中文，看能不能召回对应轨迹。召回不了，说明语料还不够或机制有问题。"
+    }</p>
+  </div>`;
+
+  const body =
+    stats +
+    search +
+    (list.length
+      ? list
+          .slice(0, 60)
+          .map((e) => {
+            const mark = e.outcome === "success" ? "成功" : e.outcome === "fail" ? "失败" : "待确认";
+            const tagCls = e.outcome === "success" ? "tag--on" : "";
+            return `<div class="diag-row">
+        <div class="diag-row__top">
+          <span class="tag ${tagCls}">${mark}</span>
+          <b>${esc(e.instruction || "（无指令）")}</b>
+        </div>
+        <div class="diag-row__sub">${esc(e.app || "?")} ${esc(e.appVersion || "")} · ${e.steps} 步 · ${fmtRelative(e.ts)}${
+          e.replayable === false ? " · 含裸坐标，不可回放" : ""
+        }</div>
+        <div class="diag-row__top" style="margin-top:6px">
+          <button class="btn btn--ghost btn--sm" data-act="traj-mark" data-id="${esc(e.id)}" data-outcome="success">成功</button>
+          <button class="btn btn--ghost btn--sm" data-act="traj-mark" data-id="${esc(e.id)}" data-outcome="fail">失败</button>
+          <button class="icon-btn icon-btn--sm" data-act="traj-del" data-id="${esc(e.id)}" aria-label="删除">${icon("trash", "icon--sm")}</button>
+        </div>
+      </div>`;
+          })
+          .join("")
+      : `<div class="empty-line"><b>还没有控屏轨迹</b>让 DSH 操作一次手机界面（读屏、点击、输入）就会自动记一条。<br>指令来自你当时说的话，所以语料天然是中文 —— 这正是它能被中文检索到的原因。</div>`);
+
+  return sheetFrame({
+    title: "控屏轨迹",
+    desc: `${st.total} 条 · 每条 = 一次控屏操作的全过程。只存在本机。`,
+    body,
+    foot: `<button class="btn btn--ghost" data-act="export-traj" style="flex:1">导出语料</button>
+           <button class="btn btn--ghost" data-act="clear-traj" style="flex:1">全部清空</button>`,
+  });
+}
+
 function diagnosticsSheet() {
   const list = state.diagnostics?.requests || [];
-  return sheetFrame({
-    title: "请求日志",
-    desc: `最近 ${list.length} 次真实请求；只存在本机，不含 Key 与会话正文。`,
-    body: list.length
+  // 提示词体量体检：system prompt 是每轮都要重发的固定开销，
+  // 得让人能看见它现在多大、哪些段被降级掉了
+  const ps = promptStats();
+  const dropped = ps.dropped.length ? ps.dropped.join("、") : "无";
+  const promptLine = `<div class="diag-row">
+    <div class="diag-row__top"><b>系统提示词体量</b><span class="mono" style="margin-left:auto">${ps.tokens} tok</span></div>
+    <div class="diag-row__sub">预算 ${ps.budget} token · ${ps.sections} 段 · 已降级：${esc(dropped)}</div>
+    <div class="diag-row__sub">${ps.tierTokens.map((t) => `${esc(t.id)} ${t.tokens}`).join(" · ")}</div>
+  </div>`;
+  const body =
+    (list.length
       ? list
           .map(
             (e) => `
@@ -571,7 +846,11 @@ function diagnosticsSheet() {
         </div>`
           )
           .join("")
-      : `<div class="empty-line"><b>还没有请求记录</b>配置 Key 后发起一次真实模型请求，这里会记录端点、模型、状态、耗时与 token。<br>未连接模型时不会产生请求。</div>`,
+      : `<div class="empty-line"><b>还没有请求记录</b>配置 Key 后发起一次真实模型请求，这里会记录端点、模型、状态、耗时与 token。<br>未连接模型时不会产生请求。</div>`) + promptLine;
+  return sheetFrame({
+    title: "请求日志",
+    desc: `最近 ${list.length} 次真实请求；只存在本机，不含 Key 与会话正文。`,
+    body,
     foot: `<button class="btn btn--ghost" data-act="copy-diagnostics" style="flex:1">复制 JSON</button>
            <button class="btn btn--danger" data-act="clear-diagnostics" style="flex:1">清空</button>`,
   });
@@ -700,12 +979,23 @@ function renderComposer(s) {
   <div class="composer-wrap">
     <div class="composer">
       <div class="composer__files" id="composer-files" ${ui.attachments.length ? "" : "hidden"}>${attachmentChips()}</div>
+      <div class="voice-strip" id="voice-strip" ${voiceState() === "idle" ? "hidden" : ""} aria-live="polite">
+        <span class="voice-strip__dot" aria-hidden="true"></span>
+        <div class="voice-strip__main">
+          <div class="voice-strip__bars" id="voice-bars" aria-hidden="true">
+            ${Array.from({ length: 5 }, () => '<i></i>').join("")}
+          </div>
+          <div class="voice-strip__text" id="voice-text">正在听…</div>
+        </div>
+        <button class="voice-strip__btn" data-act="voice-cancel" aria-label="取消语音输入">${icon("x", "icon--sm")}</button>
+        <button class="voice-strip__btn voice-strip__btn--go" data-act="voice-stop" aria-label="结束并写入">${icon("check", "icon--sm")}</button>
+      </div>
       <textarea class="composer__input" id="composer-input" rows="1" enterkeyhint="send"
         placeholder="${s && s.messages.length ? "接着说要改什么，或 / 调指令" : "描述目标，@ 引用文件，/ 调指令"}"></textarea>
       <div class="composer__foot">
         <div class="composer__tools">
           <button class="icon-btn icon-btn--sm" data-act="attach" aria-label="添加文件">${icon("plus")}</button>
-          ${state.plugins.find((p) => p.id === "voice" && p.enabled) ? `<button class="icon-btn icon-btn--sm" data-act="voice" aria-label="语音输入">${icon("mic", "icon--sm")}</button>` : ""}
+          ${state.plugins.find((p) => p.id === "voice" && p.enabled) ? `<button class="icon-btn icon-btn--sm" data-act="voice" id="voice-btn" aria-label="语音输入" aria-pressed="false">${icon("mic", "icon--sm")}</button>` : ""}
         </div>
         <button class="send" id="send-btn" data-act="send" aria-label="发送">${icon("arrowUp", "icon--sm")}</button>
       </div>
@@ -886,6 +1176,12 @@ function headHtml(m, running) {
 
 function extraHtml(m) {
   return `${
+    m.contextPack?.compacted
+      ? `<div class="msg__notice">${icon("bolt", "icon--xs")} 已压缩 ${m.contextPack.compacted} 处工具输出 · 回收约 ${Math.round(
+          (m.contextPack.reclaimed || 0) / 1000,
+        )}K token</div>`
+      : ""
+  }${
     m.contextTrim
       ? `<div class="msg__notice">${icon("layers", "icon--xs")} 较早的 ${m.contextTrim.removed} 轮已省略 · 窗口 ${fmtContext(m.contextTrim.window)}</div>`
       : ""
@@ -1100,6 +1396,7 @@ function patchAssistant(el, m) {
       .map((t) => `${t.id}:${t.status}:${(t.output || "").length}:${t.ms || 0}:${ui.toolOpen.has(t.id) ? 1 : 0}`)
       .join(","),
     m.contextTrim?.removed || 0,
+    m.contextPack?.compacted || 0,
     m.media?.sent || 0,
     m.media?.images || 0,
     open ? 1 : 0,
@@ -1287,8 +1584,12 @@ function renderTool(t) {
     error: { tag: "失败", cls: "tool__tag--err", ic: "alert", spin: false },
     denied: { tag: "已拒绝", cls: "tool__tag--err", ic: "x", spin: false },
     blocked: { tag: "已拦截", cls: "tool__tag--err", ic: "shield", spin: false },
+    // 「需要你处理」和「单纯失败」要分开：前者重试一百次也没用（凭据错、地址错），
+    // 后者可能是网络抖动。混在一起用户不知道该不该再点一次。
+    needs_user: { tag: "需处理", cls: "tool__tag--warn", ic: "alert", spin: false },
   };
-  const st = map[t.status] || map.running;
+  // 未知状态不再默认成「运行中」—— 那会让一个已经失败的调用一直转圈。
+  const st = map[t.status] || map.error;
 
   const argsText = (() => {
     if (t.name === "fs_write" || t.name === "fs_read") return t.args?.path || t.argLabel;
@@ -1304,7 +1605,15 @@ function renderTool(t) {
       </span>
       <span class="tool__name">${esc(t.name)}</span>
       <span class="tool__arg">${esc(argsText)}</span>
-      ${t.status === "done" ? `<span class="tag">${t.ms ? fmtClock(t.ms) : ""}</span>` : `<span class="tool__tag ${st.cls}">${st.tag}</span>`}
+      ${
+        t.status === "done"
+          ? `<span class="tag">${t.ms ? fmtClock(t.ms) : ""}</span>${
+              // 耗时异常长 = 客户端被系统挂起过，不是 DSH 慢。
+              // 不标出来的话，用户只会觉得"这软件越来越卡"。
+              t.suspended ? `<span class="tool__tag tool__tag--warn" title="客户端曾被系统挂起，期间屏幕可能已变化">含挂起</span>` : ""
+            }`
+          : `<span class="tool__tag ${st.cls}">${st.tag}</span>`
+      }
       ${icon("chevron", "icon--xs tool__chev")}
     </button>
     <div class="tool__body">
@@ -1312,6 +1621,7 @@ function renderTool(t) {
       ${t.code ? `<p class="tool__label">编排脚本</p><pre class="tool__code">${esc(t.code)}</pre>` : ""}
       ${t.status === "waiting" ? `<div class="tool__statusline">${icon("shield", "icon--xs")} 等待你在下方审批</div>` : ""}
       ${t.safety?.warn ? `<div class="tool__notice tool__notice--warn">${icon("shield", "icon--xs")} CC Safety Net 提醒：${esc(t.safety.secrets.join("、"))}</div>` : ""}
+      ${t.suspended ? `<div class="tool__notice tool__notice--warn">${icon("alert", "icon--xs")} 这次调用耗时 ${fmtClock(t.ms)}，DSH 当时可能被系统挂起在后台。挂起期间屏幕可能已变化，模型已被提示先重新读屏确认。</div>` : ""}
       ${t.output ? `<p class="tool__label">输出</p><pre class="tool__code">${esc(t.output)}</pre>` : ""}
       ${t.export ? `<button class="btn btn--sm btn--soft" style="margin-top:10px" data-act="download-file" data-path="${esc(t.export.path)}">${icon("download", "icon--xs")} 下载 ${esc(t.export.path.split("/").pop())}</button>` : ""}
       ${
@@ -1348,22 +1658,120 @@ function restoreDraft() {
   autoGrow();
 }
 
-/* autoGrow 用 rAF 合并：连续按键只做一次高度计算；
-   组合输入（拼音/语音候选）期间完全不改动输入框，避免打断输入法 */
+/* autoGrow 用 rAF 合并：连续按键只做一次高度计算。 */
 let growPending = false;
+
+/**
+ * 输入框高度跟随内容。
+ *
+ * ============ 这里有一个曾经把功能改坏的取舍 ============
+ *
+ * 原来的写法在**组合输入期间直接跳过**（拼音候选、语音候选都算）：
+ *
+ *     if (!input || ui.composing) return;
+ *
+ * 理由是"避免打断输入法"。担心不是没有根据 —— 改 textarea 高度会触发
+ * layout，Android 上候选框可能跟着重排、闪一下。
+ *
+ * 但代价太大：**WebView 里 `compositionend` 丢失是常见现象**
+ * （输入法上屏方式不同、语音识别走 setComposingText 提交、
+ *  某些 ROM 的输入法干脆不发这个事件）。
+ * 一旦 `ui.composing` 卡在 true，高度就永久冻结在那一刻的值 ——
+ *
+ *   · 继续打字，输入框不再长高 → **第二行开始看不见自己正在输的字**；
+ *   · 语音识别追加文字走的是同一条路径 → **语音"没反应"**（其实文字进去了）。
+ *
+ * 两个看起来无关的抱怨，其实是同一个根因。
+ *
+ * ============ 现在的做法 ============
+ *
+ * **高度变化不阻塞**（它不改 value，不会真正打断输入），
+ * 但只在高度**确实需要变**时才写 style —— 把强制重排压到最少：
+ * 没变就不碰 DOM，等于给输入法让路。
+ *
+ * 只有「按钮重绘」那类真的会打断输入法的操作，才继续看 composing。
+ */
 function autoGrow() {
   if (growPending) return;
   growPending = true;
   requestAnimationFrame(() => {
     growPending = false;
     const input = $("#composer-input");
-    if (!input || ui.composing) return;
+    if (!input) return;
+
+    // 先归零再读 scrollHeight，否则收缩时读到的是旧高度
     input.style.height = "auto";
-    input.style.height = `${Math.min(input.scrollHeight, 132)}px`;
+    const full = input.scrollHeight;
+    const next = Math.min(full, 132);
+
+    // ============ 这里必须无条件写回，不能做"值没变就跳过"的优化 ============
+    //
+    // 踩过一次：为了少碰 DOM，写成 `if (prev !== next + "px") 才写`。
+    // 结果 autoGrow 在一次输入里跑两遍（input 一次、其它路径一次）时，
+    // 第二遍看到 prev 已经是上次算出来的 32px、next 也是 32 —— 判定"没变"，
+    // 于是**高度留在上一步刚设的 `auto` 上**。
+    //
+    // 而 textarea 加了 rows="1"，`height:auto` 就是一行高：
+    // 内容明明 80px，框还是 32px，第二行起全看不见。
+    //
+    // 教训：读 scrollHeight 前必须先破坏高度，这一步本身就改变了样式，
+    // 所以后面没有"跳过写回"的余地。
+    input.style.height = `${next}px`;
+
+    // 超过上限后，浏览器不一定把光标滚进可视区（WebView 上很常见），
+    // 于是"正在输的那一行"落在框外。输入时跟到底部是符合直觉的。
+    if (full > next) input.scrollTop = full;
   });
 }
 
 let lastSendKind = "";
+
+/**
+ * 内容高度变了才重排 —— 给轮询用的轻量版本。
+ *
+ * `autoGrow` 内部会先把 height 设成 auto 再读 scrollHeight，那是一次强制布局。
+ * 400ms 一次虽然不贵，但没必要在用户发呆时也一直重排。
+ *
+ * 这里先用**当前固定高度**下的 scrollHeight 做比较（此时它仍然反映内容实际高度），
+ * 变了才调 autoGrow。没变就一个 DOM 操作都不做。
+ */
+let lastGrowH = -1;
+function growIfChanged() {
+  const input = $("#composer-input");
+  if (!input) return;
+  const h = input.scrollHeight;
+  if (h === lastGrowH) return;
+  lastGrowH = h;
+  autoGrow();
+}
+
+/**
+ * 现在到底是不是"真的还在组合输入"。
+ *
+ * ============ 为什么不能只看 ui.composing ============
+ *
+ * `compositionend` 在 Android WebView 上会丢（不同输入法上屏方式不一样），
+ * 标志一旦卡在 true 会连锁出三个问题：
+ *
+ *   1. 输入框高度不涨 → 第二行起看不见正在输的字；
+ *   2. 点发送只弹「先让输入法确认候选」→ **永远发不出去**；
+ *   3. 输入 "/" 不弹命令面板。
+ *
+ * 所以这里加**时效**：真正的组合输入，每敲一下都会刷新时间戳；
+ * 超过 3 秒没有任何组合事件，就认为那个标志是残留，不再拦着用户。
+ *
+ * 单纯靠事件复位不够 —— 因为出问题的正是"事件没来"这件事本身。
+ */
+const COMPOSING_STALE_MS = 3000;
+function isComposingNow() {
+  if (!ui.composing) return false;
+  if (Date.now() - (ui.composingAt || 0) > COMPOSING_STALE_MS) {
+    // 超时未刷新：判定为残留标志，顺手清掉
+    ui.composing = false;
+    return false;
+  }
+  return true;
+}
 
 /**
  * 是否有"孤儿运行"：状态里标记为 running，但内存里已经没有对应的执行器。
@@ -1751,6 +2159,8 @@ function renderSheet() {
     models: modelsSheet,
     "custom-model": customModelSheet,
     diagnostics: diagnosticsSheet,
+    memory: memorySheet,
+    traj: trajSheet,
     mcp: mcpSheet,
     "mcp-server": mcpServerSheet,
     workspace: workspaceSheet,
@@ -2383,7 +2793,9 @@ function mcpSheet() {
           )
           .join("")
       : `<div class="empty-line"><b>还没有 MCP 服务器</b>支持 Streamable HTTP 的 MCP 服务可以接进来；<br>stdio / 本地进程型服务器需要原生能力，当前不支持。</div>`,
-    foot: `<button class="btn btn--primary btn--block" data-act="new-mcp">${icon("plus", "icon--xs")} 添加服务器</button>`,
+    foot: `
+      ${localMcpAvailable() ? `<button class="btn btn--block" data-act="add-local-mcp">${icon("shield", "icon--xs")} 添加本机服务器</button>` : ""}
+      <button class="btn btn--primary btn--block" data-act="new-mcp">${icon("plus", "icon--xs")} 添加服务器</button>`,
   });
 }
 
@@ -2700,6 +3112,21 @@ function pluginSheet(data) {
       <div class="kv"><span>作用域</span><b>${p.scopes.join(" · ")}</b></div>
       <div class="kv"><span>安装时间</span><b>${p.installedAt ? fmtRelative(p.installedAt) : "随内核内置"}</b></div>
       ${
+        p.codePath
+          ? `<div class="section-label">沙箱</div>
+             <div class="kv"><span>来源</span><b class="mono" style="font-size:10px">${esc(
+                 String(p.source || "官方清单").slice(0, 48)
+               )}</b></div>
+             <div class="kv"><span>申请能力</span><b>${
+               (p.permissions || []).length
+                 ? esc(p.permissions.map((x) => PERMISSION_LABEL[x] || x).join(" · "))
+                 : "无"
+             }</b></div>
+             <div class="kv"><span>运行环境</span><b>独立 iframe 沙箱</b></div>
+             <p class="field__hint" style="line-height:1.8">插件代码跑在独立 origin 的 iframe 里，读不到本应用的模型 Key、localStorage、其它会话与界面。<br>它能碰到的只有上面列出的能力，且每次工具调用仍会弹审批。</p>`
+          : ""
+      }
+      ${
         p.id === "safety"
           ? `<div class="section-label">护栏记录</div>
              <div class="stat-row" style="margin-bottom:10px">
@@ -2745,24 +3172,39 @@ function pluginSheet(data) {
   });
 }
 
-const CATALOG = [
-  { id: "charts", name: "图表生成", desc: "把 CSV 直接渲染成可交互的图表卡片。", version: "1.2.0", tools: ["render_chart"], scopes: ["ui.slot"], official: true },
-  { id: "git", name: "Git 快照", desc: "为工作区生成版本快照与可回滚 diff。", version: "1.0.4", tools: ["git_snapshot"], scopes: ["workspace"], official: true },
-  { id: "office", name: "Office 导出", desc: "把 Markdown 导出为 docx / pptx / xlsx。", version: "0.8.2", tools: ["export_office"], scopes: ["workspace"], official: true },
-  { id: "calendar", name: "日历", desc: "读写设备日历，安排评审与提醒。", version: "0.5.0", tools: ["calendar_write"], scopes: ["device"], official: false },
-];
-
+/**
+ * 插件安装面板。
+ *
+ * 两个来源：
+ *   1. 官方清单（内置，离线可用）
+ *   2. 任意 URL —— 填一个插件清单地址
+ *
+ * 安装前会先拉清单、列出它要申请哪些权限，用户看清再决定。
+ */
 function pluginSearchSheet() {
   const installed = new Set(state.plugins.map((p) => p.id));
-  const list = CATALOG.filter(
-    (p) => !ui.pluginQuery || (p.name + p.desc).toLowerCase().includes(ui.pluginQuery.toLowerCase())
-  );
+  const list = searchOfficialPlugins(ui.pluginQuery);
+  const url = ui.pluginUrl || "";
+
   return sheetFrame({
-    title: "查找插件",
-    desc: "从官方索引安装；安装后立即进入当前上下文。",
+    title: "安装插件",
+    desc: "从官方清单安装，或直接填一个插件清单地址。",
     body: `
+      <div class="field">
+        <label class="field__label" for="plugin-url">插件清单地址</label>
+        <input class="input mono" id="plugin-url" value="${esc(url)}"
+          placeholder="https://example.com/dsh-plugin.json" spellcheck="false" autocomplete="off">
+        <button class="btn btn--primary btn--block" style="margin-top:8px" data-act="plugin-fetch-url">${icon(
+          "download",
+          "icon--xs"
+        )} 拉取并检查</button>
+      </div>
+
+      <div id="plugin-inspect">${pluginInspectCard(ui.pluginInspect)}</div>
+
+      <div class="section-label">官方清单</div>
       <div class="input-suffix" style="margin-bottom:10px">
-        <input class="input" id="catalog-search" placeholder="搜索插件" value="${esc(ui.pluginQuery)}" autocomplete="off">
+        <input class="input" id="catalog-search" placeholder="搜索插件" value="${esc(ui.pluginQuery || "")}" autocomplete="off">
         <span class="icon-btn" style="pointer-events:none">${icon("search", "icon--sm")}</span>
       </div>
       <div id="catalog-list">
@@ -2776,24 +3218,76 @@ function pluginSearchSheet() {
             <div class="plugin-card__main">
               <div class="plugin-card__top">
                 <span class="plugin-card__name">${esc(p.name)}</span>
-                ${p.official ? '<span class="tag">官方</span>' : '<span class="tag">社区</span>'}
+                <span class="tag">官方</span>
               </div>
-              <p class="plugin-card__desc">${esc(p.desc)}</p>
-              <div class="plugin-card__tags"><span class="tag">v${p.version}</span>${p.tools.map((t) => `<span class="tag">${t}</span>`).join("")}</div>
+              <p class="plugin-card__desc">${esc(p.description)}</p>
+              <div class="plugin-card__tags">
+                <span class="tag">v${esc(p.version)}</span>
+                ${(p.permissions || []).map((t) => `<span class="tag">${esc(t)}</span>`).join("")}
+              </div>
             </div>
             ${
               installed.has(p.id)
                 ? `<span class="tag tag--on">已安装</span>`
-                : `<button class="btn btn--sm btn--ghost" data-act="install-plugin" data-id="${p.id}">安装</button>`
+                : `<button class="btn btn--sm btn--ghost" data-act="install-plugin" data-id="${esc(p.id)}">安装</button>`
             }
           </div>`
                 )
                 .join("")
             : `<div class="empty-line">没有匹配的插件</div>`
         }
-      </div>`,
+      </div>
+
+      <p class="field__hint" style="margin-top:12px;line-height:1.8">
+        插件代码跑在独立的 iframe 沙箱里，<b>拿不到</b>本应用的模型 Key、localStorage、其它会话与界面。<br>
+        它能碰到的只有清单里显式声明的能力，且每次调用仍会弹审批。
+      </p>`,
   });
 }
+
+/**
+ * 已拉取到的插件清单预览（含权限说明与安装按钮）。
+ */
+function pluginInspectCard(ins) {
+  if (!ins) return "";
+  const p = ins.plugin;
+  const permText = (p.permissions || []).length
+    ? p.permissions.map((x) => PERMISSION_LABEL[x] || x).join(" · ")
+    : "不申请任何宿主能力";
+  return `
+    <div class="card" style="margin-bottom:14px">
+      <div class="card__row">
+        <span class="avatar avatar--accent" style="width:38px;height:38px">${icon("puzzle", "icon--sm")}</span>
+        <div style="flex:1">
+          <div class="card__title">${esc(p.name)}</div>
+          <div class="card__sub">${esc(p.description || "")}</div>
+        </div>
+      </div>
+      <div class="kv" style="margin-top:8px"><span>版本</span><b>${esc(p.version)}</b></div>
+      <div class="kv"><span>作者</span><b>${esc(p.author || "未知")}</b></div>
+      <div class="kv"><span>来源</span><b class="mono" style="font-size:10px">${esc(String(ins.source || "").slice(0, 60))}</b></div>
+      <div class="kv"><span>申请能力</span><b>${esc(permText)}</b></div>
+      <div class="kv"><span>提供工具</span><b>${p.tools.length ? esc(p.tools.map((t) => t.name).join(" · ")) : "运行后由插件自行注册"}</b></div>
+    </div>
+    ${
+      (ins.warnings || []).length
+        ? `<div class="key-warning" style="flex-direction:column;gap:4px;margin-bottom:12px">
+             ${ins.warnings.map((w) => `<span>· ${esc(w)}</span>`).join("")}
+           </div>`
+        : ""
+    }
+    <button class="btn btn--primary btn--block" style="margin-bottom:14px" data-act="plugin-confirm-install">${icon(
+      "check",
+      "icon--xs"
+    )} 安装这个插件</button>`;
+}
+
+/** 权限名的中文说明。 */
+const PERMISSION_LABEL = {
+  "fs.read": "读取工作区文件",
+  "fs.write": "写入工作区文件",
+  net: "发起网络请求",
+};
 
 function automationSheet() {
   return sheetFrame({
@@ -2939,7 +3433,23 @@ function bindEvents() {
 
   // 输入法组合输入：期间冻结输入框的样式改动，结束后一次性补齐
   els.app.addEventListener("compositionstart", (e) => {
-    if (e.target.id === "composer-input") ui.composing = true;
+    if (e.target.id !== "composer-input") return;
+    ui.composing = true;
+    ui.composingAt = Date.now();
+  });
+
+  // ============ 组合期间也要跟高度 ============
+  //
+  // 中文输入法在候选阶段只保证发 `compositionupdate`，**不保证发 `input`**。
+  // 有的输入法要等到上屏才派发 input，有的干脆全程只发 composition 系列。
+  //
+  // 只在 input 里跟高度的话，用户逐字输入时框完全不动 ——
+  // 而退格走的是 input（deleteContentBackward），所以"退格一下就涨了"。
+  // 用户描述的这个对比，正好指向这里。
+  els.app.addEventListener("compositionupdate", (e) => {
+    if (e.target.id !== "composer-input") return;
+    ui.composingAt = Date.now();
+    autoGrow();
   });
   els.app.addEventListener("compositionend", (e) => {
     if (e.target.id !== "composer-input") return;
@@ -2954,13 +3464,23 @@ function bindEvents() {
   let composerPoll = null;
   els.app.addEventListener("focusin", (e) => {
     if (e.target.id !== "composer-input" || composerPoll) return;
-    composerPoll = setInterval(updateSendState, 400);
+    // 聚焦期间每 400ms 做两件事：
+    //   1. 刷发送键状态（部分输入法上屏不发 input，靠这个兜）
+    //   2. 刷输入框高度（同上，任何输入路径漏了都能兜住）
+    composerPoll = setInterval(() => {
+      updateSendState();
+      growIfChanged();
+    }, 400);
   });
   els.app.addEventListener("focusout", (e) => {
-    if (e.target.id === "composer-input" && composerPoll) {
+    if (e.target.id !== "composer-input") return;
+    if (composerPoll) {
       clearInterval(composerPoll);
       composerPoll = null;
     }
+    // 离开输入框时组合一定已经结束（键盘都收了）。
+    // 这里不复位的话，标志会带着 true 活到下一次聚焦。
+    ui.composing = false;
   });
 
   els.app.addEventListener("input", (e) => {
@@ -2972,18 +3492,23 @@ function bindEvents() {
     }
 
     if (t.id === "composer-input") {
-      if (t.value === "/" && !ui.composing) {
+      // 先自愈再判断，否则第一次输入的 "/" 会被残留标志挡掉
+      if (ui.composing && e.inputType && e.inputType !== "insertCompositionText") {
+        ui.composing = false;
+      }
+      if (e.inputType === "insertCompositionText") ui.composingAt = Date.now();
+
+      if (t.value === "/" && !isComposingNow()) {
         t.value = "";
         ui.draft = "";
         updateSendState();
         openSheet("commands");
         return;
       }
-      // 自愈：事件流显示组合已结束但标志未复位时，纠正过来
-      if (ui.composing && e.isComposing === false) ui.composing = false;
-      // 组合输入期间只记值：不动高度、不重绘按钮，避免打断输入法
+      // 组合输入期间只记值、不重绘按钮（重绘才是真会打断输入法的操作）；
+      // 高度照常跟 —— 高度不改 value，但"看不见正在输的字"是硬伤。
       ui.draft = t.value;
-      if (!ui.composing) autoGrow();
+      autoGrow();
       scheduleSendState();
       return;
     }
@@ -3005,6 +3530,11 @@ function bindEvents() {
       box.querySelectorAll(".plugin-card").forEach((card) => {
         card.style.display = card.textContent.toLowerCase().includes(q) ? "" : "none";
       });
+      return;
+    }
+
+    if (t.id === "plugin-url") {
+      ui.pluginUrl = t.value;
       return;
     }
 
@@ -3031,6 +3561,20 @@ function bindEvents() {
 
   els.app.addEventListener("change", (e) => {
     const t = e.target;
+
+    // 「允许控制的应用」勾选：白名单是本机 MCP 的唯一授权凭据
+    if (t.matches?.('input[data-act="toggle-local-app"]')) {
+      const pkg = t.value;
+      if (t.checked) {
+        addAllowed(pkg);
+        toast(`已允许控制 ${pkg}`, "ok");
+      } else {
+        removeAllowed(pkg);
+        toast(`已取消 ${pkg} 的控制权限`);
+      }
+      renderMain(ui.view !== "chat");
+      return;
+    }
 
     // 表单内直接填 Key：存下并立刻拉取可用模型
     if (t.id === "cm-key") {
@@ -3145,6 +3689,17 @@ function bindEvents() {
   });
 
   els.scrim.addEventListener("click", () => closeDrawer());
+
+  // 从系统设置里改完无障碍开关回到本应用时，界面上的状态必须立刻反映真实情况。
+  // 否则用户看到的还是「未开启」，会以为开关又被关掉了 —— 这正是本次要修的观感问题。
+  const refreshA11yStatus = () => {
+    if (document.visibilityState === "hidden") return;
+    if (ui.view !== "settings") return;
+    renderMain(true);
+  };
+  document.addEventListener("visibilitychange", refreshA11yStatus);
+  window.addEventListener("pageshow", refreshA11yStatus);
+  window.addEventListener("focus", refreshA11yStatus);
 
   window.addEventListener("popstate", () => {
     // dropLayer() 自己触发的回退不参与处理，避免关掉抽屉后又把页面退回对话
@@ -3591,7 +4146,7 @@ async function onClick(e) {
 
     case "send":
       if (ui.run) stopRunAction();
-      else if (ui.composing) toast("先让输入法确认候选，再点发送");
+      else if (isComposingNow()) toast("先让输入法确认候选，再点发送");
       else {
         const value = composerValue().trim();
         if (value || ui.attachments.length) sendMessage(value);
@@ -3820,6 +4375,22 @@ async function onClick(e) {
       return;
     }
 
+    case "toggle-memory": {
+      const on = state.settings.memoryEnabled === false;
+      setSettings({ memoryEnabled: on });
+      renderMain(ui.view !== "chat");
+      toast(on ? "长期记忆已开启" : "长期记忆已关闭", "ok");
+      return;
+    }
+
+    case "toggle-traj": {
+      const on = state.settings.trajEnabled === false;
+      setSettings({ trajEnabled: on });
+      renderMain(ui.view !== "chat");
+      toast(on ? "控屏轨迹记录已开启" : "控屏轨迹记录已关闭", "ok");
+      return;
+    }
+
     case "toggle-hud": {
       const on = !state.settings.hudEnabled;
       if (nativeHudAvailable()) {
@@ -3850,6 +4421,212 @@ async function onClick(e) {
         }
       }
       return;
+
+    case "toggle-local-mcp": {
+      if (!localMcpAvailable()) {
+        toast("当前环境不支持本机控制", "err");
+        return;
+      }
+      const on = !localStatus().enabled;
+      if (!setServerEnabled(on)) {
+        toast("切换失败", "err");
+        return;
+      }
+      if (on) {
+        const n = getAllowedPackages().length;
+        toast(
+          n
+            ? `本机 MCP 已开启，可控制 ${n} 个已勾选的应用`
+            : "本机 MCP 已开启，但还没有勾选任何应用",
+          n ? "ok" : ""
+        );
+      } else {
+        toast("本机 MCP 已关闭，端口不再监听");
+      }
+      renderMain(ui.view !== "chat");
+      return;
+    }
+
+    case "restart-local-mcp": {
+      if (!localMcpAvailable()) {
+        toast("当前环境不支持本机控制", "err");
+        return;
+      }
+      if (!restartServer()) {
+        toast("无法触发重启，请重启应用", "err");
+        return;
+      }
+      toast("正在重新启动本机控制…");
+      // 设备进程重建要几百毫秒，稍等一下再刷新，否则读到的还是旧状态
+      setTimeout(() => renderMain(ui.view !== "chat"), 900);
+      return;
+    }
+
+    case "toggle-pointer-mark": {
+      if (!localMcpAvailable()) {
+        toast("当前环境不支持本机控制", "err");
+        return;
+      }
+      const on = !isPointerMarkEnabled();
+      if (!setPointerMarkEnabled(on)) {
+        toast("切换失败", "err");
+        return;
+      }
+      // 落点标记只在 :device 里生效，主进程没有对应的运行时状态可同步 ——
+      // 重渲染一次，让开关的 aria-checked 从刚写入的文件里读回来即可。
+      renderMain(ui.view !== "chat");
+      toast(on ? "已开启：AI 点击时会显示落点" : "已关闭落点标记");
+      return;
+    }
+
+    case "open-shizuku-download": {
+      window.open("https://shizuku.rikka.app/download/", "_blank");
+      toast("装好后打开 Shizuku，用无线调试启动服务");
+      return;
+    }
+
+    case "open-shizuku-app": {
+      // 服务没在运行 —— 只能由用户去 Shizuku 里启动（应用无权代劳）
+      if (!openShizukuApp()) {
+        toast("打不开 Shizuku，确认它还在装", "err");
+        return;
+      }
+      toast("在 Shizuku 里点「启动服务」");
+      return;
+    }
+
+    case "request-shizuku": {
+      if (!requestShizukuPermission()) {
+        toast("申请失败：Shizuku 可能没在运行", "err");
+        return;
+      }
+      toast("请在 Shizuku 的弹框里选「允许」");
+      // 授权对话框是系统弹窗，结果不会立刻回来 —— 稍等再刷一次状态
+      setTimeout(() => {
+        renderMain(true);
+        renderSheet();
+      }, 1800);
+      return;
+    }
+
+    case "connect-shizuku": {
+      if (!connectShizuku()) {
+        toast("连接失败：当前环境不支持", "err");
+        return;
+      }
+      toast("正在连接 Shizuku…");
+      setTimeout(() => {
+        renderMain(true);
+        renderSheet();
+      }, 1200);
+      return;
+    }
+
+    case "open-app-info-settings": {
+      // 打开本应用的「应用信息」页 —— Android 13+ 受限设置的放行入口
+      if (!openAppInfoSettings()) {
+        toast("无法打开应用信息页，请手动到「设置 → 应用 → DSH」进入", "err");
+        return;
+      }
+      toast("点右上角 ⋮ →「允许受限设置」。请先放行这里，再回到无障碍列表开开关");
+      return;
+    }
+
+    case "voice-download": {
+      if (!voiceDownloadModel()) {
+        toast("当前环境不支持下载", "err");
+        return;
+      }
+      setVoiceDownload({ state: "running", pct: 0 });
+      renderMain(true);
+      return;
+    }
+
+    case "toggle-node": {
+      const on = state.settings.nodeEnabled === false; // 取反
+      setSettings({ nodeEnabled: on });
+      if (on) {
+        // 运行时还没下载的话，启只是记下意图 ——
+        // 不能在这里触发 88 MB 的下载。
+        const st = nodeStatus();
+        if (st.installed) {
+          nodeStart();
+          toast("插件运行时已启动");
+        } else {
+          toast("请先下载运行时");
+        }
+      } else {
+        nodeStop();
+        toast("插件运行时已停止");
+      }
+      renderMain(true);
+      return;
+    }
+
+    case "node-download": {
+      const st = nodeStatus();
+      if (st.downloading) {
+        toast("正在下载中");
+        return;
+      }
+      if (st.installed) {
+        toast("运行时已就绪");
+        return;
+      }
+      if (!nodeDownload()) {
+        toast("无法启动下载", "err");
+        return;
+      }
+      toast("开始下载运行时（约 88 MB）");
+      renderMain(true);
+      return;
+    }
+
+    case "node-reload-plugins": {
+      // 重新加载 Node 插件：插件代码可能刚被改过，
+      // 或者上次加载失败了（改完代码想再试一次）。
+      if (!nodeBridgeAvailable()) {
+        toast("当前环境不支持", "err");
+        return;
+      }
+      const r = await refreshNodeTools();
+      const failed = Array.isArray(r?.failed) ? r.failed : [];
+      if (failed.length) {
+        toast(`${failed.length} 个插件加载失败`, "err");
+      } else {
+        toast(`已加载 ${r?.loaded ?? 0} 个插件`);
+      }
+      await syncNodePluginList();
+      renderMain(true);
+      return;
+    }
+
+    case "node-selfcheck": {
+      // 通道自检：ping 一��，看往返是否正常。
+      // 这是排查"插件调不通"时最直接的一步。
+      if (!nodeBridgeAvailable()) {
+        toast("当前环境不支持", "err");
+        return;
+      }
+      try {
+        const t0 = Date.now();
+        await nodePing();
+        const ms = Date.now() - t0;
+        toast(`通道正常（${ms} ms）`);
+      } catch (err) {
+        toast(`通道异常：${err?.message || err}`, "err");
+      }
+      return;
+    }
+
+    case "voice-permission": {
+      if (!requestVoicePermission()) {
+        toast("当前环境不支持申请麦克风权限", "err");
+        return;
+      }
+      toast("请在系统弹窗中选择「允许」");
+      return;
+    }
 
     case "request-battery-exemption": {
       // 「允许后台耗电」：弹系统面板让用户把应用加进"忽略电池优化"白名单
@@ -4150,6 +4927,116 @@ async function onClick(e) {
       openSheet("diagnostics");
       return;
 
+    case "open-memory":
+      openSheet("memory");
+      return;
+
+    case "delete-memory": {
+      const key = target.dataset.key || "";
+      if (!key) return;
+      removeMemory(key);
+      renderSheet();
+      toast("已删除这条记忆");
+      return;
+    }
+
+    case "clear-memories": {
+      openSheet("confirm", {
+        title: "清空全部记忆？",
+        desc: `${memoryStats().total} 条记忆将被删除。`,
+        detail: "之后模型将不再有这些「已验证信息」可以依据，回答里的事实性内容可能变差。",
+        danger: true,
+        confirmText: "全部清空",
+      });
+      ui.confirmAction = () => {
+        clearMemories();
+        closeSheet(true);
+        renderMain(true);
+        toast("记忆已清空");
+      };
+      return;
+    }
+
+    /* ---------------- 控屏轨迹（0.34.0） ---------------- */
+
+    case "open-traj":
+      openSheet("traj");
+      return;
+
+    case "traj-search": {
+      // 检索框是即时反馈的：每次输入都重算一次并重绘。
+      // 它是「中文检索到底行不行」的人肉验证器 ——
+      // 所以必须能一边打一边看结果，而不是提交后才见分晓。
+      ui.trajQuery = target.value || "";
+      renderSheet();
+      const el = document.getElementById("traj-q");
+      if (el) {
+        el.focus();
+        try {
+          el.setSelectionRange(el.value.length, el.value.length);
+        } catch {
+          /* 某些输入类型不支持 setSelectionRange */
+        }
+      }
+      return;
+    }
+
+    case "traj-mark": {
+      const id = target.dataset.id || "";
+      const outcome = target.dataset.outcome || "";
+      if (!id) return;
+      setTrajOutcome(id, outcome).then(() => {
+        renderSheet();
+        toast(outcome === "success" ? "已标记成功 · 进入检索池" : "已标记失败 · 不参与检索");
+      });
+      return;
+    }
+
+    case "traj-del": {
+      const id = target.dataset.id || "";
+      if (!id) return;
+      removeTrajectory(id).then(() => {
+        renderSheet();
+        toast("已删除这条轨迹");
+      });
+      return;
+    }
+
+    case "clear-traj": {
+      openSheet("confirm", {
+        title: "清空全部控屏轨迹？",
+        desc: `${trajStats().total} 条轨迹将被删除。`,
+        detail: "之后模型将不再有这些控屏范例可用，已确认成功的轨迹也无法再被检索到。",
+        danger: true,
+        confirmText: "全部清空",
+      });
+      ui.confirmAction = () => {
+        clearTrajectories().then(() => {
+          closeSheet(true);
+          renderMain(true);
+          toast("轨迹已清空");
+        });
+      };
+      return;
+    }
+
+    case "export-traj": {
+      exportTrajCorpus().then((text) => {
+        const lines = text ? text.split("\n").filter(Boolean).length : 0;
+        if (!lines) {
+          toast("还没有可导出的轨迹", "err");
+          return;
+        }
+        // 导出到工作区：这样用户能直接把语料文件取出来做离线评测
+        import("./fs.js").then(({ writeDoc }) =>
+          writeDoc("workspace", "控屏轨迹语料.jsonl", text).then(() => {
+            toast(`已导出 ${lines} 条到工作区「控屏轨迹语料.jsonl」`, "ok");
+          })
+        );
+      });
+      return;
+    }
+
     case "open-mcp":
       openSheet("mcp");
       return;
@@ -4157,6 +5044,33 @@ async function onClick(e) {
     case "new-mcp":
       openSheet("mcp-server");
       return;
+
+    case "add-local-mcp": {
+      // 一键接入本机 MCP：不用手填 URL
+      if (!localMcpAvailable()) {
+        toast("当前环境不支持本机控制", "err");
+        return;
+      }
+      const cfg = localServerConfig();
+      const list = state.settings.mcpServers || [];
+      const exist = list.find((x) => x.url === cfg.url);
+      if (exist) {
+        setSettings({ mcpServers: list.map((x) => (x.id === exist.id ? { ...x, enabled: true } : x)) });
+        toast("本机服务器已在列表中，已启用", "ok");
+        openSheet("mcp");
+        return;
+      }
+      const id = `mcp_local_${Date.now()}`;
+      setSettings({
+        mcpServers: [
+          ...list,
+          { id, name: cfg.name, url: cfg.url, token: cfg.token, enabled: true, tools: [] },
+        ],
+      });
+      toast("已添加本机服务器，去「工具与扩展」勾选允许控制的应用", "ok");
+      openSheet("mcp");
+      return;
+    }
 
     case "edit-mcp":
       openSheet("mcp-server", { id: target.dataset.id });
@@ -4185,7 +5099,7 @@ async function onClick(e) {
       }
       const box = $("#mcp-test");
       if (box) box.innerHTML = `<p class="field__hint">连接中…</p>`;
-      mcpDiscover(server)
+      mcpDiscoverWithRetry(server)
         .then((tools) => {
           server.tools = tools;
           server.lastConnectedAt = Date.now();
@@ -4331,7 +5245,12 @@ async function onClick(e) {
     case "toggle-plugin": {
       const p = state.plugins.find((x) => x.id === id);
       if (!p) return;
-      togglePlugin(id, !p.enabled);
+      // 第三方插件的启停会重建/销毁沙箱，是异步的
+      const res = await setPluginEnabled(id, !p.enabled);
+      if (!res.ok) {
+        toast(res.error || "操作失败", "err");
+        return;
+      }
       toast(`${p.name}${p.enabled ? "已启用" : "已停用"}`);
       renderMain(ui.view !== "chat");
       if (ui.sheet?.type === "plugin-detail") renderSheet();
@@ -4345,22 +5264,74 @@ async function onClick(e) {
 
     case "plugin-search":
       ui.pluginQuery = "";
+      ui.pluginUrl = "";
+      ui.pluginInspect = null;
       openSheet("plugin-search");
       return;
 
+    case "plugin-fetch-url": {
+      const url = String(ui.pluginUrl || "").trim();
+      if (!url) {
+        toast("先填一个插件清单地址", "err");
+        return;
+      }
+      const box = $("#plugin-inspect");
+      if (box) box.innerHTML = `<div class="empty-line">正在拉取…</div>`;
+      const ins = await inspectPlugin(url);
+      if (!ins.ok) {
+        if (box) box.innerHTML = `<div class="key-warning" style="flex-direction:column;gap:4px"><span>· ${esc(ins.error)}</span></div>`;
+        toast(ins.error || "拉取失败", "err");
+        return;
+      }
+      ui.pluginInspect = ins;
+      if (box) box.innerHTML = pluginInspectCard(ins);
+      toast(`已拉取 ${ins.plugin.name}`, "ok");
+      return;
+    }
+
+    case "plugin-confirm-install": {
+      const ins = ui.pluginInspect;
+      if (!ins) {
+        toast("先拉取一个插件清单", "err");
+        return;
+      }
+      const res = await installPluginPackage(ins.plugin);
+      if (!res.ok) {
+        toast(res.error || "安装失败", "err");
+        return;
+      }
+      ui.pluginInspect = null;
+      ui.pluginUrl = "";
+      toast(res.warning ? `已安装，但${res.warning}` : `已安装 ${res.plugin.name}`, res.warning ? "" : "ok");
+      renderSheet();
+      renderMain(true);
+      return;
+    }
+
     case "install-plugin": {
-      const p = CATALOG.find((x) => x.id === id);
-      if (!p) return;
-      installPlugin(p);
-      toast(`已安装 ${p.name}`, "ok");
+      // 官方清单里的插件：先走一遍 inspect，把权限摊开给用户看
+      const ins = await inspectPlugin(id);
+      if (!ins.ok) {
+        toast(ins.error || "读取插件清单失败", "err");
+        return;
+      }
+      const res = await installPluginPackage(ins.plugin);
+      if (!res.ok) {
+        toast(res.error || "安装失败", "err");
+        return;
+      }
+      toast(res.warning ? `已安装，但${res.warning}` : `已安装 ${res.plugin.name}`, res.warning ? "" : "ok");
       renderSheet();
       renderMain(true);
       return;
     }
 
     case "uninstall-plugin": {
-      state.plugins = state.plugins.filter((x) => x.id !== id);
-      save();
+      const res = await uninstallPlugin(id);
+      if (!res.ok) {
+        toast(res.error || "卸载失败", "err");
+        return;
+      }
       closeSheet();
       renderMain(true);
       toast("插件已卸载");
@@ -4473,7 +5444,17 @@ async function onClick(e) {
       return;
 
     case "voice":
-      startVoice();
+      toggleVoice();
+      return;
+
+    case "voice-stop":
+      // 用户主动结束：等最终结果写进输入框
+      stopVoice();
+      return;
+
+    case "voice-cancel":
+      cancelVoice();
+      voiceStripHide();
       return;
 
     case "new-file":
@@ -4705,23 +5686,201 @@ async function onClick(e) {
 
 /* ---------------- 辅助动作 ---------------- */
 
-function startVoice() {
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SR) {
-    toast("此设备不支持语音输入", "err");
+/* ---------------- 语音输入 ---------------- */
+
+/**
+ * 录音条的三个状态：idle（收起）/ listening / finishing。
+ *
+ * 旧实现只弹一个 toast 就完事，用户说完之前完全不知道它在不在听。
+ * 现在有：音量条（证明麦克风真的在工作）、实时转写（证明识别在跑）、
+ * 取消与结束按钮（证明用户能控制它）。
+ */
+let voiceOff = null;
+
+function voiceEls() {
+  return {
+    strip: document.getElementById("voice-strip"),
+    text: document.getElementById("voice-text"),
+    bars: document.getElementById("voice-bars"),
+    btn: document.getElementById("voice-btn"),
+    input: document.getElementById("composer-input"),
+  };
+}
+
+function voiceStripShow() {
+  const { strip, btn } = voiceEls();
+  if (strip) strip.hidden = false;
+  if (btn) {
+    btn.classList.add("is-live");
+    btn.setAttribute("aria-pressed", "true");
+  }
+  els.app?.setAttribute("data-voice", "on");
+}
+
+function voiceStripHide() {
+  const { strip, btn, bars } = voiceEls();
+  if (strip) strip.hidden = true;
+  if (btn) {
+    btn.classList.remove("is-live");
+    btn.setAttribute("aria-pressed", "false");
+  }
+  if (bars) bars.querySelectorAll("i").forEach((b) => (b.style.height = "3px"));
+  els.app?.removeAttribute("data-voice");
+}
+
+function voiceStripText(text) {
+  const { text: el } = voiceEls();
+  if (el) el.textContent = text;
+}
+
+function voiceStripLevel(level) {
+  const { bars } = voiceEls();
+  if (!bars) return;
+  // 5 根柱子做相位错开，看起来像真的在跳动，而不是整排一起长
+  const base = Math.max(0, Math.min(10, level)) / 10;
+  bars.querySelectorAll("i").forEach((b, i) => {
+    const phase = [0.66, 1, 0.82, 0.95, 0.72][i];
+    const h = 3 + Math.round(base * 15 * phase);
+    b.style.height = `${h}px`;
+  });
+}
+
+function appendVoiceText(text) {
+  const t = String(text || "").trim();
+  if (!t) return;
+  const cur = composerValue();
+  // 中文之间不加空格；中英混排时补一个，避免粘成一坨
+  const needSpace = cur && !/\s$/.test(cur) && /[A-Za-z0-9]$/.test(cur) && /^[A-Za-z0-9]/.test(t);
+  setComposerValue(`${cur}${needSpace ? " " : ""}${t}`);
+}
+
+/** 点麦克风：不再是一次性调用，而是可开可停的开关。 */
+function toggleVoice() {
+  const st = voiceState();
+  if (st === "listening" || st === "starting") {
+    stopVoice();
     return;
   }
-  const rec = new SR();
-  rec.lang = "zh-CN";
-  rec.interimResults = false;
-  rec.maxAlternatives = 1;
-  rec.onresult = (e) => {
-    const text = e.results[0][0].transcript;
-    setComposerValue(`${composerValue()}${text}`);
-  };
-  rec.onerror = () => toast("语音识别失败", "err");
-  rec.start();
-  toast("正在听…");
+  const res = startVoice({ lang: "zh-CN" });
+  if (!res.ok) {
+    if (res.reason === "no-api") {
+      toast("这个浏览器不支持语音识别，APK 内可用", "err");
+    } else if (res.reason === "no-service") {
+      toast("系统里没有可用的语音识别服务", "err");
+    } else {
+      toast("语音输入启动失败", "err");
+    }
+    return;
+  }
+}
+
+/**
+ * 重渲染后把语音相关 DOM 拉回与状态一致。
+ *
+ * 对话页每次更新都会重建 composer，录音条与麦克风按钮是新的节点 ——
+ * 不重新贴一次，就会出现「状态还在 listening，界面上却是静止的」。
+ */
+function voiceResync() {
+  const st = voiceState();
+  const strip = document.getElementById("voice-strip");
+  const btn = document.getElementById("voice-btn");
+  if (!strip || !btn) return;
+  if (st === "idle") {
+    strip.hidden = true;
+    btn.classList.remove("is-live");
+    btn.setAttribute("aria-pressed", "false");
+    return;
+  }
+  strip.hidden = false;
+  btn.classList.add("is-live");
+  btn.setAttribute("aria-pressed", "true");
+}
+
+/** 订阅语音状态，驱动录音条。 */
+function initVoiceUi() {
+  if (voiceOff) voiceOff();
+  voiceStripHide();
+  voiceOff = onVoiceEvent((e) => {
+    if (e.type === "state") {
+      // 录音条的显隐完全由状态驱动 —— 这样不管是从 UI 点的，
+      // 还是别处直接调 startVoice()，界面都不会和状态对不上。
+      if (e.state === "starting" || e.state === "listening") {
+        voiceStripText("正在听…");
+        voiceStripShow();
+      } else if (e.state === "finishing") {
+        voiceStripText("正在识别…");
+        voiceStripShow();
+      } else if (e.state === "idle") {
+        voiceStripHide();
+      }
+      return;
+    }
+    if (e.type === "download") {
+      // 42 MB 的下载必须在界面上有动静，否则用户会以为卡死然后杀掉应用
+      if (e.state === "done") {
+        setVoiceDownload({ state: "done", pct: 100 });
+        toast("离线语音模型已就绪");
+        refreshVoicePanel();
+      } else if (e.state === "unzip" || e.pct >= 100) {
+        setVoiceDownload({ state: "unzip", pct: 100 });
+        refreshVoicePanel();
+      } else {
+        setVoiceDownload({ state: "running", pct: e.pct });
+        // 只改进度条，不重建整页 —— 见 paintVoiceProgress 的注释
+        paintVoiceProgress(e.pct);
+      }
+      return;
+    }
+    if (e.type === "preparing") {
+      voiceStripText("正在准备离线语音（首次约几秒）…");
+      voiceStripShow();
+      return;
+    }
+    if (e.type === "volume") {
+      voiceStripLevel(e.level);
+      return;
+    }
+    if (e.type === "partial") {
+      voiceStripText(e.text || "正在听…");
+      return;
+    }
+    if (e.type === "final") {
+      appendVoiceText(e.text);
+      if (e.text) vibrateShort();
+      return;
+    }
+    if (e.type === "error") {
+      // 下载失败要在设置页留个"可重试"的状态，而不是只弹一下就没了
+      if (e.code === "download") {
+        setVoiceDownload({ state: "error", pct: 0 });
+        refreshVoicePanel();
+      }
+      // 「没听清 / 没检测到说话」不算故障，用中性提示，不弹红
+      const soft = e.code === "no_match" || e.code === "speech_timeout";
+      toast(e.message, soft ? "" : "err");
+      return;
+    }
+    if (e.type === "empty") {
+      voiceStripText("没听到内容");
+      const before = composerValue();
+      setTimeout(() => {
+        if (composerValue() === before && voiceState() === "idle") voiceStripHide();
+      }, 600);
+      return;
+    }
+    if (e.type === "permission" && !e.granted) {
+      toast("需要麦克风权限才能语音输入", "err");
+    }
+  });
+}
+
+/** 极轻的触感反馈：确认「这句话进去了」。失败无所谓，不是所有设备都有。 */
+function vibrateShort() {
+  try {
+    if (navigator.vibrate) navigator.vibrate(12);
+  } catch {
+    /* ignore */
+  }
 }
 
 /* ---------------- 悬浮状态窗快照 ---------------- */
@@ -4794,6 +5953,27 @@ function hudSnapshot() {
     .filter((r) => r.status === "running" || r.status === "queued")
     .slice(0, 3)
     .map((r) => ({ title: r.title, progress: r.status === "done" ? 100 : r.progress || 0 }));
+
+  // ===== 最近消息（0.28.0）=====
+  //
+  // 悬浮窗展开态要能「接消息」——显示最近几条对话。
+  // 只取**有实质内容**的：空的助手气泡（还在流式输出、content 还是空串）
+  // 会显示成一条空行，比不显示更糟。
+  const messages = [];
+  const cur = activeSession();
+  if (cur && Array.isArray(cur.messages)) {
+    for (let i = cur.messages.length - 1; i >= 0 && messages.length < 4; i -= 1) {
+      const m = cur.messages[i];
+      if (!m) continue;
+      const text = String(m.content || "").trim();
+      if (!text) continue;
+      messages.unshift({
+        role: m.role === "user" ? "user" : "assistant",
+        text: text.length > 60 ? `${text.slice(0, 60)}…` : text,
+      });
+    }
+  }
+
   // 一次性事件：进快照即消费，seq 保证 JSON 有差异、不会被 diff 吞掉
   const cue = ui.hudCue;
   ui.hudCue = null;
@@ -4804,6 +5984,9 @@ function hudSnapshot() {
     step,
     sessions,
     tasks,
+    messages,
+    // 是否有正在跑的会话 —— 悬浮窗据此决定「停止」按钮可不可点
+    running: !!ui.run,
     look,
     event: cue ? cue.kind : null,
     cueSeq: cue ? cue.seq : hudCueSeq,
@@ -4824,6 +6007,50 @@ function hudSync() {
     /* 快照失败不影响主流程 */
   }
 }
+
+/* ---------------- 悬浮窗指令入口（0.28.0）----------------
+ *
+ * 原生悬浮窗点「发送 / 停止」时，会通过 evaluateJavascript 调到这里。
+ * 协议：window.__dshHudCommand(action, payload)
+ *   action = "send"  payload = {text: "..."}
+ *   action = "stop"  payload = null
+ *
+ * 为什么放在 window 上而不是模块导出：
+ * 原生侧拿不到 ES module 的引用，只能走全局对象。
+ */
+
+function installHudCommandHandler() {
+  if (typeof window === "undefined") return;
+  window.__dshHudCommand = async (action, payload) => {
+    try {
+      if (action === "send") {
+        const text = String(payload?.text || "").trim();
+        if (!text) return "empty";
+        // 运行中不能发消息（sendMessage 内部会 return），先给个明确提示
+        if (ui.run) {
+          toast("正在运行中，先点「停止」再发消息", "err");
+          return "busy";
+        }
+        await sendMessage(text);
+        return "ok";
+      }
+      if (action === "stop") {
+        if (!ui.run && !orphanRunning()) {
+          toast("当前没有正在运行的会话", "");
+          return "idle";
+        }
+        stopRunAction();
+        return "ok";
+      }
+      return "unknown";
+    } catch (err) {
+      toast(`悬浮窗操作失败：${err?.message || err}`, "err");
+      return "error";
+    }
+  };
+}
+installHudCommandHandler();
+
 function startHudLoop() {
   if (hudTimer) return;
   hudTimer = setInterval(hudSync, 1200);
@@ -4871,6 +6098,58 @@ function downloadJSON(name, obj) {
   a.download = name;
   a.click();
   setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+/**
+ * 记忆被安全闸拒绝时的提示。
+ *
+ * 为什么要有这个：记忆写入被拒是**静默失败** ——
+ * 用户以为「记下了」，实际那条已经被丢弃。
+ * 一旦模型反复输出同类内容，用户会以为是记忆功能坏了。
+ */
+globalThis.__dshOnMemoryRejected = (keys) => {
+  const n = Array.isArray(keys) ? keys.length : 0;
+  if (n > 0) {
+    toast(`${n} 条记忆内容未保存：内容包含指令式或安全风险表述，已拒绝写入`, "err");
+  }
+};
+
+/**
+ * 刷新设置页里的语音面板。
+ *
+ * 只在**结构发生变化**时用：开始下载（按钮 → 进度条）、解压、完成、失败。
+ * 单纯的百分比跳动不走这里 —— 那会把整页重建上百次。
+ */
+function refreshVoicePanel() {
+  // 注意是 ui.view 不是 ui.screen。0.35.0 这里写成了 ui.screen（那个字段不存在），
+  // 条件恒为假 → 进度永远不刷新，用户只能靠点别的按钮触发重绘才看到新数字。
+  if (ui.view === "settings") renderMain(true);
+}
+
+/**
+ * 只改下载进度条，不重建设置页。
+ *
+ * ============ 为什么不能每次都 renderMain ============
+ *
+ * 42 MB 分 12 片，进度会更新约 100 次。
+ * 每次 `target.innerHTML = renderSettings(...)` 都是一次完整的
+ * HTML 解析 + 重排，手机上明显卡；而且用户如果正在改别的设置项，
+ * 输入到一半的内容会被清掉。
+ *
+ * 直接改 DOM 两个属性就没这些问题。
+ *
+ * 找不到元素就直接返回 —— 说明当前不在设置页（或语音分组没渲染出来）。
+ * 下次进设置页时 renderSettings 会从 voiceDl 读到最新值，不会丢进度。
+ */
+export function paintVoiceProgress(pct) {
+  const bar = document.querySelector("#voice-dl-bar");
+  const label = document.querySelector("#voice-dl-label");
+  if (!bar && !label) return;
+  // 后端按 0.1% 上报（见 ModelDownloader.Listener 的注释）：
+  // 宽度用原值让动画连续，文字取整免得画面里跳出 "37.4%" 这种数
+  const v = Math.max(0, Math.min(100, Number(pct) || 0));
+  if (bar) bar.style.width = `${v}%`;
+  if (label) label.textContent = `正在下载离线模型 ${Math.floor(v)}%`;
 }
 
 export function toast(message, kind = "") {

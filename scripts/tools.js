@@ -25,7 +25,10 @@ import {
 import { isImagePath } from "./image.js";
 import { markdownToDocx, csvToXlsx, bytesToBase64 } from "./office.js";
 import { scanDangerous, scanSecrets, scanScriptRisks } from "./safety.js";
-import { mcpToolSchemas, findMcpTool, mcpCall } from "./mcp.js";
+import { mcpToolSchemas, findMcpTool, mcpCall, formatMcpError, toMcpError } from "./mcp.js";
+import { pluginToolSchemas, callPluginTool } from "./plugin-install.js";
+import { nodeToolSchemas, callNodeTool } from "./node-plugins.js";
+import { installHostImpl } from "./plugin-host.js";
 
 const MAX_OUT = 6000;
 const clip = (s, n = MAX_OUT) => {
@@ -1275,7 +1278,12 @@ export function availableToolNames() {
     (pluginMap[p.id] || []).forEach((t) => extra.push(t));
   });
   const mcpNames = mode === "minimal" ? [] : mcpToolSchemas().map((t) => t.function.name);
-  const names = [...new Set([...base, ...extra, ...mcpNames])];
+  // 插件注册的工具也进工具表 —— 它们是运行时才知道的，
+  // 所以不能像 TOOLS 那样静态写在表里，只能动态取。
+  const pluginNames = mode === "minimal" ? [] : pluginToolSchemas().map((t) => t.function.name);
+  // Node 插件的工具同理（插件在 Node 进程里注册，运行时才知道）
+  const nodeNames = mode === "minimal" ? [] : nodeToolSchemas().map((t) => t.function.name);
+  const names = [...new Set([...base, ...extra, ...mcpNames, ...pluginNames, ...nodeNames])];
   // 极简模式只保留两个能力：终端 + 文件编辑器
   if (mode === "minimal") return ["fs_read", "fs_write", "shell"];
   return names;
@@ -1297,10 +1305,76 @@ export function toolSchemas() {
     })
     .filter(Boolean);
   const mcp = state.settings.mode === "minimal" ? [] : mcpToolSchemas();
-  return [...base, ...mcp];
+  const plugins = state.settings.mode === "minimal" ? [] : pluginToolSchemas();
+  const nodePlugins = state.settings.mode === "minimal" ? [] : nodeToolSchemas();
+  return [...base, ...mcp, ...plugins, ...nodePlugins];
 }
 
 /* ---------------- 执行闸门 ---------------- */
+
+/**
+ * 审批决策 —— 三条执行路径（内置工具 / MCP / 插件工具）共用这一个函数。
+ *
+ * ============ 为什么必须抽出来 ============
+ *
+ * 之前只有内置工具读了 `state.settings.approval`，MCP 和插件是**无条件**调
+ * `ctx.requestApproval`。结果就是：
+ *
+ *   用户把审批策略切到「自动放行」→ 内置的 fs_write、shell 不再弹窗，
+ *   但 MCP 工具（比如本机控制 app_launch）每次照弹不误。
+ *
+ * 用户的观感是「自动放行坏了」，实际上是只有一条路径认这个设置。
+ *
+ * 顺带修掉两个更隐蔽的问题：
+ *
+ *   1) `runMcpTool` 里写的是 `if (!ok) 拒绝`。在没有审批通道的上下文
+ *      （子 Agent、后台任务）里 requestApproval 是 undefined，
+ *      `!undefined` 为真 → **MCP 工具被无故拒绝**。
+ *
+ *   2) `runPluginTool` 里写的是 `if (ok === false) 拒绝`。同一个场景下
+ *      `undefined === false` 为假 → **插件工具被静默放行**。
+ *
+ *      两处对"没有审批通道"的处理正好相反，而它们都不该是这个语义。
+ *
+ * 现在的语义是明确的：没有审批通道时，敏感操作一律不做。
+ */
+async function decideApproval(label, info, ctx) {
+  const policy = state.settings.approval;
+
+  if (policy === "never") {
+    return { ok: false, output: "审批策略为「全部拒绝」，操作未执行。", status: "denied" };
+  }
+
+  // 用户明确选了自动放行 —— 三条路径一视同仁。
+  // 破坏性命令仍会被 CC Safety Net 在前面拦掉，这里不再重复询问。
+  if (policy === "auto") {
+    return { ok: true };
+  }
+
+  // 逐次询问
+  if (typeof ctx?.requestApproval !== "function") {
+    // 子 Agent / 后台任务没有 UI 可弹。这种情况绝不能静默放行敏感操作 ——
+    // 宁可跳过并说明原因，让模型自己换一条不需要授权的路。
+    return {
+      ok: false,
+      output: "当前上下文没有审批通道（子 Agent / 后台任务），敏感操作已跳过。",
+      status: "denied",
+    };
+  }
+
+  const allowed = await ctx.requestApproval({
+    name: info.name,
+    label,
+    preview: info.preview || "",
+    args: info.args || {},
+    safety: info.safety,
+  });
+
+  if (!allowed) {
+    return { ok: false, output: "用户拒绝了该操作。", status: "denied" };
+  }
+  return { ok: true };
+}
 
 async function runMcpTool(name, args, ctx) {
   const startedAt = Date.now();
@@ -1312,14 +1386,14 @@ async function runMcpTool(name, args, ctx) {
   if (state.settings.permission === "readonly") {
     return { ok: false, output: "当前权限为只读，MCP 工具可能会修改外部数据，已拒绝。", ms: 0, status: "denied" };
   }
-  const ok = await ctx.requestApproval?.({
-    name,
-    label: `MCP · ${server.name} · ${tool.name}`,
-    preview: server.url,
-    args: args || {},
-  });
-  if (!ok) {
-    return { ok: false, output: "已拒绝这次 MCP 工具调用。", ms: Date.now() - startedAt, status: "denied" };
+
+  const gate = await decideApproval(
+    `MCP · ${server.name} · ${tool.name}`,
+    { name, preview: server.url, args: args || {} },
+    ctx
+  );
+  if (!gate.ok) {
+    return { ok: false, output: gate.output, ms: Date.now() - startedAt, status: gate.status };
   }
   try {
     const res = await mcpCall(server, tool.name, args || {});
@@ -1330,17 +1404,113 @@ async function runMcpTool(name, args, ctx) {
       status: res.isError ? "error" : "done",
     };
   } catch (err) {
+    // 结构化错误：模型需要知道「该不该重试、要不要人介入、下一步干什么」。
+    // 只给一句 `MCP 调用失败：xxx` 的话，它只能靠猜 —— 于是 401 也重试。
+    const e = toMcpError(err);
     return {
       ok: false,
-      output: `MCP 调用失败：${err.message}`,
+      output: formatMcpError(e),
       ms: Date.now() - startedAt,
-      status: "error",
+      status: e.userActionRequired ? "needs_user" : "error",
+      retryable: e.retryable,
+      userActionRequired: e.userActionRequired,
     };
   }
 }
 
+/**
+ * 执行插件注册的工具。
+ *
+ * 插件工具一律走审批 —— 第三方代码的能力不能免审。
+ * 只读模式下也拒绝：插件可能通过 fs.write 之类做出修改。
+ */
+async function runPluginTool(name, args, ctx) {
+  const startedAt = Date.now();
+  const m = /^plugin__([a-z0-9_-]+)__(.+)$/.exec(String(name || ""));
+  if (!m) {
+    return { ok: false, output: `插件工具名不合法：${name}`, ms: 0, status: "error" };
+  }
+  const [, pluginId, toolName] = m;
+  const plugin = state.plugins.find((p) => p.id === pluginId);
+  if (!plugin || !plugin.enabled) {
+    return { ok: false, output: `插件 ${pluginId} 未启用`, ms: 0, status: "error" };
+  }
+  if (state.settings.permission === "readonly") {
+    return {
+      ok: false,
+      output: "当前权限为只读，插件工具已拒绝。",
+      ms: 0,
+      status: "denied",
+    };
+  }
+  const gate = await decideApproval(
+    `插件 · ${plugin.name} · ${toolName}`,
+    { name, preview: plugin.source || plugin.desc || "", args: args || {} },
+    ctx
+  );
+  if (!gate.ok) {
+    return { ok: false, output: gate.output, ms: Date.now() - startedAt, status: gate.status };
+  }
+  const res = await callPluginTool(name, args);
+  return {
+    ok: res.ok,
+    output: res.output,
+    ms: Date.now() - startedAt,
+    status: res.ok ? "done" : "error",
+  };
+}
+
+/**
+ * Node 插件工具的执行。
+ *
+ * ============ 为什么和 iframe 插件分开 ============
+ *
+ * 两者执行路径完全不同：
+ *   · iframe 插件 → 工具在 WebView 沙箱里，靠 postMessage 往返
+ *   · Node 插件  → 工具在 Node 进程里，靠原生通道往返
+ *
+ * 但**审批逻辑必须一样**：都是第三方代码的能力，一律走审批，
+ * 只读模式下也拒绝。不能因为"跑在 Node 里"就绕过审批 ——
+ * 那等于给插件开后门。
+ */
+async function runNodePluginTool(name, args, ctx) {
+  const startedAt = Date.now();
+  const toolName = String(name).slice("plugin__node__".length);
+  if (!toolName) {
+    return { ok: false, output: `Node 插件工具名不合法：${name}`, ms: 0, status: "error" };
+  }
+  if (state.settings.permission === "readonly") {
+    return {
+      ok: false,
+      output: "当前权限为只读，Node 插件工具已拒绝。",
+      ms: 0,
+      status: "denied",
+    };
+  }
+  const gate = await decideApproval(
+    `Node 插件 · ${toolName}`,
+    { name, preview: "Node 运行时内的插件工具", args: args || {} },
+    ctx
+  );
+  if (!gate.ok) {
+    return { ok: false, output: gate.output, ms: Date.now() - startedAt, status: gate.status };
+  }
+  const res = await callNodeTool(name, args);
+  return {
+    ok: res.ok,
+    output: res.output,
+    ms: Date.now() - startedAt,
+    status: res.ok ? "done" : "error",
+  };
+}
+
 export async function executeTool(name, args, ctx = {}) {
   if (String(name).startsWith("mcp__")) return runMcpTool(name, args, ctx);
+  // Node 插件工具：plugin__node__<toolName>
+  // 必须排在 iframe 插件之前 —— 它也是 plugin__ 开头。
+  if (String(name).startsWith("plugin__node__")) return runNodePluginTool(name, args, ctx);
+  // 插件工具：plugin__<pluginId>__<toolName>
+  if (String(name).startsWith("plugin__")) return runPluginTool(name, args, ctx);
   const tool = TOOLS[name];
   const startedAt = Date.now();
   if (!tool) {
@@ -1389,26 +1559,15 @@ export async function executeTool(name, args, ctx = {}) {
     };
   }
 
-  // 审批
-  if (tool.sensitive && state.settings.approval === "never") {
-    return {
-      ok: false,
-      output: "审批策略为「全部拒绝」，操作未执行。",
-      ms: 0,
-      status: "denied",
-    };
-  }
-
-  if (tool.sensitive && state.settings.approval === "ask" && ctx.requestApproval) {
-    const ok = await ctx.requestApproval({
-      name,
-      label: tool.label,
-      preview: tool.preview?.(args) || "",
-      args: args || {},
-      safety,
-    });
-    if (!ok) {
-      return { ok: false, output: "用户拒绝了该操作。", ms: 0, status: "denied" };
+  // 审批（与 MCP / 插件走同一套决策）
+  if (tool.sensitive) {
+    const gate = await decideApproval(
+      tool.label,
+      { name, preview: tool.preview?.(args) || "", args: args || {}, safety },
+      ctx
+    );
+    if (!gate.ok) {
+      return { ok: false, output: gate.output, ms: 0, status: gate.status };
     }
   }
 

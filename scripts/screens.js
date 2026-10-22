@@ -35,6 +35,23 @@ import { icon } from "./icons.js";
 import { plainText } from "./markdown.js";
 import { availableToolNames } from "./tools.js";
 import { powerStatus, powerAvailable } from "./keep-alive.js";
+import { voiceDiagnose, requestVoicePermission } from "./voice.js";
+import { nodeStatus } from "./node-runtime.js";
+import { nodeToolList } from "./node-plugins.js";
+import {
+  localMcpAvailable,
+  localStatus,
+  listLaunchableApps,
+  getAllowedPackages,
+  isPointerMarkEnabled,
+} from "./mcp-local.js";
+import { listAll as listMemories } from "./memory.js";
+import { trajStats } from "./traj.js";
+
+/** 记忆条数（设置页摘要用）。 */
+const memoryCount = () => listMemories().length;
+
+/** 轨迹条数（设置页摘要用）。 */
 
 const esc = (s) =>
   String(s ?? "")
@@ -210,6 +227,15 @@ export function renderPlugins() {
   <div class="page-summary">${enabled.length} / ${state.plugins.length} 已启用</div>
 
   <div class="workspace__body scroll" style="padding-top:0">
+    <button class="creator-row" data-act="plugin-search">
+      <span class="avatar">${icon("download", "icon--sm")}</span>
+      <span class="creator-row__text">
+        <b>安装插件</b>
+        <span>官方清单，或直接填一个插件清单地址。</span>
+      </span>
+      ${icon("chevron", "icon--sm")}
+    </button>
+
     <button class="creator-row" data-act="creator-mode">
       <span class="avatar">${icon("sparkles", "icon--sm")}</span>
       <span class="creator-row__text">
@@ -461,6 +487,435 @@ function backgroundKeepAliveSection() {
     </div>`;
 }
 
+/**
+ * 「本机控制」区块：让用户决定 Agent 能碰这台手机上的哪些应用。
+ *
+ * 设计上刻意做成显式勾选，而不是"全都能碰"：
+ *   - 服务默认关闭，勾了白名单也不会自己启动
+ *   - 白名单为空 = 一个应用都不允许
+ *   - 无障碍已开启时，ui_* 工具只能操作白名单内正处于前台的应用
+ */
+/**
+ * 语音输入自检。
+ *
+ * 「语音用不了」有四种原因，对外表现却都是"没反应"。这里把它们摊开：
+ * 有没有服务、有没有权限、服务是哪个包 —— 用户一眼能看出缺哪一项，
+ * 也省得来回描述"就是不行"。
+ */
+/**
+ * 离线模型下载的瞬时状态。
+ *
+ * 不放进 store：它不是用户数据，退出应用就该丢，
+ * 也没必要落盘（重启后按"未下载"处理是对的 —— 真下载完了，
+ * 原生侧会通过 modelInstalled 告诉我们）。
+ */
+let voiceDl = { state: "idle", pct: 0 };
+
+/** 由 ui.js 在收到 download 事件时更新。 */
+export function setVoiceDownload(next) {
+  voiceDl = { ...voiceDl, ...next };
+}
+
+export function getVoiceDownload() {
+  return voiceDl;
+}
+
+/**
+ * 模型下载区块：按钮 / 进度 / 完成状态。
+ *
+ * 42 MB 的下载没有进度条是不可接受的 —— 用户只会觉得卡死了，
+ * 然后在 30% 的时候杀掉应用。
+ */
+function voiceModelBlock(d) {
+  if (d.modelInstalled || d.modelBundled) {
+    return d.modelInstalled
+      ? `<div class="settings__row-sub" style="color:var(--ok,#5ac08a);margin-bottom:8px">✓ 离线模型已就位（不再需要网络）</div>`
+      : "";
+  }
+  const dl = voiceDl;
+  if (dl.state === "running") {
+    return `
+      <!-- id 是给 ui.js 的 paintVoiceProgress 用的：进度只改这两个节点，不重建整页 -->
+      <div class="settings__row-sub" style="margin-bottom:8px" id="voice-dl-label">正在下载离线模型 ${Math.floor(dl.pct)}%</div>
+      <div style="height:6px;border-radius:3px;background:var(--line,#2a2f3a);overflow:hidden;margin-bottom:10px">
+        <div id="voice-dl-bar" style="width:${dl.pct}%;height:100%;background:var(--accent,#4c8dff);transition:width .2s"></div>
+      </div>
+      <p class="field__hint" style="margin:0 0 10px">分 12 条连接并行下载。中途断了也没关系 —— 已下的部分会保留，点重试从断点继续。</p>`;
+  }
+  if (dl.state === "unzip") {
+    return `<div class="settings__row-sub" style="margin-bottom:8px">正在解压安装（约 10 秒）…</div>`;
+  }
+  return `
+    <button class="btn btn--primary btn--block" style="margin-bottom:8px" data-act="voice-download">
+      ${icon("download", "icon--xs")} 下载离线语音模型（42 MB）
+    </button>
+    ${
+      dl.state === "error"
+        ? `<p class="field__hint" style="margin:0 0 10px;color:var(--danger,#e5484d)">上次下载中断了，已下的部分已经保留 —— 点上面按钮会从断点继续，不会从头再来一遍。</p>`
+        : ""
+    }`;
+}
+
+/**
+ * Node 插件运行时。
+ *
+ * 为什么值得占一个设置分组：它决定了「DSH 的插件能不能用」这件事。
+ * 而插件是 DSH 相对其它客户端最大的差异点 —— 用户需要知道它现在是活的还是死的。
+ */
+function nodeRuntimeSection() {
+  const st = nodeStatus();
+  // 浏览器 / PWA 里没有原生桥，这个分组不该出现（否则会显示"不可用"误导人）
+  if (!st.native) return "";
+
+  const on = state.settings.nodeEnabled !== false;
+  let line = "";
+  let hint = "";
+  let color = "var(--ok,#5ac08a)";
+  // 额外的操作按钮（目前只有"下载"）
+  let action = "";
+
+  if (!st.available) {
+    line = "运行时不可用";
+    hint =
+      st.reason ||
+      st.error ||
+      "JNI 包装没能加载 —— 这个 APK 可能没带 libdshnode.so";
+    color = "var(--danger,#e5484d)";
+  } else if (st.runtimeError) {
+    // 装上了但起不来：dlopen 失败、符号缺失等。
+    // 把原文显示出来，用户截图反馈时才能定位。
+    line = "加载失败";
+    hint = st.runtimeError;
+    color = "var(--danger,#e5484d)";
+  } else if (!st.installed) {
+    // 运行时（libnode.so，117 MB）是下载的，不是内置的 ——
+    // 内置的话 APK 128 MB，用户根本传不到手机上
+    if (st.downloading) {
+      line = `正在下载运行时 ${st.percent}%`;
+      hint = "约 88 MB。中途断了会从断点继续，不用从头下。";
+      color = "var(--warn,#d9a441)";
+    } else {
+      line = "运行时未下载（88 MB）";
+      hint =
+        "运行时不会内置在安装包里 —— 否则光一个包就 128 MB，手机传都传不过来。" +
+        "点下面的按钮下载一次，之后每次更新应用只有十几 MB。";
+      color = "var(--warn,#d9a441)";
+      action = `<button class="btn btn--sm" data-act="node-download">下载运行时</button>`;
+    }
+  } else if (st.running) {
+    // Node 在跑，但通道不一定连上了 —— 这是两件事。
+    // 「运行中但连不上」意味着插件工具调不通，得让用户看见。
+    if (!st.channelConnected) {
+      line = "运行中，但通道未连接";
+      hint =
+        "Node 进程起来了，但和页面的消息通道没连上 —— " +
+        "插件工具此时调不通。稍等几秒会自动重连；如果一直这样，" +
+        "说明运行时启动时出了岔子，重启应用试试。";
+      color = "var(--warn,#d9a441)";
+    } else {
+      line = "运行中";
+      hint = "插件跑在独立进程里，崩溃会自动重启（连续 5 次失败后停下）。";
+    }
+  } else if (on) {
+    line = "已启用，等待启动";
+    hint = "开关打开后应用下次启动就会拉起运行时。";
+    color = "var(--warn,#d9a441)";
+  } else {
+    line = "已关闭";
+    hint = "关闭后所有插件停止，正在跑的任务会中断。";
+    color = "var(--warn,#d9a441)";
+  }
+
+  return `
+    <div class="settings__group">
+      <div class="settings__group-head">插件运行时</div>
+      <div class="settings__row">
+        <div class="settings__row-main">
+          <div class="settings__row-title">Node.js 运行时</div>
+          <div class="settings__row-sub" style="color:${color}">${esc(line)}</div>
+        </div>
+        <button class="switch" role="switch" aria-checked="${on}" aria-label="Node.js 运行时" data-act="toggle-node"></button>
+      </div>
+      ${action ? `<div class="settings__row">${action}</div>` : ""}
+      ${hint ? `<div class="settings__row settings__row--hint"><div class="settings__row-sub">${esc(hint)}</div></div>` : ""}
+    </div>`;
+}
+
+/**
+ * Node 插件清单。
+ *
+ * ============ 为什么单独一个分组 ============
+ *
+ * 「Node 运行时是活的」和「插件是好的」是两回事：
+ * 运行时活着但插件加载失败（语法错误、依赖缺失、版本不兼容），
+ * 用户看到的现象是「工具列表里没有它」—— 没有任何报错。
+ *
+ * 所以把插件清单和工具清单摆到界面上，让失败有地方显示。
+ */
+function nodePluginsSection() {
+  const st = nodeStatus();
+  // 浏览器 / PWA 没有原生桥，不显示
+  if (!st.native) return "";
+  // 运行时没起来就没必要列插件
+  if (!st.running) return "";
+
+  const plugins = state.nodePlugins || [];
+  const tools = nodeToolList();
+
+  let body;
+  if (!st.channelConnected) {
+    body = `<div class="settings__row-sub" style="color:var(--warn,#d9a441)">通道未连接，暂时读不到插件清单</div>`;
+  } else if (!plugins.length) {
+    body = `<div class="settings__row-sub">没有找到插件。插件代码放在工作区的 plugins/ 目录下，每个插件一个子目录。</div>`;
+  } else {
+    body = plugins
+      .map((p) => {
+        const mine = tools.filter((t) => t.pluginId === `node__${p.id}`);
+        const toolTxt = mine.length
+          ? ` · ${mine.length} 个工具：${mine.map((t) => t.name).join("、")}`
+          : " · 未注册工具";
+        return `<div class="settings__row">
+          <div class="settings__row-main">
+            <div class="settings__row-title">${esc(p.name || p.id)}</div>
+            <div class="settings__row-sub">${esc(p.id)} · v${esc(p.version || "0.0.0")}${esc(toolTxt)}</div>
+          </div>
+        </div>`;
+      })
+      .join("");
+  }
+
+  return `
+    <div class="settings__group">
+      <div class="settings__group-head">Node 插件</div>
+      ${body}
+      ${
+        st.channelConnected
+          ? `<div class="settings__row">
+               <button class="btn btn--sm" data-act="node-reload-plugins">重新加载插件</button>
+               <button class="btn btn--sm" data-act="node-selfcheck">通道自检</button>
+             </div>`
+          : ""
+      }
+    </div>`;
+}
+
+function voiceInputSection() {
+  const d = voiceDiagnose();
+  // 浏览器 / PWA 没有原生桥：不显示这个分组，免得占地方还看不懂
+  if (!d.native) return "";
+
+  const ok = d.available && d.permission;
+  let line;
+  let hint = "";
+  if (!d.available) {
+    line = d.serviceCount === 0
+      ? "系统里没有语音识别服务 —— 这台设备可能没装（国产 ROM 常见）"
+      : "语音服务存在，但系统判定不可用";
+    hint =
+      "可以装一个带语音识别的输入法或语音服务（如讯飞语记），" +
+      "或改用键盘自带的语音键。这是设备能力问题，不是应用能绕过的。";
+  } else if (!d.permission) {
+    line = "有语音服务，但还没有麦克风权限";
+    hint = "点下面的按钮授权。如果系统不再弹窗，说明之前勾过「不再询问」，需要到系统设置里手动打开。";
+  } else if (d.onDevice) {
+    line = "使用系统的本地识别（不走网络，质量最好）";
+  } else if (d.preferBuiltin && !d.modelInstalled) {
+    // 还没下载模型：这是最常见的首次状态
+    line = "还没有下载离线语音模型";
+    hint =
+      "系统的识别只能走云端，而那条链路在你的网络下多半不通（错误码 11）。" +
+      "下载一个 42 MB 的中文模型后，语音就会完全在本地识别，不再需要网络。";
+  } else if (d.builtin && d.preferBuiltin) {
+    // 这才是多数国内设备的实际状态：系统只能走云端，所以用内置引擎
+    line = "使用内置离线引擎（不走网络）";
+    hint =
+      "系统的识别服务只能走云端，而那条链路在你的网络下多半不通（错误码 11），" +
+      "所以改用了应用自带的离线引擎。它不联网、一定能出字，代价是准确率低于云端 —— " +
+      "短句指令够用，长句和口音重的场景会出错。";
+  } else if (!d.builtin) {
+    line = "系统只能走云端，且内置引擎未安装";
+    hint =
+      "如果点麦克风后报「连不上语音识别服务（11）」，说明云端那条链路不通。" +
+      "这次构建没有打包离线语音模型（android/vosk-cn/ 缺失），需要重新构建完整包。";
+  } else {
+    line = "语音服务与麦克风权限都正常";
+  }
+
+  return `
+    <div class="settings__group">
+      <div class="settings__group-head">语音输入</div>
+      <div class="settings__row settings__row--stack">
+        <div class="settings__row-title" style="margin-bottom:4px">状态</div>
+        <div class="settings__row-sub" style="margin-bottom:${hint ? "8px" : "2px"};color:${
+          ok ? "var(--ok,#5ac08a)" : "var(--warn,#d9a441)"
+        }">${ok ? "✓ " : "! "}${esc(line)}</div>
+        ${hint ? `<p class="field__hint" style="margin:0 0 10px">${esc(hint)}</p>` : ""}
+        ${
+          d.available && !d.permission
+            ? `<button class="btn btn--primary btn--block" style="margin-bottom:8px" data-act="voice-permission">${icon("mic", "icon--xs")} 授权麦克风</button>`
+            : ""
+        }
+        ${voiceModelBlock(d)}
+        <p class="field__hint" style="margin:8px 0 0;opacity:.75">
+          识别服务：${
+            d.serviceCount
+              ? esc(d.services.join("、"))
+              : "未找到"
+          }<br>系统本地识别：${d.onDevice ? "支持" : "不支持"} · 内置引擎：${
+            d.builtin ? "已就绪" : "未安装"
+          } · Android API ${d.api || "?"}${
+            d.error ? ` · 自检异常：${esc(d.error)}` : ""
+          }
+        </p>
+      </div>
+    </div>`;
+}
+
+function localControlSection() {
+  if (!localMcpAvailable()) return "";
+  const st = localStatus();
+  const apps = listLaunchableApps();
+  const allowed = new Set(getAllowedPackages());
+  const allowedList = apps.filter((a) => allowed.has(a.package));
+  const pointerOn = isPointerMarkEnabled();
+
+  return `
+    <div class="settings__group">
+      <div class="settings__group-head">本机控制</div>
+      <div class="settings__row">
+        <div class="settings__row-main">
+          <div class="settings__row-title">本机 MCP 服务</div>
+          <div class="settings__row-sub">${
+            st.running
+              ? `正在监听 127.0.0.1:${st.port || 8788} · 只对本机生效`
+              : st.enabled
+              ? "已启用，但设备进程没响应（可能刚被系统回收）"
+              : "默认关闭。开启后 Agent 才能通过 MCP 操作这台手机"
+          }</div>
+        </div>
+        <button class="switch" role="switch" aria-checked="${st.enabled}" aria-label="本机 MCP 服务" data-act="toggle-local-mcp"></button>
+      </div>
+
+      ${
+        // 「开着但连不上」是最常见的一种不稳：设备进程被回收过一次，
+        // 或者监听 socket 已经不能 accept。给它一个明确的恢复动作，
+        // 而不是让用户去翻设置、重启应用。
+        st.enabled && !st.running
+          ? `<button class="btn btn--primary btn--block" style="margin:2px 0 10px" data-act="restart-local-mcp">重新连接</button>`
+          : ""
+      }
+
+      <div class="settings__row">
+        <div class="settings__row-main">
+          <div class="settings__row-title">显示点击位置</div>
+          <div class="settings__row-sub">${
+            !st.overlay
+              ? "缺少悬浮窗权限，落点画不出来 —— 但点击本身照常执行"
+              : pointerOn
+              ? "AI 点击时在落点画涟漪，滑动时画连线，1.2 秒后消失"
+              : "已关闭：操作照常执行，只是看不见落点"
+          }</div>
+        </div>
+        <button class="switch" role="switch" aria-checked="${pointerOn}" aria-label="显示点击位置" data-act="toggle-pointer-mark"></button>
+      </div>
+      ${
+        // 没权限时不隐藏这一行（那是最需要它的时候），而是在下面直接给入口。
+        // 这是 0.23.x 那次的教训：把「去授权」按钮藏在 js 条件里，用户永远看不到。
+        !st.overlay
+          ? `<button class="btn btn--primary btn--block" style="margin:2px 0 10px" data-act="request-hud-permission">去授予悬浮窗权限</button>`
+          : ""
+      }
+
+      ${shizukuCard(st)}
+
+      <div class="settings__row settings__row--stack">
+        <div class="settings__row-title" style="margin-bottom:4px">允许控制的应用</div>
+        <p class="field__hint" style="margin:0 0 8px">
+          已勾选 <b>${allowedList.length}</b> 个。Agent 只能启动、读取、操作用户勾选过的应用；
+          其它应用一律拒绝。深链跳转也会被拦。
+        </p>
+        ${
+          apps.length
+            ? `<div class="local-apps">${apps
+                .map(
+                  (a) => `
+          <label class="local-app">
+            <input type="checkbox" data-act="toggle-local-app" value="${esc(a.package)}" ${allowed.has(a.package) ? "checked" : ""}>
+            <span class="local-app__label">${esc(a.label || a.package)}</span>
+            <span class="local-app__pkg mono">${esc(a.package)}</span>
+          </label>`
+                )
+                .join("")}</div>`
+            : `<p class="field__hint">没有取到可启动应用列表。</p>`
+        }
+      </div>
+    </div>`;
+}
+
+/**
+ * 低速通道（Shizuku）的状态卡。
+ *
+ * 为什么单独占一张卡，而不是塞进无障碍那一块：
+ * 这两条通道的**修法完全不同** —— 无障碍要去系统设置里开开关、放行电池，
+ * Shizuku 要去启动服务、点授权。混在一起会让人分不清该动哪个。
+ *
+ * 五档状态对应五个不同动作，这也是为什么 State 不能只给一个 boolean。
+ */
+function shizukuCard(st) {
+  const s = Number(st.shizukuState ?? 0);
+  let tone = "";
+  let text = "";
+
+  if (!st.available) {
+    text = "未接入原生桥（浏览器环境没有 Shizuku 通道）。";
+  } else if (s === 0) {
+    tone = "bad";
+    text = "没有安装 Shizuku。装好并启动服务后，这条通道才可用。";
+  } else if (s === 1) {
+    tone = "bad";
+    text = "Shizuku 装了，但服务没在运行 —— 每次重启手机后要重新启动一次（Android 11+ 用无线调试即可，不需要电脑）。";
+  } else if (s === 2) {
+    tone = "warn";
+    text = "Shizuku 在运行，但还没授权本应用。点下面的按钮，在 Shizuku 的弹框里选「允许」。";
+  } else if (s === 3) {
+    tone = "warn";
+    text = "正在建立连接…";
+  } else if (s === 4) {
+    tone = "ok";
+    text = "通道就绪。界面操作（读屏、点击、滑动、输入）全部走这条。";
+  } else {
+    tone = "warn";
+    text = "已授权，尚未建立连接。首次调用 ui_* 会自动连上，也可以点下面的按钮立即连接。";
+  }
+
+  const btn = (act, label) =>
+    `<button class="btn btn--primary btn--block" style="margin-bottom:8px" data-act="${act}">${label}</button>`;
+
+  let actions = "";
+  if (st.available) {
+    if (s === 0) actions = btn("open-shizuku-download", "去下载 Shizuku");
+    else if (s === 1) actions = btn("open-shizuku-app", "打开 Shizuku 启动服务");
+    else if (s === 2) actions = btn("request-shizuku", "授权 DSH");
+    else if (s === 3 || s === 5) actions = btn("connect-shizuku", "立即连接");
+  }
+
+  return `<div class="settings__row settings__row--stack">
+        <div class="settings__row-title" style="margin-bottom:4px;display:flex;align-items:center;gap:6px">
+          界面操作 · Shizuku
+        </div>
+        <div class="settings__row-sub" style="margin-bottom:10px">${esc(st.shizukuDesc || "未检测")}</div>
+        <div class="a11y-verdict a11y-verdict--${tone}">${esc(text)}</div>
+        ${actions}
+        <p class="field__hint" style="margin:0">
+          原来还有一条「无障碍」通道，更快（约 100ms）也能输中文，但它的权限来自
+          「系统对应用的绑定」，vivo / 小米 / OPPO 的省电策略会周期性把它摘掉，
+          表现为「时好时坏」。0.26.0 起已移除，只保留这一条 —— 行为可预期。<br>
+          代价：读一次界面约 1~2 秒；中文输入靠剪贴板 + 粘贴键。
+        </p>
+      </div>`;
+
+}
+
 function settingsHome() {
   return `
   <div class="settings scroll">
@@ -480,6 +935,29 @@ function settingsHome() {
     </div>
     <div style="height:20px"></div>
   </div>`;
+}
+
+/**
+ * 一句话结论：现在到底卡在哪。
+ *
+ * 前几轮的教训是「给了用户一堆状态字段，他仍然不知道该点哪」。
+ * 这里按「最可能的下一步」排序，只给一条 —— 说多了等于没说。
+ */
+/**
+ * 审批策略的说明文案。
+ *
+ * 旧文案只说「写入、终端、插件安装前会弹审批」，没讲清楚 MCP 工具算不算。
+ * 更糟的是代码里 MCP / 插件确实**不认**这个设置 —— 文案和实现都不完整。
+ * 现在三条路径统一了，文案也把范围写全。
+ */
+function approvalHint(policy) {
+  if (policy === "never") {
+    return "所有敏感操作（写入、终端、脚本、MCP、插件工具）直接拒绝，不弹窗。";
+  }
+  if (policy === "auto") {
+    return "上述操作全部直接执行，包括 MCP 与插件工具。破坏性命令仍会被 CC Safety Net 拦下。";
+  }
+  return "写入、终端、脚本、MCP 工具、插件工具，每次调用前都会弹窗确认。";
 }
 
 export function renderSettings(cat = null) {
@@ -635,7 +1113,7 @@ export function renderSettings(cat = null) {
           <button class="segmented__item" data-act="set-approval" data-value="auto" aria-pressed="${s.approval === "auto"}">自动放行</button>
           <button class="segmented__item" data-act="set-approval" data-value="never" aria-pressed="${s.approval === "never"}">全部拒绝</button>
         </div>
-        <p class="field__hint" style="margin-top:6px">${s.approval === "ask" ? "写入、终端、插件安装前会弹出审批。" : s.approval === "auto" ? "敏感操作直接执行，适合调好的固定流程。" : "所有敏感操作直接拒绝。"}</p>
+        <p class="field__hint" style="margin-top:6px">${approvalHint(s.approval)}</p>
       </div>
 
       <div class="settings__row">
@@ -649,6 +1127,50 @@ export function renderSettings(cat = null) {
           <button class="icon-btn icon-btn--sm" data-act="max-steps" data-value="2" aria-label="增加">${icon("plus", "icon--sm")}</button>
         </div>
       </div>
+    </div>
+
+    <div class="settings__group">
+      <div class="settings__group-head">长期记忆</div>
+      <div class="settings__row">
+        <div class="settings__row-main">
+          <div class="settings__row-title">启用长期记忆</div>
+          <div class="settings__row-sub">把已验证的事实与偏好注入对话，替代模型自己的猜测</div>
+        </div>
+        <button class="switch" role="switch" aria-checked="${s.memoryEnabled !== false}" aria-label="启用长期记忆" data-act="toggle-memory"></button>
+      </div>
+      <button class="settings__row" data-act="open-memory" style="width:100%;text-align:left">
+        <div class="settings__row-main">
+          <div class="settings__row-title">我的记忆</div>
+          <div class="settings__row-sub">${(() => {
+            const n = memoryCount();
+            return n ? `${n} 条 · 查看、删除与纠正` : "还没有记录 · 对话中说出偏好或纠正错误会自动积累";
+          })()}</div>
+        </div>
+        ${icon("chevron", "icon--sm")}
+      </button>
+    </div>
+
+    <div class="settings__group">
+      <div class="settings__group-head">控屏轨迹</div>
+      <div class="settings__row">
+        <div class="settings__row-main">
+          <div class="settings__row-title">记录控屏轨迹</div>
+          <div class="settings__row-sub">DSH 操作手机界面时自动记一条，落库前已脱敏；只有你标为成功的才会被检索使用</div>
+        </div>
+        <button class="switch" role="switch" aria-checked="${s.trajEnabled !== false}" aria-label="记录控屏轨迹" data-act="toggle-traj"></button>
+      </div>
+      <button class="settings__row" data-act="open-traj" style="width:100%;text-align:left">
+        <div class="settings__row-main">
+          <div class="settings__row-title">控屏轨迹库</div>
+          <div class="settings__row-sub">${(() => {
+            const st = trajStats();
+            return st.total
+              ? `${st.total} 条 · ${st.success} 条已确认成功 · 查看、判定与检索`
+              : "还没有记录 · 让 DSH 操作一次手机界面就会自动记一条";
+          })()}</div>
+        </div>
+        ${icon("chevron", "icon--sm")}
+      </button>
     </div>`,
 
     tools: () => `
@@ -671,7 +1193,11 @@ export function renderSettings(cat = null) {
         <span class="tag">${(s.mcpServers || []).length}</span>
         ${icon("chevron", "icon--sm")}
       </button>
-    </div>`,
+    </div>
+    ${localControlSection()}
+    ${voiceInputSection()}
+    ${nodeRuntimeSection()}
+    ${nodePluginsSection()}`,
 
     notify: () => `
     <div class="settings__group">
