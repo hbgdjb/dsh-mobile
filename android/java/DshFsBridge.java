@@ -391,6 +391,11 @@ public class DshFsBridge {
             name = "library";
         } else if ("traj".equals(area)) {
             name = "traj";
+        } else if ("deps".equals(area)) {
+            // 依赖缓存：插件装的 npm 包按 name@version 存 tarball。
+            // 单独一个区，不进工作区 —— 那是用户的文件空间，
+            // 不该凭空多出几百个我们自己的缓存文件。
+            name = "deps-cache";
         } else {
             name = "workspace";
         }

@@ -92,6 +92,11 @@ await page.waitForTimeout(900);
 await page.click('.tab[data-view="plugins"]');
 await page.waitForTimeout(400);
 
+/* 插件页现在分三段：已安装 / 发现 / 页面内。
+   页面内插件的安装入口在「页面内」这一段里，先切过去。 */
+await page.click('.segmented__item[data-act="plugins-tab"][data-value="page"]');
+await page.waitForTimeout(400);
+
 const entry = await page.evaluate(() => {
   const row = [...document.querySelectorAll('[data-act="plugin-search"]')].find((e) => e.classList.contains("creator-row"));
   return {

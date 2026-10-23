@@ -2537,3 +2537,427 @@ html[data-density="compact"] .tool {
 .no-motion .voice-strip__bars i {
   transition: none;
 }
+
+/* ============================================================
+   插件市场卡片
+   ------------------------------------------------------------
+   两列网格，每格一张卡。原来是一行一行的「标题 + 描述 + 按钮」，
+   三千多个插件滚起来像一份没排版的清单 —— 看不出边界，
+   也分不清哪些是同一个插件的不同信息。
+   ============================================================ */
+
+.mk-grid {
+  display: grid;
+  /* minmax(0, 1fr) 而不是 1fr：标题很长时 grid 项会撑破列宽 */
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px;
+  align-items: stretch;
+}
+
+/* 平板/横屏给三列，不然每格宽得离谱 */
+@media (min-width: 560px) {
+  .mk-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+.mk-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 11px 11px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: linear-gradient(180deg, rgba(233, 237, 245, 0.032), rgba(233, 237, 245, 0.008));
+  transition: border-color var(--dur-1, 0.15s), background var(--dur-1, 0.15s);
+}
+
+.mk-card:active {
+  border-color: var(--line-strong);
+}
+
+/* 分类单独一行，压在标题上方。
+   放标题右边会把本来就不宽的两列再切掉一块，标题只能显示成
+   「dsh-telemetry-…」；放脚注又和版本号挤在同一行被截断。 */
+.mk-card__cat {
+  min-height: 1.3em;
+  font: 9px/1.3 var(--font-mono);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mk-card__title {
+  /* 固定两行的高度：标题一行还是两行，描述都从同一高度开始，
+     两列读起来才是对齐的，而不是参差的 */
+  height: 2.84em;
+  font: 600 12.5px/1.42 var(--font-body);
+  color: var(--text);
+  /* 两行截断：标题常常是「作者-插件名」，一行放不下 */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.mk-card__desc {
+  flex: 1;
+  min-height: 3.2em; /* 没描述也占位，两列才对得齐 */
+  margin: 0;
+  font: 11.5px/1.6 var(--font-body);
+  color: var(--dim);
+  /* 三行截断。描述在中英文两种语言下长度差很多，截断比撑高整齐。 */
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.mk-card__foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.mk-card__meta {
+  min-width: 0;
+  font: 10px/1.4 var(--font-mono);
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 没写说明的插件也占同样的位置，别让卡片高度忽高忽低 */
+.mk-card__desc--empty {
+  color: var(--line-strong);
+  font-style: italic;
+}
+
+.mk-card__btn {
+  flex: none;
+  min-width: 58px;
+  min-height: 30px; /* 手指要按得着 */
+  padding: 0 12px;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-sm);
+  background: var(--accent-soft);
+  color: var(--accent-bright);
+  font: 500 11.5px/1 var(--font-body);
+  transition: background var(--dur-1, 0.15s), transform var(--dur-1, 0.15s);
+}
+
+.mk-card__btn:active {
+  transform: scale(0.96);
+  background: var(--accent-line);
+}
+
+.mk-card__btn[disabled] {
+  opacity: 0.55;
+  transform: none;
+}
+
+.mk-card__done {
+  flex: none;
+  padding: 0 9px;
+  min-height: 26px;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid rgba(79, 209, 165, 0.28);
+  border-radius: var(--r-sm);
+  background: var(--ok-soft);
+  color: var(--ok);
+  font: 500 11px/1 var(--font-body);
+}
+
+/* ---------- 分类筛选：单行横向滚动 ---------- */
+
+.mk-cats {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -webkit-overflow-scrolling: touch;
+  /* 两侧留一点，滑到头时首尾不贴边 */
+  padding: 0 1px 2px;
+}
+
+.mk-cats::-webkit-scrollbar {
+  display: none;
+}
+
+.mk-cats__item {
+  flex: none;
+  height: 30px;
+  padding: 0 11px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font: 11.5px/1 var(--font-body);
+  white-space: nowrap;
+  transition: color var(--dur-1, 0.15s), border-color var(--dur-1, 0.15s),
+    background var(--dur-1, 0.15s);
+}
+
+.mk-cats__item[aria-selected="true"] {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent-bright);
+}
+
+/* 「N 个匹配」那行 */
+.market-count {
+  margin: 0 0 9px;
+  font: 11px/1.4 var(--font-mono);
+  letter-spacing: 0.06em;
+  color: var(--dim);
+}
+
+/* 列表底部留白：最后一排卡片被底部 tabbar 压住过 */
+#market-list {
+  padding-bottom: 24px;
+}
+
+/* ---------- 市场：详情面板 ---------- */
+
+.mk-card--tap {
+  cursor: pointer;
+}
+
+.mk-card--tap:active {
+  border-color: var(--accent-line);
+  background: rgba(71, 99, 244, 0.06);
+}
+
+.mk-detail__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.mk-detail__tag {
+  padding: 3px 9px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font: 11px/1.45 var(--font-body);
+  color: var(--muted);
+}
+
+.mk-detail__tag--mono {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.02em;
+}
+
+.mk-detail__tag--dim {
+  color: var(--dim);
+  border-style: dashed;
+}
+
+.mk-detail__text {
+  margin: 0 0 10px;
+  font: 13px/1.78 var(--font-body);
+  color: var(--text-soft);
+  word-break: break-word;
+}
+
+.mk-detail__text--en {
+  font-size: 11.5px;
+  line-height: 1.65;
+  color: var(--dim);
+}
+
+.mk-detail__link {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  margin: 6px 0 4px;
+  padding: 9px 11px;
+  border: 1px dashed var(--line);
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  text-align: left;
+}
+
+.mk-detail__link .mono {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mk-detail__link-hint {
+  flex: none;
+  color: var(--accent-bright);
+}
+
+.mk-detail__pre {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mk-detail__pre--wait {
+  font: 11.5px/1.7 var(--font-body);
+  color: var(--dim);
+}
+
+.mk-detail__flag {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-left: 2px solid var(--line-strong);
+  border-radius: var(--r-sm);
+}
+
+.mk-detail__flag b {
+  font: 600 12px/1.4 var(--font-body);
+  color: var(--text);
+}
+
+.mk-detail__flag span {
+  font: 11.5px/1.62 var(--font-body);
+  color: var(--dim);
+}
+
+.mk-detail__flag--warn {
+  border-left-color: var(--warn);
+  background: var(--warn-soft);
+}
+
+.mk-detail__flag--warn b {
+  color: var(--warn);
+}
+
+.mk-detail__flag--ok {
+  border-left-color: var(--ok);
+  background: var(--ok-soft);
+}
+
+.mk-detail__flag--ok b {
+  color: var(--ok);
+}
+
+.mk-detail__kv {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font: 11.5px/1.6 var(--font-body);
+}
+
+.mk-detail__kv span {
+  flex: none;
+  color: var(--dim);
+}
+
+.mk-detail__kv b {
+  min-width: 0;
+  color: var(--text-soft);
+  font-weight: 500;
+  text-align: right;
+  word-break: break-all;
+}
+
+/* 说明被数据源截断时的提示 —— 不能让用户以为详情页也看不全 */
+.mk-detail__note {
+  margin: -4px 0 12px;
+  padding-left: 9px;
+  border-left: 2px solid var(--line-strong);
+  font: 11px/1.65 var(--font-body);
+  color: var(--dim);
+}
+
+/* ---------- 市场：安装进度 ---------- */
+
+.mk-progress {
+  height: 3px;
+  margin: 5px 0 1px;
+  border-radius: 2px;
+  background: var(--line);
+  overflow: hidden;
+}
+
+.mk-progress i {
+  display: block;
+  height: 100%;
+  width: 0;
+  border-radius: 2px;
+  background: var(--accent-bright);
+  transition: width 0.25s ease;
+}
+
+/* 还不知道总数时（查依赖、算树）走一段来回跑的条子 ——
+   静止的 0% 和「卡死」在视觉上没有区别 */
+.mk-progress--indeterminate i {
+  width: 38%;
+  animation: mk-progress-slide 1.15s ease-in-out infinite;
+}
+
+@keyframes mk-progress-slide {
+  0% {
+    transform: translateX(-110%);
+  }
+  100% {
+    transform: translateX(360%);
+  }
+}
+
+.mk-card__busy {
+  flex: none;
+  min-width: 58px;
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  color: var(--text-soft);
+  font-size: 10.5px;
+}
+
+/* 「已装 · 查看」现在是个按钮了 —— 它通向已安装列表 */
+button.mk-card__done {
+  cursor: pointer;
+  min-height: 30px;
+}
+
+button.mk-card__done:active {
+  transform: scale(0.97);
+}
+
+/* 刚装好的那一行：左边一道强调色 + 淡背景，几秒后自己褪掉 */
+.settings__row.is-new {
+  background: var(--accent-soft);
+  box-shadow: inset 2px 0 0 var(--accent);
+  animation: mk-new-row 3.2s ease-out forwards;
+}
+
+@keyframes mk-new-row {
+  0%,
+  70% {
+    background: var(--accent-soft);
+    box-shadow: inset 2px 0 0 var(--accent);
+  }
+  100% {
+    background: transparent;
+    box-shadow: inset 2px 0 0 transparent;
+  }
+}

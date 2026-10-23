@@ -30,6 +30,9 @@
     <link rel="stylesheet" href="./styles/components.css" />
     <link rel="stylesheet" href="./styles/effort.css" />
     <link rel="stylesheet" href="./styles/screens.css" />
+
+    <!-- 启动动画覆盖层：样式必须在应用样式之后，否则 z-index 和底色会被盖掉 -->
+    <link rel="stylesheet" href="./splash/dsh-splash.css" />
   </head>
   <body>
     <div class="stage">
@@ -76,6 +79,8 @@
       </div>
     </div>
 
+    <!-- 启动动画：普通脚本，必须先于 module 执行 —— 保证首帧是深色动画而不是白屏 -->
+    <script src="./splash/dsh-splash.js"></script>
     <script type="module" src="./scripts/app.js"></script>
   </body>
 </html>

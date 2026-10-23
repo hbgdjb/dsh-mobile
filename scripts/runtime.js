@@ -37,6 +37,7 @@ import {
   persistTags,
 } from "./memory.js";
 import { beginTrajectory, captureTool, endTrajectory, abortTrajectory } from "./traj.js";
+import { isNodeLlmModel, nodeProviderOf, streamViaNode } from "./llm-bridge.js";
 
 const sleep = (ms, signal) =>
   new Promise((resolve, reject) => {
@@ -457,9 +458,75 @@ function effortFallback(active, detail) {
   return "（该模型不接受 reasoning_effort，已自动关闭推理强度透传并保存；请重发本条消息）";
 }
 
+/**
+ * 走 Node 里插件 adapter 的一次请求。
+ *
+ * 与上面走 HTTP 的那条路**返回同样的形状**（`{ calls, finish }`），
+ * 所以下游的工具执行、重试、轨迹记录都不用改。
+ *
+ * ============ 为什么要单独一个函数 ============
+ *
+ * HTTP 那条路的诊断字段（endpoint / status / tokens）在这里意义不同：
+ * 没有 HTTP 状态码，端点是「node:<provider>」。硬塞进同一个函数里
+ * 只会让两边都变得难读。
+ */
+async function chatViaNode(active, { messages, tools, signal, onText, onReasoning, onUsage }) {
+  const provider = nodeProviderOf(active);
+  const model = modelApiId(active);
+  if (!provider) throw new Error("这个模型没有记录来源供应方，请到设置里重新同步一次模型列表");
+  if (!model) throw new Error("这个模型没有模型 ID");
+
+  const started = Date.now();
+  let diag = { endpoint: `node:${provider}`, model, status: 0, ok: false, tokens: 0, ms: 0 };
+
+  try {
+    const r = await streamViaNode({
+      provider,
+      model,
+      messages,
+      tools,
+      // 系统提示词已经在 messages[0] 里了，不再单传一份 ——
+      // 传两份会让有些 adapter 把它拼接两遍
+      temperature:
+        typeof active.temperature === "number" ? active.temperature : state.settings.temperature ?? 0.3,
+      maxTokens: Number(active.maxTokens) > 0 ? Number(active.maxTokens) : undefined,
+      reasoningEffort: active.supportsEffort !== false ? state.settings.reasoning : undefined,
+      signal,
+      onText,
+      onReasoning,
+      onUsage(u) {
+        diag.tokens = u?.total_tokens || diag.tokens;
+        onUsage?.(u);
+      },
+    });
+
+    diag = { ...diag, ok: true, ms: Date.now() - started };
+    addDiagnostic(diag);
+    setModelStatus(active.id, { ok: true, status: 0, ms: diag.ms, model });
+    return { calls: r.calls, finish: r.finish };
+  } catch (err) {
+    // 用户主动停止不是错误，别写进诊断记录
+    if (err?.name === "AbortError") throw err;
+    const detail = String(err?.message || err);
+    diag = { ...diag, ms: Date.now() - started, error: detail };
+    addDiagnostic(diag);
+    setModelStatus(active.id, { ok: false, status: 0, error: detail, model });
+    throw new Error(`插件模型调用失败：${detail}`);
+  }
+}
+
 async function chatOnce({ messages, tools, signal, onText, onReasoning, onUsage }) {
   const active = currentModel();
   if (!active) throw new Error("还没有添加模型。到 设置 → 模型管理 里添加一个，选好供应方一分钟就能接上。");
+
+  // ============ 插件提供的模型：请求交给 Node 里的 adapter ============
+  //
+  // 这类模型没有 Base URL —— 它的端点在插件的 adapter 闭包里，
+  // 只有加载了插件的 Node 进程能执行它。所以这里换一条路走。
+  if (isNodeLlmModel(active)) {
+    return await chatViaNode(active, { messages, tools, signal, onText, onReasoning, onUsage });
+  }
+
   const apiKey = apiKeyFor(active);
   const baseUrl = modelBaseUrl(active);
   const model = modelApiId(active);
@@ -1142,9 +1209,35 @@ function subagentSystemPrompt(task) {
 export async function spawnSubagentOnce(task, signal) {
   const active = currentModel();
   if (!active) throw new Error("还没有添加模型，无法派生子 Agent。");
-  const baseUrl = modelBaseUrl(active);
   const model = modelApiId(active);
-  if (!baseUrl || !model) throw new Error("请先配置 Base URL 与模型 ID");
+  if (!model) throw new Error("请先配置模型 ID");
+
+  const subMessages = [
+    // 子 Agent 同样需要「有据可依」：它拿不到主对话的上下文，
+    // 只能靠记忆块知道用户是谁、项目是什么 —— 不注入就等于让它去编
+    { role: "system", content: subagentSystemPrompt(task) },
+    { role: "user", content: task },
+  ];
+
+  // 插件提供的模型没有 HTTP 端点，同样交给 Node 里的 adapter
+  if (isNodeLlmModel(active)) {
+    let text = "";
+    await streamViaNode({
+      provider: nodeProviderOf(active),
+      model,
+      messages: subMessages,
+      tools: [],
+      temperature: 0.2,
+      signal,
+      onText: (t) => {
+        text += t;
+      },
+    });
+    return sanitizeUntrusted(text || "（子 Agent 没有返回内容）");
+  }
+
+  const baseUrl = modelBaseUrl(active);
+  if (!baseUrl) throw new Error("请先配置 Base URL");
   const apiKey = apiKeyFor(active);
   if (!apiKey) throw new Error("当前服务未配置 API Key");
   const res = await fetchWithTimeout(endpointFor(baseUrl), {
@@ -1152,12 +1245,7 @@ export async function spawnSubagentOnce(task, signal) {
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
     body: JSON.stringify({
       model,
-      messages: [
-        // 子 Agent 同样需要「有据可依」：它拿不到主对话的上下文，
-        // 只能靠记忆块知道用户是谁、项目是什么 —— 不注入就等于让它去编
-        { role: "system", content: subagentSystemPrompt(task) },
-        { role: "user", content: task },
-      ],
+      messages: subMessages,
       temperature: 0.2,
       stream: false,
     }),
@@ -1299,9 +1387,35 @@ export async function testModel(modelOrId) {
   };
 
   const key = apiKeyFor(model);
+  const apiModel = modelApiId(model);
+
+  // 插件提供的模型：没有 Key、没有 Base URL —— 直接让 Node 侧跑一次最小请求
+  if (isNodeLlmModel(model)) {
+    if (!apiModel) throw new Error("缺少模型 ID，请到模型参数里填写");
+    const started = Date.now();
+    const endpoint = `node:${nodeProviderOf(model)}`;
+    try {
+      await streamViaNode({
+        provider: nodeProviderOf(model),
+        model: apiModel,
+        messages: [{ role: "user", content: "ping" }],
+        tools: [],
+        maxTokens: 16,
+      });
+    } catch (err) {
+      const message = err?.message || "插件模型调用失败";
+      addDiagnostic({ endpoint, model: apiModel, status: 0, ok: false, error: message });
+      record({ ok: false, status: 0, error: message, model: apiModel });
+      throw new Error(message);
+    }
+    const ms = Date.now() - started;
+    addDiagnostic({ endpoint, model: apiModel, status: 0, ok: true, ms });
+    record({ ok: true, status: 0, ms, model: apiModel, endpoint });
+    return { ms, model: apiModel, usage: 0, endpoint, status: 0 };
+  }
+
   if (!key) throw new Error(`「${model.label}」所属服务还没有配置 Key`);
   const baseUrl = modelBaseUrl(model);
-  const apiModel = modelApiId(model);
   if (!baseUrl) throw new Error("缺少 Base URL，请到模型参数里填写");
   if (!apiModel) throw new Error("缺少模型 ID，请到模型参数里填写");
 

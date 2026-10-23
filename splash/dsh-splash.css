@@ -1,0 +1,67 @@
+/* ============================================================
+   DSH Mobile · 启动动画覆盖层  dsh-splash.css
+   ------------------------------------------------------------
+   只做三件事：
+   1) 把页面底色先压成深灰黑，杜绝 WebView 首帧白闪
+   2) 覆盖层固定在最上层，动画期间吃掉所有触摸
+   3) 给 canvas 加一层极淡的暗角（比在 canvas 里画便宜）
+
+   注意：底色由 canvas 自己画。退场做百叶擦除时 JS 会把这里的
+   background 置为 transparent，让真实界面从擦开的地方透出来。
+   ============================================================ */
+
+html {
+  /* 关键：脚本还没跑起来时，页面就已经是深色 */
+  background: #0b0c0e;
+}
+
+html.dsh-booting {
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+.dsh-splash {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: #0b0c0e;
+  overflow: hidden;
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* 预览页里塞进手机框时用绝对定位 */
+.dsh-splash--inline {
+  position: absolute;
+}
+
+.dsh-splash__canvas {
+  display: block;
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* 暗角：把注意力收到中间，顺便给纯色底一点纵深 */
+.dsh-splash__veil {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(130% 88% at 50% 44%, rgba(0, 0, 0, 0) 46%, rgba(0, 0, 0, 0.46) 100%),
+    radial-gradient(120% 60% at 50% 106%, rgba(0, 0, 0, 0.5), rgba(0, 0, 0, 0) 70%);
+}
+
+/* 极细颗粒：压到几乎看不见，只是让大面积纯色不发闷 */
+.dsh-splash__veil::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  opacity: 0.14;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix type='saturate' values='0'/></filter><rect width='120' height='120' filter='url(%23n)' opacity='0.5'/></svg>");
+  background-size: 120px 120px;
+}

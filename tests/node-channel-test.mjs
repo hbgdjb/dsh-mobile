@@ -23,7 +23,7 @@ const NODE_DIR = path.join(ROOT, "android", "node");
 
 const { connect } = require(path.join(NODE_DIR, "channel.js"));
 const { createContainer, applyPlugin } = require(path.join(NODE_DIR, "cordis-lite.js"));
-const { createHost, listPlugins } = require(path.join(NODE_DIR, "plugin-host.js"));
+const { createHost, listPlugins, diagnose } = require(path.join(NODE_DIR, "plugin-host.js"));
 const { createServices } = require(path.join(NODE_DIR, "ctx-services.js"));
 
 let passed = 0;
@@ -257,10 +257,27 @@ await test("inject 声明的服务出现在 ctx 上", () => {
   assert.strictEqual(typeof ctx.slots.inject, "function");
 });
 
-await test("没声明的服务不会出现在 ctx 上（cordis 语义）", () => {
+await test("没声明的服务读取会抛错（cordis 代理语义）", () => {
   const c = createContainer({ services: { slots: {}, sessions: {} } });
   const ctx = c.contextFor(["slots"]);
-  assert.strictEqual(ctx.sessions, undefined, "没声明的服务不该给");
+  // cordis 的 ctx 是代理：读一个没在 inject 里声明的服务会抛错
+  // （`cannot get property "X" without inject`），
+  // 而不是返回 undefined —— 详见 reflect.ts 的 Proxy handler。
+  //
+  // 这一点很重要：返回 undefined 会让插件以为服务存在，
+  // 走进本不该走的分支，然后在几百行之外以无关的错误崩掉。
+  assert.throws(
+    () => ctx.sessions,
+    /cannot get property "sessions" without inject/,
+    "没声明的服务必须抛错，不能返回 undefined"
+  );
+  // 声明过的照常可读
+  assert.ok(ctx.slots, "声明过的服务应该在 ctx 上");
+  // ctx.get() 是机会性查找 —— 无论声明与否都能问到，问不到才返回 undefined。
+  // 这里 sessions 宿主确实提供了，所以 get 得到它（虽然插件没声明）。
+  assert.deepStrictEqual(ctx.get("sessions"), {}, "ctx.get 不受 inject 限制");
+  // 问不到的服务 → undefined，不抛错
+  assert.strictEqual(ctx.get("nothingHere"), undefined, "ctx.get 问不到时返回 undefined");
 });
 
 await test("点号路径 remote.session 能解析", () => {
@@ -421,6 +438,108 @@ await test("卸载插件后工具清空", async () => {
   assert.strictEqual(host.listTools().length, 0);
 });
 
+/* ---------- 目录诊断：让「未找到插件」能自解释 ---------- */
+
+await test("plugins 目录不存在时，诊断要明说「不存在」", () => {
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-nodiag-"));
+  const d = diagnose(empty);
+  assert.strictEqual(d.exists, false, "没建过就必须报 false");
+  assert.strictEqual(d.pluginsDir, path.join(empty, "plugins"));
+  assert.deepStrictEqual(d.entries, []);
+});
+
+await test("plugins 目录存在但空着 → 能看出「写到了别处」", () => {
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-nodiag2-"));
+  fs.mkdirSync(path.join(empty, "plugins"), { recursive: true });
+  const d = diagnose(empty);
+  assert.strictEqual(d.exists, true);
+  assert.deepStrictEqual(d.entries, [], "空目录要如实报空，而不是报不存在");
+});
+
+await test("目录在但缺入口文件 → 单独报出来（最常见的「放了文件却说找不到」）", () => {
+  const w = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-stray-"));
+  fs.mkdirSync(path.join(w, "plugins", "half-made"), { recursive: true });
+  fs.writeFileSync(path.join(w, "plugins", "half-made", "index.json"), "{}");
+  const d = diagnose(w);
+  assert.deepStrictEqual(d.entries, ["half-made"]);
+  assert.deepStrictEqual(d.stray, ["half-made"], "缺 main.js 的目录要单独标出来");
+});
+
+await test("plugins 目录里有东西时列出条目名", () => {
+  const d0 = diagnose(ws);
+  assert.strictEqual(d0.exists, true);
+  assert.ok(d0.entries.includes("cjs-plugin"), "应该列出目录名，实际：" + JSON.stringify(d0.entries));
+});
+
+/* ---------- 依赖未齐 → 插件挂起（cordis PENDING 语义） ---------- */
+
+const ws2 = path.join(tmp, "ws2");
+fs.mkdirSync(path.join(ws2, "plugins"), { recursive: true });
+
+// 声明依赖一个还不存在的服务「webServer」
+const ws2PluginDir = path.join(ws2, "plugins", "needs-web");
+fs.mkdirSync(ws2PluginDir, { recursive: true });
+fs.writeFileSync(
+  path.join(ws2PluginDir, "main.js"),
+  `
+    exports.inject = ["webServer"];
+    exports.apply = function (ctx) {
+      ctx.tools.registerTool(
+        { name: "web_tool", description: "依赖 webServer 的工具", parameters: { type: "object", properties: {} } },
+        async () => ({ ok: true })
+      );
+    };
+  `
+);
+
+await test("依赖未齐的插件被挂起，apply 不执行", async () => {
+  const container = createContainer({});
+  const host = createHost({ workspace: ws2, container, log: () => {}, onTools: () => {} });
+  const r = await host.loadAll();
+
+  assert.strictEqual(r.loaded, 0, "依赖未齐不能算已加载");
+  assert.strictEqual(r.failed.length, 0, "依赖未齐不是失败，是挂起");
+  assert.strictEqual(host.pendingCount(), 1, "应该有一个插件在等依赖");
+  assert.strictEqual(host.listTools().length, 0, "apply 没跑，工具不该注册上");
+
+  const st = host.listStatus();
+  assert.strictEqual(st.length, 1);
+  assert.strictEqual(st[0].id, "needs-web");
+  assert.strictEqual(st[0].status, "pending");
+  assert.deepStrictEqual(st[0].pendingDeps, ["webServer"]);
+});
+
+await test("依赖到齐后插件自动启动", async () => {
+  const container = createContainer({});
+  const host = createHost({ workspace: ws2, container, log: () => {}, onTools: () => {} });
+  await host.loadAll();
+  assert.strictEqual(host.pendingCount(), 1);
+
+  // 服务到齐 → 容器唤醒挂起的插件
+  container.provide("webServer", { port: 8788 });
+
+  assert.strictEqual(host.pendingCount(), 0, "依赖到齐后不该再挂着");
+  const st = host.listStatus();
+  assert.strictEqual(st[0].status, "active");
+  assert.deepStrictEqual(st[0].pendingDeps, []);
+
+  const names = host.listTools().map((t) => t.name);
+  assert.ok(names.includes("web_tool"), "插件应该在这时候才真正激活并注册工具");
+});
+
+await test("卸载后依赖到齐不会再启动", async () => {
+  const container = createContainer({});
+  const host = createHost({ workspace: ws2, container, log: () => {}, onTools: () => {} });
+  await host.loadAll();
+  assert.strictEqual(host.pendingCount(), 1);
+
+  host.unloadAll();
+  container.provide("webServer", { port: 8788 });
+
+  assert.strictEqual(host.listTools().length, 0, "卸载后不该再冒出来");
+  assert.strictEqual(host.pendingCount(), 0);
+});
+
 /* ============================================================
    4. 宿主服务
    ============================================================ */
@@ -512,6 +631,178 @@ await test("main.js 连上通道后能响应 ping 与 runtime.info", async () =>
 
   child.kill("SIGKILL");
   server.close();
+});
+
+await test("插件提供的模型能通过通道真的跑完一次生成（第 2 步）", async () => {
+  const { spawn } = await import("node:child_process");
+  const tmpWs = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-e2e-llm-"));
+  const runtimeDir = fs.mkdtempSync(path.join(os.tmpdir(), "dsh-rt-llm-"));
+
+  // 装一个「假供应方」插件：注册路由，stream 回固定内容
+  const pluginDir = path.join(tmpWs, "plugins", "fake-llm");
+  fs.mkdirSync(pluginDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(pluginDir, "main.js"),
+    `
+      exports.inject = ['llm'];
+      exports.apply = function (ctx) {
+        const adapter = {
+          providerInfo: (p) => ({ id: p, name: '假供应方' }),
+          listModels: async (p) => [{ id: 'fake-1', name: 'Fake 1', provider: p }],
+          stream(options) {
+            return {
+              async *[Symbol.asyncIterator]() {
+                yield { type: 'block-start', index: 0, blockType: 'text' };
+                yield { type: 'text-delta', index: 0, text: '收到 ' };
+                // 把消息条数回显出来 —— 证明确实是我们翻译后传进去的那份
+                yield { type: 'text-delta', index: 0, text: String(options.messages.length) };
+                yield { type: 'text-delta', index: 0, text: ' 条消息' };
+                yield { type: 'block-end', index: 0, block: { type: 'text', text: '收到 2 条消息' } };
+                yield { type: 'usage', usage: { inputTokens: 3, outputTokens: 4, totalTokens: 7 } };
+                yield { type: 'finish', reason: { kind: 'stop' } };
+              }
+            };
+          }
+        };
+        ctx.llm.registerAdapter(['fake-route'], adapter);
+      };
+    `
+  );
+
+  /** Node 推给「Java」的事件。 */
+  const events = [];
+
+  /** Java 侧持有的那条 Node 连接（Java 调 Node 就写进它）。 */
+  let nodeSock = null;
+  /** 发出去的调用：id → resolve。 */
+  const inflight = new Map();
+  let callSeq = 0;
+
+  /** Java 调 Node 的一个方法（协议：{id, method, params}）。 */
+  function callNode(method, params) {
+    return new Promise((resolve, reject) => {
+      if (!nodeSock) return reject(new Error("Node 还没连上来"));
+      callSeq += 1;
+      const id = "j" + callSeq;
+      const timer = setTimeout(() => {
+        inflight.delete(id);
+        reject(new Error("等待 Node 响应超时：" + method));
+      }, 8000);
+      inflight.set(id, { resolve, reject, timer });
+      nodeSock.write(JSON.stringify({ id, method, params: params || {} }) + "\n");
+    });
+  }
+
+  const server = net.createServer((sock) => {
+    sock.setEncoding("utf8");
+    let buf = "";
+    sock.on("data", (c) => {
+      buf += c;
+      let i;
+      while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 1);
+        if (!line) continue;
+        const m = JSON.parse(line);
+        if (m.hello) {
+          nodeSock = sock;
+          sock.write(JSON.stringify({ id: "h1", ok: true, result: { hello: true } }) + "\n");
+          continue;
+        }
+        if (m.event) {
+          events.push(m);
+          continue;
+        }
+        // Node 对 Java 调用的响应
+        if (m.id && inflight.has(m.id)) {
+          const p = inflight.get(m.id);
+          inflight.delete(m.id);
+          clearTimeout(p.timer);
+          if (m.ok) p.resolve(m.result);
+          else p.reject(new Error(String(m.error || "Node 侧失败")));
+        }
+      }
+    });
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const port = server.address().port;
+
+  const child = spawn(
+    process.execPath,
+    [path.join(NODE_DIR, "main.js"), runtimeDir, String(port), "e2e-token", tmpWs],
+    { stdio: ["ignore", "pipe", "pipe"] }
+  );
+  let out = "";
+  child.stdout.on("data", (d) => { out += d.toString(); });
+  child.stderr.on("data", (d) => { out += d.toString(); });
+
+  try {
+    // 等它连上来并把插件加载完
+    const deadline0 = Date.now() + 8000;
+    while (!nodeSock && Date.now() < deadline0) await new Promise((r) => setTimeout(r, 50));
+    assert.ok(nodeSock, "Node 应该连上来：" + out);
+
+    const routes = await callNode("llm.routes", {});
+    assert.ok(
+      routes.routes.some((r) => r.provider === "fake-route"),
+      "插件的路由要报到页面：" + out
+    );
+
+    // 起跑 —— 这一步必须**立刻**返回，不能等整段生成
+    const callId = "c_test_1";
+    const started = await callNode("llm.chat", {
+      callId,
+      provider: "fake-route",
+      model: "fake-1",
+      messages: [
+        { role: "system", content: "你是助手" },
+        { role: "user", content: "你好" },
+      ],
+    });
+    assert.strictEqual(started.started, true);
+
+    // 等流跑完
+    const deadline = Date.now() + 8000;
+    let done = null;
+    while (Date.now() < deadline) {
+      done = events.find((e) => e.event === "llm.done" && e.data.callId === callId);
+      if (done) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+
+    assert.ok(done, "应该收到 llm.done：" + out);
+    assert.strictEqual(done.data.ok, true, "这次生成该是成功的：" + JSON.stringify(done.data));
+    assert.strictEqual(done.data.finish, "stop");
+    assert.strictEqual(done.data.usage.totalTokens, 7, "usage 要带回来");
+
+    const text = events
+      .filter((e) => e.event === "llm.chunk" && e.data.callId === callId)
+      .flatMap((e) => e.data.chunks)
+      .filter((c) => c.type === "text-delta")
+      .map((c) => c.text)
+      .join("");
+    assert.strictEqual(text, "收到 2 条消息", "正文要一字不差地传回来");
+
+    // ============ 详情：插件到底带来了什么 ============
+    //
+    // 归属是靠 apply 期间的作用域记下来的。没这一步，
+    // 详情页只能把所有路由摊在一起，分不清谁是谁的。
+    const detail = await callNode("plugins.detail", { id: "fake-llm" });
+    assert.strictEqual(detail.plugin.id, "fake-llm");
+    assert.strictEqual(detail.plugin.status, "active", "装好并加载的插件状态应是 active");
+    assert.strictEqual(detail.plugin.kind, "script", "单文件插件");
+    assert.ok(detail.plugin.entry, "要带上入口路径，便于排查");
+
+    assert.strictEqual(detail.routes.length, 1, "它注册了 1 条路由");
+    assert.strictEqual(detail.routes[0].provider, "fake-route");
+    assert.ok(
+      (detail.routes[0].models || []).some((m) => m.id === "fake-1"),
+      "详情里要列出它提供的模型，实际：" + JSON.stringify(detail.routes[0].models)
+    );
+  } finally {
+    child.kill("SIGKILL");
+    server.close();
+  }
 });
 
 /* ---------------- 汇总 ---------------- */

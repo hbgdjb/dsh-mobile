@@ -8,6 +8,7 @@ import android.webkit.WebView;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
@@ -49,6 +50,27 @@ public class DshHttpBridge {
     public void postStream(String id, String url, String headersJson, String bodyJson, int timeoutSec, String method) {
         final String m = (method == null || method.isEmpty()) ? "POST" : method.toUpperCase();
         new Thread(() -> run(id, url, headersJson, bodyJson, timeoutSec, m), "dsh-http-" + id).start();
+    }
+
+    /**
+     * 下载一个二进制资源（插件包、图片等），整段回传 Base64。
+     *
+     * ============ 为什么必须走原生 ============
+     *
+     * 页面里 fetch 一个第三方 URL 会被 CORS 挡住 —— 请求发得出去，
+     * 响应读不到，JS 侧只看到一句 `TypeError: Failed to fetch`。
+     * 而「从网址装插件」拉的一定是外部地址，所以这条路必须由原生走。
+     *
+     * 回传用 Base64 而不是分块文本：文本通道按 UTF-8 解码，二进制一到
+     * 0x80 以上就坏了（zip 里全是这种字节）。
+     *
+     * @param id        请求 id，回传时带回来
+     * @param url       目标地址
+     * @param timeoutSec 读超时（秒）
+     */
+    @JavascriptInterface
+    public void getBinary(String id, String url, int timeoutSec) {
+        new Thread(() -> runBinary(id, url, timeoutSec), "dsh-bin-" + id).start();
     }
 
     @JavascriptInterface
@@ -132,6 +154,79 @@ public class DshHttpBridge {
                 } catch (Exception ignored) {
                 }
             }
+        }
+    }
+
+    /** 单次下载的上限。Base64 会膨胀 4/3，再大就可能在低端机上 OOM。 */
+    private static final int MAX_BINARY = 24 * 1024 * 1024;
+
+    private void runBinary(String id, String url, int timeoutSec) {
+        HttpURLConnection conn = null;
+        try {
+            conn = (HttpURLConnection) new URL(url).openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(20000);
+            conn.setReadTimeout(Math.max(15, timeoutSec) * 1000);
+            conn.setInstanceFollowRedirects(true);
+            conn.setUseCaches(false);
+            conn.setRequestProperty("Accept", "*/*");
+
+            active.put(id, conn);
+            int status = conn.getResponseCode();
+            if (status < 200 || status >= 300) {
+                String body = readAll(conn.getErrorStream());
+                if (body.isEmpty()) body = readAll(conn.getInputStream());
+                emitError(id, status, "HTTP " + status, body);
+                return;
+            }
+
+            ByteArrayOutputStream buf = new ByteArrayOutputStream();
+            byte[] chunk = new byte[8192];
+            int n;
+            int total = 0;
+            try (InputStream in = conn.getInputStream()) {
+                while ((n = in.read(chunk)) >= 0) {
+                    if (!active.containsKey(id)) return; // 已被 abort
+                    if (n <= 0) continue;
+                    total += n;
+                    if (total > MAX_BINARY) {
+                        emitError(id, status, "文件太大（超过 24 MB）", "");
+                        return;
+                    }
+                    buf.write(chunk, 0, n);
+                }
+            }
+
+            active.remove(id);
+            String b64 = android.util.Base64.encodeToString(buf.toByteArray(), android.util.Base64.NO_WRAP);
+            emitBytes(id, status, conn.getContentType(), b64);
+        } catch (Exception err) {
+            boolean aborted = !active.containsKey(id);
+            active.remove(id);
+            if (!aborted) {
+                emitError(id, 0, err.getClass().getSimpleName() + ": " + String.valueOf(err.getMessage()), "");
+            }
+        } finally {
+            active.remove(id);
+            if (conn != null) {
+                try {
+                    conn.disconnect();
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    private void emitBytes(String id, int status, String mime, String base64) {
+        try {
+            JSONObject obj = new JSONObject();
+            obj.put("id", id);
+            obj.put("type", "bytes");
+            obj.put("status", status);
+            obj.put("mime", mime == null ? "" : mime);
+            obj.put("base64", base64);
+            eval(obj.toString());
+        } catch (Exception ignored) {
         }
     }
 

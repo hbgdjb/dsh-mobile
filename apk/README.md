@@ -2,9 +2,9 @@
 
 | 文件 | 版本 | 说明 |
 |---|---|---|
-| `DSH-Mobile-0.38.0.apk` | **v0.38.0**（versionCode 94） | 与当前源码版本一致 |
+| `dsh-mobile-0.49.0-debug.apk` | **v0.49.0**（versionCode 119） | 与当前源码版本一致，debug 构建 |
 
-> 旧版本（v0.12.4 / v0.21.6）已从仓库移除，需要的话可在 git 历史里找回：
+> 旧版本（v0.12.4 / v0.21.6 / v0.38.0）已从仓库移除，需要的话可在 git 历史里找回：
 > `git log --diff-filter=D -- apk/`
 
 ## 安装
@@ -18,13 +18,15 @@
 | 项 | 值 |
 |---|---|
 | 包名 | `ai.deepseek.dsh.mobile` |
-| versionCode / versionName | 94 / 0.38.0 |
+| versionCode / versionName | 119 / 0.49.0 |
 | minSdk / targetSdk | 24 / 34 |
-| ABI | `arm64-v8a`（内嵌 Node 运行时，含 `libdshnode.so`） |
-| 权限 | `INTERNET`、`SYSTEM_ALERT_WINDOW`、`POST_NOTIFICATIONS`、`RECORD_AUDIO`、`VIBRATE`、`ACCESS_NETWORK_STATE`、`WAKE_LOCK`、`KILL_BACKGROUND_PROCESSES`、`FOREGROUND_SERVICE(_DATA_SYNC)`、`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`、`moe.shizuku.manager.permission.API_V23` |
-| MD5 | `7492e4a393f1346e18b34c7dcf407f5a` |
-| 大小 | 15.36 MB |
+| ABI | `arm64-v8a`（内嵌 Node 运行时：`libdshnode.so`；另含 `libvosk.so`、`libjnidispatch.so`、`libc++_shared.so`） |
+| 权限 | `INTERNET`、`SYSTEM_ALERT_WINDOW`、`POST_NOTIFICATIONS`、`RECORD_AUDIO`、`VIBRATE`、`ACCESS_NETWORK_STATE`、`WAKE_LOCK`、`KILL_BACKGROUND_PROCESSES`、`FOREGROUND_SERVICE(_DATA_SYNC)`、`REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`、`moe.shizuku.manager.permission.API_V23`（与 v0.38.0 一致，无新增） |
+| MD5 | `e366d139ababd70f1d768e509cb2385c` |
+| 大小 | 15.49 MB |
 
-> v0.38.0 起新增本地语音识别（Vosk，故需 `RECORD_AUDIO`）与
-> Shizuku 提权执行支持（`moe.shizuku.manager.permission.API_V23`），
-> 以及内嵌 Node.js 运行时（Android 侧体积由 4.2 MB 增至 15.4 MB 的主因）。
+> 本版为 `assembleDebug` 产物（`debuggable=true`），与 v0.38.0 的构建方式相同。
+> v0.49.0 起打通插件生态：迷你 cordis 容器、Node 侧 llm/hmr 服务、插件市场
+> （公开目录 3000+ 条）与 npm 依赖安装；原生侧新增 DSH 小球视图（DshBotView）
+> 与 Agent 运行时保活（DshKeepAliveService）。体积 15.36 → 15.49 MB
+> （新增 `libjnidispatch.so`），`libnode.so` 仍为按需下载，未进包。

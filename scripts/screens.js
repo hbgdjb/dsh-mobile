@@ -38,6 +38,8 @@ import { powerStatus, powerAvailable } from "./keep-alive.js";
 import { voiceDiagnose, requestVoicePermission } from "./voice.js";
 import { nodeStatus } from "./node-runtime.js";
 import { nodeToolList } from "./node-plugins.js";
+import { isNodeLlmModel, nodeProviderOf } from "./llm-bridge.js";
+import { filterCatalog, categoriesOf, pluginIdOf } from "./plugin-catalog.js";
 import {
   localMcpAvailable,
   localStatus,
@@ -50,6 +52,20 @@ import { trajStats } from "./traj.js";
 
 /** 记忆条数（设置页摘要用）。 */
 const memoryCount = () => listMemories().length;
+
+/**
+ * 当前模型能不能直接发请求。
+ *
+ * 插件提供的模型（source === "node-llm"）没有 API Key、没有 Base URL ——
+ * 它的端点在 Node 里的 adapter 上。只看 Key 会把它误判成「未连接」，
+ * 用户明明选好了却看到「未连接模型」，会以为是配置没生效。
+ */
+function modelReadyForChat() {
+  const m = currentModel();
+  if (!m) return false;
+  if (isNodeLlmModel(m)) return true;
+  return !!apiKeyForCurrent();
+}
 
 /** 轨迹条数（设置页摘要用）。 */
 
@@ -189,9 +205,12 @@ export function renderWorkspace(tab = "workspace") {
 
 /* ---------------- 插件 ---------------- */
 
-export function renderPlugins() {
+export function renderPlugins(tab = "node", market = {}, highlight = "", depCache = null) {
   const enabled = state.plugins.filter((p) => p.enabled);
   const disabled = state.plugins.filter((p) => !p.enabled);
+  const nodeCount = (state.nodePlugins || []).length;
+  const isNode = tab === "node";
+  const isMarket = tab === "market";
 
   const card = (p) => `
     <div class="plugin-row">
@@ -223,14 +242,71 @@ export function renderPlugins() {
         data-act="toggle-plugin" data-id="${p.id}"></button>
     </div>`;
 
+  // ============ 为什么这里要分两类 ============
+  //
+  // 手机上有两套插件，跑的地方完全不同：
+  //   · Node 插件：跑在独立的 Node 进程里，能读写文件、发网络请求，
+  //     能提供工具，也能提供模型（llm adapter）。装的是真 JS 包。
+  //   · 页面内插件：跑在页面的沙箱里，只能做授权过的操作（读写工作区、
+  //     导出文档之类），装的是清单。
+  //
+  // 以前 Node 插件藏在「设置」里，而「插件」页只有页面内插件 ——
+  // 用户打开插件页会以为「装不进来」，因为安装入口在另一个地方。
+  const switcher = `
+    <div class="segmented" style="margin:0 0 4px">
+      <button class="segmented__item" data-act="plugins-tab" data-value="node"
+        aria-pressed="${isNode}">已安装 · ${nodeCount}</button>
+      <button class="segmented__item" data-act="plugins-tab" data-value="market"
+        aria-pressed="${isMarket}">发现</button>
+      <button class="segmented__item" data-act="plugins-tab" data-value="page"
+        aria-pressed="${!isNode && !isMarket}">页面内 · ${state.plugins.length}</button>
+    </div>`;
+
+  if (isMarket) {
+    return `
+  <div class="page-summary">${
+    market.loading
+      ? "正在拉取插件目录…"
+      : market.error
+      ? "目录没加载出来"
+      : market.items && market.items.length
+      ? `${market.items.length} 个社区插件 · 直接从 npm 安装`
+      : "社区插件目录"
+  }</div>
+  <div class="workspace__body scroll" style="padding-top:0">
+    ${switcher}
+    <input class="input" id="market-q" placeholder="搜索插件，比如：搜索、记忆、主题"
+      value="${esc(market.query || "")}" autocomplete="off" spellcheck="false"
+      style="margin-bottom:10px" aria-label="搜索插件">
+    <div id="market-filters">${renderMarketFilters(market)}</div>
+    <div id="market-list">${renderMarketList(market)}</div>
+  </div>`;
+  }
+
+  if (isNode) {
+    return `
+  <div class="page-summary">${
+    nodeCount ? `${nodeCount} 个 · 跑在 Node.js 里，能提供工具与模型` : "装一个插件，让模型多一批能力"
+  }</div>
+  <div class="workspace__body scroll" style="padding-top:0">
+    ${switcher}
+    ${nodePluginsBody(highlight, depCache)}
+    <p class="eyebrow" style="margin:18px 0 0;line-height:1.9;letter-spacing:.04em">
+      插件在你设备上以完整权限运行：能读写工作区、发网络请求。只装信得过的来源。
+    </p>
+  </div>`;
+  }
+
   return `
   <div class="page-summary">${enabled.length} / ${state.plugins.length} 已启用</div>
 
   <div class="workspace__body scroll" style="padding-top:0">
-    <button class="creator-row" data-act="plugin-search">
+    ${switcher}
+
+    <button class="creator-row" data-act="plugin-search" style="margin-top:12px">
       <span class="avatar">${icon("download", "icon--sm")}</span>
       <span class="creator-row__text">
-        <b>安装插件</b>
+        <b>安装页面内插件</b>
         <span>官方清单，或直接填一个插件清单地址。</span>
       </span>
       ${icon("chevron", "icon--sm")}
@@ -255,6 +331,138 @@ export function renderPlugins() {
       开关会即时改变模型可用的工具。
     </p>
   </div>`;
+}
+
+/**
+ * 市场里的分类筛选条。
+ *
+ * 分类来自目录数据本身（`metadata.category`），不做映射 ——
+ * 上游加了新分类，这里自动就有。
+ */
+export function renderMarketFilters(market = {}) {
+  const items = Array.isArray(market.items) ? market.items : [];
+  if (!items.length) return "";
+  const cats = categoriesOf(items);
+  const active = String(market.category || "");
+
+  // ============ 为什么是横向滚动而不是换行 ============
+  //
+  // 分类有二十多个。用 flex-wrap 换行的话，光筛选条就要占掉半屏 ——
+  // 而且 segmented__item 带 flex:1，换行后每个按钮被拉成不同的宽，
+  // 看起来像一排参差的灰块。横向滚动只占一行，滑动切换也不费劲。
+  return `
+    <div class="mk-cats" role="tablist" aria-label="按分类筛选">
+      <button class="mk-cats__item" role="tab" data-act="market-cat" data-value=""
+        aria-selected="${!active}">全部 · ${items.length}</button>
+      ${cats
+        .map(
+          (c) =>
+            `<button class="mk-cats__item" role="tab" data-act="market-cat" data-value="${esc(c.name)}"
+              aria-selected="${active === c.name}">${esc(c.name)} · ${c.count}</button>`
+        )
+        .join("")}
+    </div>`;
+}
+
+/**
+ * 市场列表。
+ *
+ * 一次只渲染 40 条：目录有三千多个，全渲染会把主线程卡住。
+ * 「加载更多」按需追加，搜索/分类变化时重置。
+ */
+export function renderMarketList(market = {}) {
+  if (market.loading) {
+    // note 是「正在试哪个源」。目录有好几个来源，一个不通就换下一个 ——
+    // 不显示的话，用户在慢网络下只能看着一句「正在拉取」干等。
+    return `<div class="empty-line">
+      <b>正在拉取目录</b>
+      ${esc(market.note || "约 2.6 MB、三千多条，第一次要等十几秒。")}
+      <br><span style="font-size:12px;opacity:.75">之后半小时内走缓存，不用重下。</span>
+    </div>`;
+  }
+  if (market.error) {
+    return `<div class="empty-line">
+      <b>没能加载目录</b>
+      <span style="display:block;margin-top:8px;font-size:12px;line-height:1.75">${esc(market.error)}</span>
+    </div>
+    <button class="btn btn--primary btn--block" data-act="market-reload" style="margin-top:10px">重试</button>
+    <p class="field__hint" style="margin-top:10px">
+      目录只是「有哪些插件」的清单，装插件不依赖它 ——
+      知道包名和版本的话，可以在「已安装」里点「安装 Node 插件」直接填地址。
+    </p>`;
+  }
+  const items = Array.isArray(market.items) ? market.items : [];
+  if (!items.length) {
+    return `<div class="empty-line"><b>还没有数据</b>点下面的按钮拉一次目录。</div>
+      <button class="btn btn--primary btn--block" data-act="market-reload" style="margin-top:10px">加载目录</button>`;
+  }
+
+  const filtered = filterCatalog(items, { query: market.query, category: market.category });
+  if (!filtered.length) {
+    return `<div class="empty-line"><b>没有匹配的插件</b>换个词，或把分类切回「全部」。</div>`;
+  }
+
+  const limit = Math.max(20, Number(market.limit) || 40);
+  const shown = filtered.slice(0, limit);
+
+  // 已装的插件不再给「安装」按钮 —— 点下去只会报「已存在」。
+  // 目录里的 name 和安装后的目录 id 不是一个形状（@scope/name → scope-name），
+  // 转换规则由 pluginIdOf 负责，和安装器共用同一套。
+  const installed = new Set((state.nodePlugins || []).map((p) => String(p.id || "")));
+
+  // 正在装的这一个：卡片内显示进度，而不是只在面板里滚一行字。
+  // 依赖多的插件要装一两分钟，没有可见进度就会让人以为卡死了。
+  const busy = market.installing || null;
+
+  const cards = shown
+    .map((it) => {
+      const done = installed.has(pluginIdOf(it.name));
+      const mine = busy && busy.name === it.name ? busy : null;
+
+      const pct =
+        mine && mine.total > 0 ? Math.max(4, Math.min(100, Math.round((mine.done / mine.total) * 100))) : 0;
+      const progress = mine
+        ? `<div class="mk-progress${mine.total ? "" : " mk-progress--indeterminate"}" role="progressbar"
+             aria-label="安装进度"><i${mine.total ? ` style="width:${pct}%"` : ""}></i></div>`
+        : "";
+
+      const action = done
+        ? `<button class="mk-card__done" data-act="goto-installed" data-name="${esc(it.name)}">已装 · 查看</button>`
+        : mine
+        ? `<span class="mk-card__busy mono">${
+            mine.total ? `${mine.done}/${mine.total}` : "准备"
+          }</span>`
+        : `<button class="mk-card__btn" data-act="market-install"
+             data-name="${esc(it.name)}" data-version="${esc(it.version)}">安装</button>`;
+
+      // 整卡始终可点开详情（已装也要能看说明）；「查看」按钮在卡片内，
+      // 点它时 closest 拿到的是按钮本身，不会冒泡到卡片。
+      return `<div class="mk-card mk-card--tap" data-act="market-open" data-name="${esc(it.name)}">
+        ${it.category ? `<div class="mk-card__cat">${esc(it.category)}</div>` : `<div class="mk-card__cat"></div>`}
+        <div class="mk-card__title">${esc(it.title)}</div>
+        ${it.desc || it.descEn ? `<p class="mk-card__desc">${esc(it.desc || it.descEn)}</p>` : `<p class="mk-card__desc mk-card__desc--empty">没有说明。</p>`}
+        ${progress}
+        <div class="mk-card__foot">
+          <span class="mk-card__meta">${it.version ? `v${esc(it.version)}` : ""}</span>
+          ${action}
+        </div>
+      </div>`;
+    })
+    .join("");
+
+  return `
+    <div class="market-count">${filtered.length} 个匹配${
+    filtered.length > limit ? ` · 已显示 ${limit} 个` : ""
+  }</div>
+    <div class="mk-grid">${cards}</div>
+    ${
+      filtered.length > limit
+        ? `<button class="btn btn--ghost btn--block" data-act="market-more" style="margin-top:12px">加载更多</button>`
+        : ""
+    }
+    <p class="eyebrow" style="margin:16px 0 0;line-height:1.9;letter-spacing:.04em">
+      插件来自 npm。安装后由 Node 加载 —— 带界面的插件其界面部分在本机不渲染。
+    </p>`;
 }
 
 /* ---------------- 任务 ---------------- */
@@ -602,6 +810,15 @@ function nodeRuntimeSection() {
       color = "var(--warn,#d9a441)";
       action = `<button class="btn btn--sm" data-act="node-download">下载运行时</button>`;
     }
+  } else if (!st.running && st.serviceRunning && on) {
+    // 服务活着，但 Node 进程不在 —— 多半是启动时崩了。
+    // 这种情况以前被报成「运行中」，用户看到的却是「通道未连接」，
+    // 两边都对，合起来却什么都没说明。
+    line = "服务在跑，但 Node 进程没起来";
+    hint =
+      "前台服务还在，Node 进程已经退出（启动时崩了，或者连续崩溃后停止重启）。" +
+      "点下面的「查看 Node 日志」，最后几行会写明原因。也可以关掉开关再打开重试。";
+    color = "var(--danger,#e5484d)";
   } else if (st.running) {
     // Node 在跑，但通道不一定连上了 —— 这是两件事。
     // 「运行中但连不上」意味着插件工具调不通，得让用户看见。
@@ -638,6 +855,18 @@ function nodeRuntimeSection() {
       </div>
       ${action ? `<div class="settings__row">${action}</div>` : ""}
       ${hint ? `<div class="settings__row settings__row--hint"><div class="settings__row-sub">${esc(hint)}</div></div>` : ""}
+      ${
+        st.running
+          ? `<div class="settings__row">
+               <button class="btn btn--sm" data-act="node-log">查看 Node 日志</button>
+             </div>
+             ${
+               !st.channelConnected
+                 ? `<div class="settings__row settings__row--hint"><div class="settings__row-sub">日志里会写明连不上的原因（require 失败 / 连接被拒 / 口令不对）。</div></div>`
+                 : ""
+             }`
+          : ""
+      }
     </div>`;
 }
 
@@ -652,33 +881,92 @@ function nodeRuntimeSection() {
  *
  * 所以把插件清单和工具清单摆到界面上，让失败有地方显示。
  */
-function nodePluginsSection() {
+/**
+ * Node 插件的列表主体。
+ *
+ * 抽出来是因为两处都要用：插件页（主入口）与设置页（跳转过去的摘要）。
+ * 之前只有设置页有，而「插件」页只有页面内插件 —— 用户打开插件页
+ * 会以为「装不进来」，因为安装入口藏在另一个页面里。
+ */
+function nodePluginsBody(highlight = "", depCache = null) {
   const st = nodeStatus();
-  // 浏览器 / PWA 没有原生桥，不显示
-  if (!st.native) return "";
-  // 运行时没起来就没必要列插件
-  if (!st.running) return "";
+  if (!st.native) {
+    return `<div class="empty-line">
+      <b>这里需要手机上的 Node 运行时</b>
+      浏览器预览里没法跑插件。装到手机上打开就能用。
+    </div>`;
+  }
 
   const plugins = state.nodePlugins || [];
   const tools = nodeToolList();
+  const diag = state.nodePluginsDiag || null;
 
-  let body;
+  // 运行时没起来：直接说清楚卡在哪，而不是给一个空列表
+  if (!st.running && !st.serviceRunning) {
+    return `<div class="settings__group">
+      <div class="settings__row">
+        <div class="settings__row-main">
+          <div class="settings__row-title">Node 运行时没在跑</div>
+          <div class="settings__row-sub">到 设置 → 插件运行时 打开开关。插件跑在它里面。</div>
+        </div>
+      </div>
+    </div>`;
+  }
+
+  let list;
   if (!st.channelConnected) {
-    body = `<div class="settings__row-sub" style="color:var(--warn,#d9a441)">通道未连接，暂时读不到插件清单</div>`;
+    list = `<div class="settings__row-sub" style="color:var(--warn,#d9a441)">通道未连接，暂时读不到插件清单</div>
+      <div class="settings__row-sub">插件跑在 Node 里，读清单要过通道。这时的「没有插件」不代表没装。</div>`;
   } else if (!plugins.length) {
-    body = `<div class="settings__row-sub">没有找到插件。插件代码放在工作区的 plugins/ 目录下，每个插件一个子目录。</div>`;
+    let detail = "";
+    if (diag) {
+      detail = `<div class="settings__row-sub">插件目录：<code>${esc(diag.pluginsDir || "?")}</code>${
+        diag.exists
+          ? ` · ${diag.entries.length} 个条目`
+          : " · <b>不存在</b>（运行时可能没起来）"
+      }</div>`;
+    }
+    list = `<div class="settings__row-sub">还没有插件。点下面的按钮装一个 —— 填网址，或从手机选文件。</div>
+      <div class="settings__row-sub">支持 .zip / .tar.gz / .tgz / 单个 .js。装进工作区的 plugins/ 目录。</div>${detail}`;
   } else {
-    body = plugins
+    list = plugins
       .map((p) => {
         const mine = tools.filter((t) => t.pluginId === `node__${p.id}`);
         const toolTxt = mine.length
           ? ` · ${mine.length} 个工具：${mine.map((t) => t.name).join("、")}`
           : " · 未注册工具";
-        return `<div class="settings__row">
+        const pending = p.status === "pending";
+        const failed = p.status === "failed";
+        const depTxt =
+          pending && Array.isArray(p.pendingDeps) && p.pendingDeps.length
+            ? ` · 在等 ${p.pendingDeps.join("、")}`
+            : "";
+        // 失败原因要显示出来 —— 只说「没装上」用户没法处理。
+        // 这是 listStatus() 补了 failed 状态之后才拿得到的。
+        const errTxt = failed && p.error ? ` · ${p.error}` : "";
+        const reloadable =
+          st.channelConnected && (p.status === "active" || p.status === "pending" || p.status === "failed");
+        return `<div class="settings__row${highlight === p.id ? " is-new" : ""}" data-act="node-plugin-detail" data-id="${esc(p.id)}">
           <div class="settings__row-main">
-            <div class="settings__row-title">${esc(p.name || p.id)}</div>
-            <div class="settings__row-sub">${esc(p.id)} · v${esc(p.version || "0.0.0")}${esc(toolTxt)}</div>
+            <div class="settings__row-title">${esc(p.name || p.id)}${
+              pending ? ' <span class="tag">等依赖</span>' : ""
+            }${failed ? ' <span class="tag tag--exp">加载失败</span>' : ""}</div>
+            <div class="settings__row-sub">${esc(p.id)} · v${esc(p.version || "0.0.0")}${esc(
+              depTxt
+            )}${esc(toolTxt)}${esc(errTxt)}</div>
           </div>
+          ${
+            reloadable
+              ? `<button class="icon-btn icon-btn--sm" data-act="node-reload-one" data-id="${esc(p.id)}"
+            aria-label="重载 ${esc(p.name || p.id)}" title="重载这个插件（代码改了不用重启应用）">${icon(
+                "refresh",
+                "icon--sm"
+              )}</button>`
+              : ""
+          }
+          <button class="icon-btn icon-btn--sm" data-act="node-uninstall" data-id="${esc(p.id)}"
+            aria-label="卸载 ${esc(p.name || p.id)}">${icon("trash", "icon--sm")}</button>
+          ${icon("chevron", "icon--sm")}
         </div>`;
       })
       .join("");
@@ -686,16 +974,80 @@ function nodePluginsSection() {
 
   return `
     <div class="settings__group">
+      <div class="settings__row">
+        <button class="btn btn--primary btn--sm" data-act="node-install-open">${icon("plus", "icon--xs")} 安装 Node 插件</button>
+        ${
+          st.channelConnected
+            ? `<button class="btn btn--sm" data-act="node-reload-plugins">${icon(
+                "refresh",
+                "icon--xs"
+              )} 重载全部</button>
+               <button class="btn btn--sm" data-act="node-selfcheck">通道自检</button>`
+            : `<button class="btn btn--sm" data-act="node-log">查看 Node 日志</button>`
+        }
+      </div>
+      ${list}
+      ${depCacheRow(depCache)}
+    </div>`;
+}
+
+/**
+ * 依赖缓存那一行。
+ *
+ * 缓存是好事（第二个插件不再重复下载），但它占的空间用户看不见 ——
+ * 装在应用数据目录里，文件管理器进不去。所以至少要有个数、有个清。
+ */
+function depCacheRow(cache) {
+  if (!cache) return "";
+  if (!cache.bytes) {
+    return `<div class="settings__row">
+      <div class="settings__row-main">
+        <div class="settings__row-title">依赖缓存</div>
+        <div class="settings__row-sub">还没有缓存。装带依赖的插件时会把下载过的包存下来，供下次复用。</div>
+      </div>
+    </div>`;
+  }
+  const mb = cache.bytes / 1024 / 1024;
+  const size = mb >= 1 ? `${mb.toFixed(1)} MB` : `${Math.max(1, Math.round(cache.bytes / 1024))} KB`;
+  return `<div class="settings__row">
+    <div class="settings__row-main">
+      <div class="settings__row-title">依赖缓存</div>
+      <div class="settings__row-sub">${cache.count} 个包 · ${esc(size)} · 装其它插件时复用，不必重新下载</div>
+    </div>
+    <button class="btn btn--sm" data-act="clear-dep-cache">清理</button>
+  </div>`;
+}
+
+/**
+ * 设置页里的「Node 插件」摘要。
+ *
+ * 管理动作都挪到插件页了 —— 这里只留一句现状 + 一个入口。
+ * 留着的理由是：用户查「插件为什么没生效」时，先到的是设置里的运行时分组，
+ * 隔壁就该告诉他插件在哪管。
+ */
+function nodePluginsSection() {
+  const st = nodeStatus();
+  if (!st.native) return "";
+  if (!st.running && !st.serviceRunning) return "";
+
+  const plugins = state.nodePlugins || [];
+  const pending = plugins.filter((p) => p.status === "pending").length;
+  const summary = !st.channelConnected
+    ? "通道未连接，读不到清单"
+    : plugins.length
+    ? `${plugins.length} 个已安装${pending ? ` · ${pending} 个在等依赖` : ""}`
+    : "还没有插件";
+
+  return `
+    <div class="settings__group">
       <div class="settings__group-head">Node 插件</div>
-      ${body}
-      ${
-        st.channelConnected
-          ? `<div class="settings__row">
-               <button class="btn btn--sm" data-act="node-reload-plugins">重新加载插件</button>
-               <button class="btn btn--sm" data-act="node-selfcheck">通道自检</button>
-             </div>`
-          : ""
-      }
+      <button class="settings__row" data-act="goto-node-plugins" style="width:100%;text-align:left">
+        <div class="settings__row-main">
+          <div class="settings__row-title">管理插件</div>
+          <div class="settings__row-sub">${esc(summary)}</div>
+        </div>
+        ${icon("chevron", "icon--sm")}
+      </button>
     </div>`;
 }
 
@@ -1021,14 +1373,27 @@ export function renderSettings(cat = null) {
         <span class="avatar avatar--accent">${icon("bolt", "icon--sm")}</span>
         <div style="flex:1;min-width:0">
           <div class="card__title">${esc(model.label)}</div>
-          <div class="card__sub">${model.provider ? `${esc(model.provider)} · ` : ""}${fmtContext(model.ctx)} · ${esc(hostOf(modelBaseUrl(model)))}</div>
+          <div class="card__sub">${
+            isNodeLlmModel(model)
+              ? `由插件 ${esc(nodeProviderOf(model) || "（未知）")} 提供 · ${fmtContext(model.ctx)}`
+              : `${model.provider ? `${esc(model.provider)} · ` : ""}${fmtContext(model.ctx)} · ${esc(hostOf(modelBaseUrl(model)))}`
+          }</div>
         </div>
         <span class="conn-pill conn-pill--${conn.tone}"><span class="conn-pill__dot"></span>${esc(conn.text)}</span>
       </div>
-      ${st && !st.ok ? `<p class="field__hint" style="color:var(--danger);margin-bottom:10px">${esc(st.error || "最近一次请求失败，可点下方测试连接。")}</p>` : ""}`;
+      ${st && !st.ok ? `<p class="field__hint" style="color:var(--danger);margin-bottom:10px">${esc(st.error || "最近一次请求失败，可点下方测试连接。")}</p>` : ""}
+      ${
+        isNodeLlmModel(model)
+          ? `<p class="field__hint" style="margin:10px 0 14px">
+               这个模型的端点由插件在 Node 里提供（路由 <code>${esc(nodeProviderOf(model))}</code>），
+               不需要 Base URL 与 API Key —— 所以上面两项没有显示。
+               模型 ID 与上下文窗口仍可改。
+             </p>`
+          : ""
+      }`;
       })()}
 
-      <div class="field">
+      <div class="field"${isNodeLlmModel(model) ? ' style="display:none"' : ""}>
         <label class="field__label" for="set-key">${esc(providerKeyOf(model) === "custom" ? "自定义服务 Key" : `${model.provider || "服务"} API Key`)}
           <button class="chip" data-act="toggle-key" style="height:22px;font-size:9px">${s.showKey ? "隐藏" : "显示"}</button>
         </label>
@@ -1040,7 +1405,7 @@ export function renderSettings(cat = null) {
         <p class="field__hint">只保存在本机；不同服务分槽保存。留空则无法发送消息。</p>
       </div>
 
-      <div class="field">
+      <div class="field"${isNodeLlmModel(model) ? ' style="display:none"' : ""}>
         <label class="field__label" for="set-base">Base URL</label>
         <input class="input mono" id="set-base" value="${esc(modelBaseUrl(model))}" data-model-field="baseUrl" spellcheck="false" placeholder="https://api.deepseek.com">
         <p class="field__hint">这是当前模型自己的端点；切换模型不会覆盖它。</p>
@@ -1473,8 +1838,8 @@ export function renderDrawer(search = "") {
     </div>
 
     <div class="drawer__foot">
-      <div class="drawer__conn">${icon(apiKeyForCurrent() && currentModel() ? "bolt" : "info", "icon--xs")}
-        <span>${apiKeyForCurrent() && currentModel() ? `已连接 · ${esc(currentModel().label)}` : "未连接模型"}</span>
+      <div class="drawer__conn">${icon(modelReadyForChat() ? "bolt" : "info", "icon--xs")}
+        <span>${modelReadyForChat() ? `已连接 · ${esc(currentModel().label)}` : "未连接模型"}</span>
       </div>
       <div class="drawer__foot-actions">
         <button class="drawer__pill" data-act="open-account">

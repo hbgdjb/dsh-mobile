@@ -137,16 +137,53 @@ export function nodeToolList() {
  *
  * 推送可能因为 Node 晚启动而错过（页面先加载、Node 后起来），
  * 所以设置页打开时要主动拉一次补齐。
+ *
+ * ============ 这里只读，不加载 ============
+ *
+ * 之前这里顺手调了一次 `plugins.load` —— 那会把**已经加载好的插件**
+ * 再 apply 一遍，出现两个实例同时跑、宿主服务注册撞车的问题。
+ *
+ * 现在分成两个明确的操作：
+ *   · refreshNodeTools()   —— 只读列表
+ *   · loadNewNodePlugins() —— 只加载没加载过的（装完新插件时用）
+ *
+ * @param {{load?:boolean}} [opts] load=true 时顺带加载新插件
+ * @returns {Promise<Array<object>>} 插件列表
  */
-export async function refreshNodeTools() {
+export async function refreshNodeTools(opts = {}) {
   ensureNodeToolSubscription();
   if (!nodeBridgeAvailable()) return [];
   try {
     const r = await nodeCall("plugins.list", {});
-    // 顺便触发一次加载，让工具表有内容
-    await nodeCall("plugins.load", {});
+    if (opts.load) {
+      await nodeCall("plugins.loadnew", {});
+    }
     return r?.plugins || [];
   } catch {
     return [];
   }
+}
+
+/**
+ * 只加载还没加载过的插件。
+ *
+ * 装完新插件时用 —— 已在跑的那些绝不能重跑。
+ */
+export async function loadNewNodePlugins() {
+  if (!nodeBridgeAvailable()) return { loaded: 0, failed: [] };
+  try {
+    return await nodeCall("plugins.loadnew", {});
+  } catch {
+    return { loaded: 0, failed: [] };
+  }
+}
+
+/**
+ * 一个插件的详情：它注册了哪些工具、提供了哪些模型、卡在哪个依赖上。
+ *
+ * 列表里只有「名字 + 版本 + 工具数」——装完插件，用户第一个问题
+ * 恰恰是「它到底带来了什么」。
+ */
+export async function nodePluginDetail(id) {
+  return await nodeCall("plugins.detail", { id: String(id || "") });
 }

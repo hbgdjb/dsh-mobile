@@ -27,7 +27,7 @@ echo "→ 复制 Web 运行时"
 cp "$ROOT/index.html" "$WORK/www/"
 cp "$ROOT/manifest.webmanifest" "$WORK/www/"
 cp "$ROOT/sw.js" "$WORK/www/"
-cp -R "$ROOT/styles" "$ROOT/scripts" "$ROOT/icons" "$WORK/www/"
+cp -R "$ROOT/styles" "$ROOT/scripts" "$ROOT/icons" "$ROOT/splash" "$WORK/www/"
 cp "$ROOT/android/package.json" "$ROOT/android/capacitor.config.json" "$WORK/"
 
 cd "$WORK"
@@ -40,8 +40,8 @@ npx cap sync android
 
 cd android
 echo "sdk.dir=$SDK" > local.properties
-sed -i 's/versionName "1.0"/versionName "0.38.0"/' app/build.gradle || true
-sed -i 's/versionCode 1/versionCode 94/' app/build.gradle || true
+sed -i 's/versionName "1.0"/versionName "0.49.0"/' app/build.gradle || true
+sed -i 's/versionCode 1/versionCode 119/' app/build.gradle || true
 
 echo "→ 注入原生 HTTP 桥"
 JAVA_DIR="app/src/main/java/ai/deepseek/dsh/mobile"
@@ -73,13 +73,17 @@ cp "$ROOT/android/jni/CMakeLists.txt" "$ROOT/android/jni/dshnode.cpp" "$NODE_CPP
 # Node 侧的脚本不止入口一个：通道客户端、cordis 迷你容器、
 # 宿主服务、插件宿主 —— 都是 main.js 的依赖，缺一个就起不来。
 cp "$ROOT/android/node/main.js" "$ROOT/android/node/channel.js" \
-   "$ROOT/android/node/cordis-lite.js" "$ROOT/android/node/ctx-services.js" \
-   "$ROOT/android/node/plugin-host.js" "$NODE_ASSETS/"
+   "$ROOT/android/node/cordis-lite.js" "$ROOT/android/node/fiber-state.js" \
+   "$ROOT/android/node/ctx-services.js" "$ROOT/android/node/host-services.js" \
+   "$ROOT/android/node/plugin-host.js" "$ROOT/android/node/llm-service.js" \
+   "$ROOT/android/node/llm-chat.js" \
+   "$ROOT/android/node/plugin-reload.js" "$ROOT/android/node/hmr-service.js" \
+   "$NODE_ASSETS/"
 # VERSION 是"脚本已解压"的标记，必须随 APK 版本变化 ——
 # 否则升级 APK 后新代码配旧的解压结果，出现诡异的不一致。
-# 用 versionCode（94），不是版本名（0.38.0）：它是整数、单调递增、
+# 用 versionCode（119），不是版本名（0.49.0）：它是整数、单调递增、
 # 且和 PackageManager 拿到的值一致。
-echo "94" > "$NODE_ASSETS/VERSION"
+echo "119" > "$NODE_ASSETS/VERSION"
 
 echo "→ 复制 AIDL（Shizuku UserService 接口）"
 # AIDL 必须放在 app/src/main/aidl 下，Gradle 才会自动编译成 IShizukuExec。
@@ -469,7 +473,7 @@ echo "→ Gradle 构建 Debug APK"
 ./gradlew assembleDebug --no-daemon
 
 APK="$WORK/android/app/build/outputs/apk/debug/app-debug.apk"
-VERSION="0.38.0"
+VERSION="0.49.0"
 if [ -f "$APK" ]; then
   mkdir -p "$ROOT/android/out"
   cp "$APK" "$ROOT/android/out/dsh-mobile-$VERSION-debug.apk"

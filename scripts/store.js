@@ -647,6 +647,12 @@ const DEFAULT_STATE = () => ({
    * 落盘反而会造成"界面上显示有插件，其实已经没了"的错觉。
    */
   nodePlugins: [],
+  /**
+   * Node 侧插件目录的诊断快照（见 android/node/plugin-host.js 的 diagnose）。
+   *
+   * 不落盘 —— 和 nodePlugins 一样是运行时状态。
+   */
+  nodePluginsDiag: null,
   automations: seedAutomations(),
   runs: seedRuns(),
   stats: { runs: 0, tools: 0, tokens: 0 },
@@ -699,6 +705,21 @@ function load() {
           });
         }
       }
+      // ============ 给每个模型条目补 label ============
+      //
+      // 所有界面显示模型名都读 `label`（顶栏 chip、模型卡标题、抽屉底部）。
+      // 而插件模型（source: "node-llm"）在 0.41.5 之前的同步里只写了 name，
+      // 没有 label —— 一旦用户选中它，`model.label.replace(...)` 直接抛
+      // TypeError，整页渲染中断，表现为「对话界面没了」。
+      //
+      // 补在加载时而不是只在写入时：这样**已经存在手机里的旧条目**
+      // 也能被修好，不用等下一次同步。
+      for (const m of parsed.settings.customModels) {
+        if (!m || typeof m !== "object") continue;
+        if (typeof m.label === "string" && m.label) continue;
+        m.label = String(m.name || m.apiModel || m.id || "未命名模型");
+      }
+
       const picked =
         parsed.settings.customModels.find((m) => m && m.id === parsed.settings.model) || null;
       if (!parsed.settings.contextWindow) parsed.settings.contextWindow = picked?.ctx || 128000;
@@ -1161,7 +1182,14 @@ export const apiKeyFor = (model = currentModel()) => {
   return String(state.settings.keys?.[slot] || "").trim();
 };
 export const apiKeyForCurrent = () => apiKeyFor(currentModel());
-export const hasKeyFor = (model) => !!apiKeyFor(model);
+export const hasKeyFor = (model) => {
+  // 插件提供的模型没有 Key —— 它的端点在 Node 里的 adapter 上。
+  // 这里返回 true，界面才不会一直提示「未配置 Key · 无法对话」。
+  if (model && (model.source === "node-llm" || String(model.provider || "").startsWith("node__"))) {
+    return true;
+  }
+  return !!apiKeyFor(model);
+};
 
 /** 当前模型生效的上下文窗口（按模型保存，不再是一个全局值）。 */
 export const modelContextWindow = (model = currentModel()) =>
@@ -1734,6 +1762,16 @@ export function setSettings(patch) {
 export function setNodePlugins(list) {
   state.nodePlugins = Array.isArray(list) ? list : [];
   emit({ type: "node:plugins", plugins: state.nodePlugins });
+}
+
+/**
+ * 记下 Node 侧的插件目录诊断。
+ *
+ * 「未找到插件」这句话本身不提供信息：可能是目录不存在、目录空、
+ * 文件写到了别处。界面要靠这份快照把差别说出来。
+ */
+export function setNodePluginsDiag(diag) {
+  state.nodePluginsDiag = diag && typeof diag === "object" ? diag : null;
 }
 
 export async function resetAll() {

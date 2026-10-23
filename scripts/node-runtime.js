@@ -45,7 +45,10 @@ export function nodeStatus() {
     return {
       native: true,
       available: !!o.available,
+      // running = Node 进程真的在；serviceRunning = 前台服务被要求启动过。
+      // 两者分开，界面才能说出「服务活着但 Node 崩了」这种情况。
       running: !!o.running,
+      serviceRunning: !!o.serviceRunning,
       installed: !!o.installed,
       downloading: !!o.downloading,
       percent: Number(o.percent) || 0,
@@ -72,6 +75,22 @@ export function nodeStart() {
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * 读 Node 自己的日志尾部（最后 8 KB）。
+ *
+ * 「运行中但通道未连接」只能靠它定位 —— 页面看不到 Android/data 下的文件。
+ * 浏览器里没有原生桥，返回空串。
+ */
+export function nodeLogTail() {
+  if (!nodeBridgeAvailable()) return "";
+  try {
+    if (typeof window.DshNode?.logTail !== "function") return "";
+    return String(window.DshNode.logTail() || "");
+  } catch {
+    return "";
   }
 }
 
@@ -321,6 +340,30 @@ export async function nodeLoadPlugins() {
   return await nodeCall("plugins.load", {});
 }
 
+/**
+ * 热重载插件。
+ *
+ * ============ 和 nodeLoadPlugins 的区别 ============
+ *
+ * `plugins.load` 只是再跑一遍 apply —— 不卸载旧的。
+ * 于是模块缓存没破（代码改了但跑的还是旧的），
+ * 旧 fiber 还在（同一个插件两个实例同时跑），
+ * 宿主服务的注册还会撞车。
+ *
+ * `plugins.reload` 才是真重载：卸载 → 破缓存 → 重新加载。
+ *
+ * @param {string} [id] 插件 id；不传就重载全部
+ * @returns {Promise<object>} {ok, results:[{id,ok,mode,error,restored}]}
+ */
+export async function nodeReloadPlugin(id) {
+  return await nodeCall("plugins.reload", { id: String(id || "") });
+}
+
+/** 热重载全部插件。 */
+export async function nodeReloadPlugins() {
+  return await nodeCall("plugins.reload", {});
+}
+
 /** 卸载全部插件。 */
 export async function nodeUnloadPlugins() {
   return await nodeCall("plugins.unload", {});
@@ -339,4 +382,49 @@ export async function nodeRuntimeInfo() {
 /** 连通性自检。 */
 export async function nodePing() {
   return await nodeCall("ping", {});
+}
+
+/* ============================================================
+   模型供应方（llm）相关
+   ============================================================ */
+
+/** 问 Node 侧某个供应方提供了哪些模型。 */
+export async function nodeDiscoverModels(settingsNs) {
+  const r = await nodeCall("llm.discover", { settingsNs });
+  return Array.isArray(r?.models) ? r.models : [];
+}
+
+/** 问 Node 侧某个路由（provider）眼下提供哪些模型。 */
+export async function nodeListModels(provider) {
+  const r = await nodeCall("llm.models", { provider });
+  return Array.isArray(r?.models) ? r.models : [];
+}
+
+/** 列出 Node 侧的模型供应方。 */
+export async function nodeLlmRoutes() {
+  const r = await nodeCall("llm.routes", {});
+  return {
+    routes: Array.isArray(r?.routes) ? r.routes : [],
+    directory: Array.isArray(r?.directory) ? r.directory : [],
+    namespaces: Array.isArray(r?.namespaces) ? r.namespaces : [],
+  };
+}
+
+/**
+ * 让 Node 侧按插件提供的 adapter 跑一次生成。
+ *
+ * **立刻返回** —— 这不是「跑完给你结果」，是「开跑了」。
+ * 正文通过 `llm.chunk` 事件流回来，收尾通过 `llm.done`。
+ * 所以这里的超时给得很短：它只等「起跑」这一下，
+ * 等整段生成的是事件订阅那一侧（见 scripts/llm-bridge.js）。
+ *
+ * @param {object} params { callId, provider, model, messages, tools, system, ... }
+ */
+export async function nodeLlmChat(params) {
+  return await nodeCall("llm.chat", params, { timeoutMs: 30000 });
+}
+
+/** 停掉一次正在跑的生成。 */
+export async function nodeLlmAbort(callId) {
+  return await nodeCall("llm.abort", { callId });
 }

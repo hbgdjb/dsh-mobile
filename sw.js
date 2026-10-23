@@ -1,10 +1,13 @@
 /* Service Worker — 壳缓存，保证断网也能打开；接口请求不缓存 */
 
-const CACHE = "dsh-mobile-v6.0.0";
+const CACHE = "dsh-mobile-v6.0.1";
 const SHELL = [
   "./",
   "./index.html",
   "./manifest.webmanifest",
+  // 启动动画 —— 少了它，断网打开时第一帧是空白而不是动画
+  "./splash/dsh-splash.css",
+  "./splash/dsh-splash.js",
   "./styles/tokens.css",
   "./styles/base.css",
   "./styles/components.css",

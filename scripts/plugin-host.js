@@ -327,7 +327,7 @@ class PluginRuntime {
   }
 
   /** 插件请求宿主能力。逐项按已声明的权限放行。 */
-  async handleHostCall(method, callId, params) {
+  async handleHostCall(method, callId, params_) {
     const reply = (ok, result, error) => {
       this.post({ __dshReply: callId, ok, result, error });
     };
@@ -337,7 +337,16 @@ class PluginRuntime {
       return;
     }
     try {
-      const params = d.__dshHostCallParams || {};
+      // ============ 这里原来有个 bug ============
+      //
+      // 写的是 `d.__dshHostCallParams` —— 但这个作用域里根本没有 `d`
+      // （`d` 是 onMessage 里的局部变量，不是模块级变量）。
+      // 一执行就抛 ReferenceError，被下面的 catch 吞掉，
+      // 于是**所有**宿主能力调用（fs.read / fs.write / net）全部失败，
+      // 而且失败信息是「d is not defined」—— 完全指不到真正的问题。
+      //
+      // 参数已经传进来了，直接用形参。
+      const params = params_ || {};
       let out;
       if (method === "fs.read") out = await hostImpl.fsRead(this.plugin, params);
       else if (method === "fs.write") out = await hostImpl.fsWrite(this.plugin, params);

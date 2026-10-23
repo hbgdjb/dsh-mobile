@@ -15,6 +15,7 @@ import {
   activeSession,
   setSettings,
   setNodePlugins,
+  setNodePluginsDiag,
   togglePlugin,
   installPlugin,
   toggleAutomation,
@@ -133,8 +134,24 @@ import {
   searchTrajectories as searchTrajectories,
   exportCorpus as exportTrajCorpus,
 } from "./traj.js";
-import { nodeBridgeAvailable, nodeStatus, nodeStart, nodeStop, nodeDownload, nodePing, nodeCall } from "./node-runtime.js";
-import { refreshNodeTools } from "./node-plugins.js";
+import { nodeBridgeAvailable, nodeStatus, nodeStart, nodeStop, nodeDownload, nodePing, nodeCall, nodeLogTail, nodeReloadPlugin, nodeReloadPlugins } from "./node-runtime.js";
+import { refreshNodeTools, loadNewNodePlugins, nodePluginDetail } from "./node-plugins.js";
+import { syncNodeLlmModels, isNodeLlmModel } from "./llm-bridge.js";
+import {
+  installNodePlugin,
+  uninstallNodePlugin,
+  depCacheStats,
+  clearDepCache,
+} from "./plugin-install-node.js";
+import {
+  loadCatalog,
+  npmTarballUrl,
+  clearCatalogCache,
+  inspectPackage,
+  pluginIdOf,
+  formatAgo,
+} from "./plugin-catalog.js";
+import { syncIndex } from "./store.js";
 import {
   startVoice,
   stopVoice,
@@ -148,6 +165,8 @@ import {
   renderHome,
   renderWorkspace,
   renderPlugins,
+  renderMarketList,
+  renderMarketFilters,
   renderTasks,
   renderSettings,
   SETTINGS_CAT_MAP,
@@ -177,6 +196,34 @@ const ui = {
   lastBuilt: null,
   renderFrom: null, // 渲染窗口起点（消息下标）
   workspaceTab: "workspace",
+  pluginsTab: "node",   // 插件页三类：node（跑在 Node 里）/ market（发现）/ page（页面内沙箱）
+  /**
+   * 插件市场的运行时状态。
+   *
+   * 不落盘：目录 2.5 MB，写进 state 会被整包序列化，还会污染工作区。
+   * 缓存只活在内存里，30 分钟过期（见 plugin-catalog 的 TTL）。
+   */
+  market: {
+    loading: false,
+    error: "",
+    note: "",
+    items: [],
+    at: 0,
+    query: "",
+    category: "",
+    limit: 40,
+    /**
+     * 正在装的那个插件：{ name, stage, done, total }。
+     *
+     * 依赖多的插件要装一两分钟。只在面板里滚一行字不够 ——
+     * 用户会以为没在下载。卡片里要有进度条和「12/59」。
+     */
+    installing: null,
+  },
+  /** 刚装好的插件 id：用来在已安装列表里高亮那一行，几秒后自动消失。 */
+  highlightPlugin: "",
+  /** 依赖缓存占用：{ count, bytes }。装在应用数据目录，用户看不见，所以给它一行数。 */
+  depCache: null,
   attachments: [],   // 待随消息发送的附件 [{path,name,size}]
   msgNodes: new Map(), // 消息 id -> DOM，供增量渲染复用
   imageViewer: false,  // 图片查看器是否打开（返回键优先关它）
@@ -282,6 +329,68 @@ function startNodeRuntime() {
  * 清单来自 Node —— 它才是真正加载了插件的那一方。
  * 页面这边的 state.plugins 只管 iframe 插件，两套分开。
  */
+/**
+ * 拉一次插件目录（有缓存就不拉）。
+ *
+ * 失败不抛给用户看堆栈 —— 目录是外部资源，网络不通很正常，
+ * 界面上给一句原因 + 一个重试按钮就够了。
+ */
+async function ensureMarketLoaded() {
+  if (ui.market.loading) return;
+  if (ui.market.items.length && Date.now() - ui.market.at < 30 * 60 * 1000) return;
+
+  ui.market.loading = true;
+  ui.market.error = "";
+  ui.market.note = "";
+  if (ui.view === "plugins" && ui.pluginsTab === "market") renderMain(true);
+
+  try {
+    const items = await loadCatalog({
+      onProgress: (label, i, total) => {
+        ui.market.note =
+          total > 1 ? `正在试 ${label}（第 ${i + 1} / ${total} 个来源）` : `正在试 ${label}`;
+        // 只刷列表块，别整页重绘 —— 搜索框在页面上，重绘会丢焦点
+        if (ui.view === "plugins" && ui.pluginsTab === "market") paintMarket();
+      },
+    });
+    ui.market.items = items;
+    ui.market.at = Date.now();
+  } catch (e) {
+    ui.market.error = String((e && e.message) || e);
+  } finally {
+    ui.market.loading = false;
+    ui.market.note = "";
+    if (ui.view === "plugins" && ui.pluginsTab === "market") renderMain(true);
+  }
+}
+
+/**
+ * 只重绘市场里的分类条与列表。
+ *
+ * 不能整页重绘：搜索框在页面里，重绘会丢焦点 —— 用户打字打到一半
+ * 光标就跳走了。
+ */
+function paintMarket() {
+  const filters = $("#market-filters");
+  if (filters) filters.innerHTML = renderMarketFilters(ui.market);
+  const list = $("#market-list");
+  if (list) list.innerHTML = renderMarketList(ui.market);
+}
+
+/**
+ * 问一下依赖缓存占了多少。
+ *
+ * 缓存装在应用数据目录，用户在文件管理器里看不见 —— 所以至少要在
+ * 插件页给出一个数字，并且给个清空的办法。
+ */
+async function refreshDepCache() {
+  try {
+    ui.depCache = await depCacheStats();
+  } catch {
+    ui.depCache = null;
+  }
+}
+
 async function syncNodePluginList() {
   if (!nodeBridgeAvailable()) return;
   const st = nodeStatus();
@@ -289,6 +398,8 @@ async function syncNodePluginList() {
   try {
     const r = await nodeCall("plugins.list", {});
     setNodePlugins(Array.isArray(r?.plugins) ? r.plugins : []);
+    // 目录诊疗：列表为空时界面要靠它说清楚卡在哪一步
+    setNodePluginsDiag(r?.diagnostics || null);
   } catch {
     /* 读不到就保持原样，不清空 —— 免得界面闪一下 */
   }
@@ -324,6 +435,8 @@ function startNodePoll() {
     // 通道刚连上 → 拉一次插件清单（Node 起来时插件已经加载好了）
     if (st.channelConnected && !wasConnected) {
       syncNodePluginList();
+      // Node 侧的模型供应方这时也注册好了 → 同步进手机端模型表
+      syncNodeLlmModels();
     }
     if (ui.view === "settings") renderMain(true);
   }, 1000);
@@ -547,7 +660,8 @@ function renderMain(force = false) {
   }
 
   if (ui.view === "workspace") target.innerHTML = renderWorkspace(ui.workspaceTab);
-  if (ui.view === "plugins") target.innerHTML = renderPlugins();
+  if (ui.view === "plugins")
+    target.innerHTML = renderPlugins(ui.pluginsTab, ui.market, ui.highlightPlugin, ui.depCache);
   if (ui.view === "tasks") target.innerHTML = renderTasks();
   if (ui.view === "settings") {
     // 设置页内点任何控件都会重渲染，这里保住滚动位置，不再跳回顶部。
@@ -948,7 +1062,7 @@ function renderContextBar(s) {
   const modelChip = model
     ? `<button class="chip" data-act="open-model" title="${esc(conn.detail)}">
         <span class="chip__dot ${conn.key === "ok" ? "chip__dot--ok" : conn.key === "nokey" || conn.key === "fail" ? "chip__dot--warn" : ""}"></span>
-        ${esc(model.label.replace("DeepSeek-", ""))}
+        ${esc(String(model.label || model.name || model.apiModel || model.id || "模型").replace("DeepSeek-", ""))}
         ${
           effortEnabled()
             ? `<span class="chip__effort" style="color:${effortColor(state.settings.reasoning)}">${effortName(state.settings.reasoning)}</span>`
@@ -2169,6 +2283,10 @@ function renderSheet() {
     trace: traceSheet,
     file: fileSheet,
     "new-file": newFileSheet,
+    "node-log": nodeLogSheet,
+    "node-install": nodeInstallSheet,
+    "node-plugin": nodePluginSheet,
+    "market-plugin": marketPluginSheet,
     "plugin-detail": pluginSheet,
     "plugin-search": pluginSearchSheet,
     "new-automation": automationSheet,
@@ -3074,6 +3192,422 @@ function fileSheet(data) {
   });
 }
 
+/**
+ * 市场里点开一个插件。
+ *
+ * ============ 为什么需要这一屏 ============
+ *
+ * 卡片是两列的，描述只能显示三行。而目录里的中文描述中位数 85 字、
+ * 最长 161 字，四分之一超过 120 字 —— 被截断的恰恰是「这插件到底
+ * 干什么」的关键部分。用户点开就是为了读完它。
+ *
+ * 顺手多做一件事：查一眼 npm 上的 package.json。目录里没有依赖信息，
+ * 而「装上去能不能跑」几乎全由它决定。这一条请求几百字节，
+ * 在详情页里等它也值。
+ */
+function marketPluginSheet(data) {
+  const it = data?.item;
+  if (!it) {
+    return sheetFrame({
+      title: "插件详情",
+      body: `<div class="empty-line"><b>这条记录丢了</b>回到列表再点一次。</div>`,
+      foot: `<button class="btn btn--ghost" data-act="close-sheet" style="flex:1">关闭</button>`,
+    });
+  }
+
+  const installed = (state.nodePlugins || []).some((p) => String(p.id || "") === pluginIdOf(it.name));
+  const repo = String(it.repo || "").replace(/^https?:\/\//, "").replace(/\.git$/, "");
+  const ago = formatAgo(it.updatedAt);
+
+  // 描述：中文优先，英文作为补充。两者都可能有，也可能都没有。
+  const zh = String(it.desc || "").trim();
+  const en = String(it.descEn || "").trim();
+  // 目录里的说明本身就有 12% 是截断的（以省略号结尾）——
+  // 那不是我们截的，是数据源截的。不说清楚，用户会以为详情页也能看全。
+  const cutByCatalog = /(…|\.\.\.)$/.test(zh) || /(…|\.\.\.)$/.test(en);
+  const cutNote = cutByCatalog
+    ? `<p class="mk-detail__note">目录里的说明到这里就结束了，更详细的写在仓库的 README 里。</p>`
+    : "";
+
+  const descBlock = `${
+    zh
+      ? `<p class="mk-detail__text">${esc(zh)}</p>${
+          en && en !== zh ? `<p class="mk-detail__text mk-detail__text--en">${esc(en)}</p>` : ""
+        }`
+      : en
+      ? `<p class="mk-detail__text">${esc(en)}</p>`
+      : `<p class="mk-detail__text mk-detail__text--en">目录里没有写说明。</p>`
+  }${cutNote}`;
+
+  const pre = data?.pre || null;
+  const preLoading = data?.preLoading;
+  const preError = data?.preError;
+
+  let preBlock;
+  if (preLoading) {
+    preBlock = `<div class="mk-detail__pre mk-detail__pre--wait">正在查 npm 上的包信息…</div>`;
+  } else if (pre) {
+    const deps = pre.deps || [];
+    const peers = pre.peers || [];
+    const rows = [];
+
+    if (deps.length) {
+      rows.push(`<div class="mk-detail__flag mk-detail__flag--warn">
+        <b>声明了 ${deps.length} 个依赖</b>
+        <span>${esc(deps.slice(0, 4).join("、"))}${deps.length > 4 ? "…" : ""}</span>
+        <span>手机端不能 npm install。包里若没带 node_modules，加载时会报 Cannot find module。</span>
+      </div>`);
+    } else {
+      rows.push(`<div class="mk-detail__flag mk-detail__flag--ok">
+        <b>没有声明依赖</b><span>装上就能跑的可能性大。</span>
+      </div>`);
+    }
+
+    if (pre.hasClient) {
+      rows.push(`<div class="mk-detail__flag">
+        <b>带界面部分</b>
+        <span>它在 dsh web 宿主里会往界面挂东西。本机不渲染，但工具与模型照常生效。</span>
+      </div>`);
+    }
+
+    if (peers.length) {
+      // 只列两个：这些名字又长又技术，列四个会占两行，
+      // 而用户真正关心的是「有没有我这边提供不了的」—— 数量比名字更能说明。
+      rows.push(`<div class="mk-detail__kv"><span>宿主依赖</span><b>${esc(
+        peers.slice(0, 2).join("、")
+      )}${peers.length > 2 ? ` 等 ${peers.length} 个` : ""}</b></div>`);
+    }
+    if (pre.main) {
+      rows.push(`<div class="mk-detail__kv"><span>入口</span><b class="mono">${esc(pre.main)}</b></div>`);
+    }
+    if (pre.enginesNode) {
+      rows.push(`<div class="mk-detail__kv"><span>Node 要求</span><b>${esc(pre.enginesNode)}</b></div>`);
+    }
+
+    preBlock = `<div class="mk-detail__pre">${rows.join("")}</div>`;
+  } else {
+    preBlock = preError
+      ? `<div class="mk-detail__pre mk-detail__pre--wait">没查到 npm 上的包信息：${esc(
+          preError
+        )}<br>不影响安装，只是少了这项参考。</div>`
+      : "";
+  }
+
+  const foot = installed
+    ? `<button class="btn btn--ghost" data-act="close-sheet" style="flex:1">关闭</button>
+       <div style="flex:1.4;display:flex;align-items:center;justify-content:center">
+         <span class="mk-card__done">已装在这台设备上</span>
+       </div>`
+    : `<button class="btn btn--ghost" data-act="close-sheet" style="flex:1">关闭</button>
+       <button class="btn btn--primary" data-act="market-install" style="flex:1.4"
+         data-name="${esc(it.name)}" data-version="${esc(it.version)}">安装</button>`;
+
+  return sheetFrame({
+    title: esc(it.title),
+    desc: `<span class="mono" style="font-size:11px">${esc(it.name)}</span>`,
+    body: `
+      <div class="mk-detail__meta">
+        ${it.category ? `<span class="mk-detail__tag">${esc(it.category)}</span>` : ""}
+        ${it.version ? `<span class="mk-detail__tag mk-detail__tag--mono">v${esc(it.version)}</span>` : ""}
+        ${ago ? `<span class="mk-detail__tag mk-detail__tag--dim">更新于 ${esc(ago)}</span>` : ""}
+      </div>
+
+      ${descBlock}
+
+      ${
+        repo
+          ? `<button class="mk-detail__link" data-act="market-copy-repo">
+               <span class="mono">${esc(repo)}</span>
+               <span class="mk-detail__link-hint">点击复制</span>
+             </button>`
+          : ""
+      }
+
+      <div class="section-label">装之前</div>
+      ${preBlock}
+
+      <div id="ni-progress" class="field__hint" style="margin-top:12px"></div>`,
+    foot,
+  });
+}
+
+/**
+ * 插件详情 —— 它到底带来了什么。
+ *
+ * ============ 为什么值得单独一屏 ============
+ *
+ * 装完插件，用户第一个问题是「它给了什么」。列表里只有
+ * 「名字 · 版本 · N 个工具」，看不到工具叫什么、提供了哪些模型、
+ * 卡在哪个依赖上。而这几件事恰好是判断「这插件有用吗」的全部依据。
+ */
+function nodePluginSheet(data) {
+  const detail = data?.detail || null;
+  const err = data?.error || "";
+
+  if (!detail) {
+    return sheetFrame({
+      title: "插件详情",
+      desc: data?.id || "",
+      body: err
+        ? `<div class="empty-line"><b>读不到详情</b>${esc(err)}</div>`
+        : `<div class="empty-line">正在问 Node 要数据…</div>`,
+      foot: `<button class="btn btn--ghost" data-act="close-sheet" style="flex:1">关闭</button>`,
+    });
+  }
+
+  const p = detail.plugin || {};
+  const tools = Array.isArray(detail.tools) ? detail.tools : [];
+  const routes = Array.isArray(detail.routes) ? detail.routes : [];
+  const pending = p.status === "pending";
+
+  const statusLine = pending
+    ? `在等 ${(p.pendingDeps || []).join("、") || "依赖"}`
+    : p.status === "active"
+    ? "已加载，正在运行"
+    : p.status === "failed"
+    ? `加载失败：${p.error || "未知原因"}`
+    : p.status === "not-loaded"
+    ? "文件在，但没加载起来（看 Node 日志）"
+    : String(p.status || "未知");
+
+  const toolBlocks = tools.length
+    ? tools
+        .map(
+          (t) =>
+            `<div class="kv"><span class="mono">${esc(t.name)}</span><b style="text-align:right;max-width:62%">${esc(
+              t.description || "（无说明）"
+            )}</b></div>`
+        )
+        .join("")
+    : `<p class="field__hint">这个插件没有注册工具。</p>`;
+
+  const routeBlocks = routes.length
+    ? routes
+        .map((r) => {
+          const models = Array.isArray(r.models) ? r.models : [];
+          const list = models.length
+            ? models
+                .map(
+                  (m) =>
+                    `<div class="kv"><span class="mono">${esc(m.id)}</span><b>${esc(m.name || m.id)}${
+                      m.contextWindow ? ` · ${fmtContext(m.contextWindow)}` : ""
+                    }</b></div>`
+                )
+                .join("")
+            : r.error
+            ? ""
+            : `<p class="field__hint">这个路由眼下没有模型（可能还没探测，或需要配置）。</p>`;
+          return `
+            <div class="kv"><span>路由</span><b class="mono">${esc(r.provider)}</b></div>
+            ${r.name && r.name !== r.provider ? `<div class="kv"><span>名称</span><b>${esc(r.name)}</b></div>` : ""}
+            ${r.error ? `<p class="field__hint" style="color:var(--warn,#d9a441)">清单查不到：${esc(r.error)}</p>` : ""}
+            ${list}`;
+        })
+        .join("")
+    : `<p class="field__hint">${
+        detail.routeCount
+          ? "它没有提供模型 —— 可能只提供工具。"
+          : "还没有任何模型供应方注册。"
+      }</p>`;
+
+  return sheetFrame({
+    title: esc(p.name || p.id || "插件"),
+    desc: `${esc(p.id || "")} · v${esc(p.version || "0.0.0")}`,
+    body: `
+      <div class="kv"><span>状态</span><b style="color:${
+        pending
+          ? "var(--warn,#d9a441)"
+          : p.status === "failed"
+          ? "var(--danger,#e5484d)"
+          : "var(--ok,#5ac08a)"
+      }">${esc(statusLine)}</b></div>
+      <div class="kv"><span>形态</span><b>${p.kind === "package" ? "npm 包" : "单文件脚本"}</b></div>
+      ${
+        p.entry
+          ? `<div class="kv"><span>入口</span><b class="mono" style="font-size:10px;word-break:break-all;text-align:right;max-width:64%">${esc(
+              p.entry
+            )}</b></div>`
+          : ""
+      }
+
+      <div class="section-label">工具 · ${tools.length}</div>
+      ${toolBlocks}
+
+      <div class="section-label">模型</div>
+      ${routeBlocks}
+
+      <div style="display:flex;gap:8px;margin-top:18px">
+        <button class="btn btn--ghost btn--sm" data-act="node-reload-one" data-id="${esc(p.id || "")}" style="flex:1">重载</button>
+        <button class="btn btn--ghost btn--sm" data-act="node-uninstall" data-id="${esc(p.id || "")}"
+          style="flex:1;color:var(--danger,#e5484d)">卸载</button>
+      </div>`,
+    foot: `<button class="btn btn--primary" data-act="close-sheet" style="flex:1">关闭</button>`,
+  });
+}
+
+/**
+ * 安装 Node 插件。
+ *
+ * ============ 为什么要有安全提示 ============
+ *
+ * 插件不是沙箱里的东西：它在 Node 里跑，能读工作区、能发网络请求、
+ * 能起定时器。装一个插件等于把权限交给它。
+ *
+ * 所以这里不写「一键安装，轻松扩展」那种话 —— 先把风险说清楚，
+ * 用户同意之后才装。
+ */
+function nodeInstallSheet() {
+  return sheetFrame({
+    title: "安装 Node 插件",
+    desc: "支持 .zip / .tar.gz / .tgz，或单个 .js 文件",
+    body: `
+      <div class="field">
+        <label class="field__label" for="ni-url">插件包网址</label>
+        <input class="input mono" id="ni-url" placeholder="https://…/plugin.zip" autocomplete="off" spellcheck="false">
+        <p class="field__hint">GitHub Release 的 zip、npm pack 出来的 .tgz 都行。装进工作区的 plugins/ 目录。</p>
+      </div>
+      <button class="btn btn--ghost btn--block" data-act="node-install-file">从手机选择文件…</button>
+      <div class="field" style="margin-top:14px">
+        <div id="ni-progress" class="field__hint" aria-live="polite">还没有开始。</div>
+      </div>
+      <p class="field__hint" style="color:var(--warn,#d9a441);display:flex;gap:6px;align-items:flex-start">
+        ${icon("shield", "icon--xs")}
+        <span>插件是在你设备上运行的 JavaScript：能读写工作区文件、发起网络请求。
+        只装你信得过的来源。装完可以在设置里随时卸载。</span>
+      </p>`,
+    foot: `<button class="btn btn--ghost" data-act="close-sheet" style="flex:1">关闭</button>
+           <button class="btn btn--primary" data-act="node-install-url" style="flex:1.4">安装</button>`,
+  });
+}
+
+/**
+ * 装完之后让 Node 真的把插件跑起来，并把它的模型同步进选择器。
+ *
+ * 三步都不做的话，用户会看到「装好了但列表里没有」——那正是我们
+ * 前几个版本反复踩的坑。
+ */
+async function afterNodePluginChange() {
+  // 插件文件是直接用 fs 写的，没走 store 的 writeFile ——
+  // 所以工作区索引里没有它们，列表里会看不见。
+  // 同步一次索引，让「装好了但工作区里找不到」这种事不发生。
+  try {
+    await syncIndex("workspace");
+  } catch {
+    /* 索引同步失败不影响组装载 */
+  }
+  try {
+    // 只加载新来的插件 —— 已在跑的那些不能重跑
+    // （重跑会出现两个实例同时跑，宿主服务注册也会撞车）
+    await loadNewNodePlugins();
+  } catch {
+    /* 通道没连上时加载会失败，但文件已经装好了 */
+  }
+  await refreshDepCache();
+  await syncNodePluginList();
+  try {
+    await syncNodeLlmModels();
+  } catch {
+    /* 模型同步失败不该盖掉安装结果 */
+  }
+  renderMain(true);
+}
+
+/** 统一的安装流程（网址 / 文件共用）。 */
+async function runNodeInstall(source) {
+  const box = $("#ni-progress");
+
+  /**
+   * 进度出口。
+   *
+   * 同时更新三个地方，因为它们解决的是三个不同的问题：
+   *   · 面板里的那行字 —— 看得懂「现在在干什么」
+   *   · 卡片里的进度条 —— 看得见「在动」
+   *   · done/total 计数 —— 看得出「还要多久」
+   */
+  const say = (t, done, total) => {
+    if (box) box.textContent = t;
+    const inst = ui.market.installing;
+    if (inst) {
+      inst.stage = t;
+      if (typeof done === "number") inst.done = done;
+      if (typeof total === "number") inst.total = total;
+      if (ui.view === "plugins" && ui.pluginsTab === "market") paintMarket();
+    }
+  };
+
+  const fromMarket = Boolean(ui.market.installing);
+  say("准备…");
+  try {
+    const r = await installNodePlugin({ ...source, onProgress: say });
+    const warns = Array.isArray(r.warnings) ? r.warnings : [];
+    const clientNote = r.hasClient ? "它的界面部分在本机不渲染（需要 dsh web 宿主），工具/模型照常生效。" : "";
+    const depNote = r.deps
+      ? ` · 依赖 ${r.deps.packages} 个包 / ${Math.round((r.deps.bytes || 0) / 1024)} KB`
+      : "";
+    say(
+      `已安装 ${r.name} v${r.version} · ${r.installed} 个文件${depNote}${
+        warns.length ? "（有警告）" : ""
+      }`
+    );
+    ui.market.installing = null;
+    await afterNodePluginChange();
+    closeSheet(true);
+
+    // ============ 装完要让人找得到 ============
+    //
+    // 从市场装的，装完直接跳到「已安装」并高亮那一行。
+    // 只弹个 toast 是不够的 —— 用户下一步的动作一定是「看看它长什么样」，
+    // 而那时他还停在市场列表里，得自己猜去哪儿找。
+    if (fromMarket) {
+      ui.pluginsTab = "node";
+      ui.highlightPlugin = r.id;
+      renderMain(true);
+      setTimeout(() => {
+        if (ui.highlightPlugin === r.id) {
+          ui.highlightPlugin = "";
+          if (ui.view === "plugins" && ui.pluginsTab === "node") renderMain(true);
+        }
+      }, 3200);
+    }
+
+    if (warns.length) toast(warns[0], "err");
+    else if (r.deps) toast(`已安装 ${r.name}，依赖 ${r.deps.packages} 个包`);
+    else if (clientNote) toast(clientNote);
+    else toast(`已安装 ${r.name}`, "ok");
+  } catch (e) {
+    const msg = String((e && e.message) || e);
+    ui.market.installing = null;
+    say("安装失败：" + msg);
+    toast(msg, "err");
+    if (fromMarket) paintMarket();
+  }
+}
+
+function nodeLogSheet(data) {
+  const raw = String(data?.text || "");
+  const text = raw.trim();
+  let body;
+  if (!text) {
+    body = `<div class="empty-line">
+      <b>日志是空的</b>
+      Node 可能还没真正跑起来过，或者日志被清空了（超过 200 KB 会滚动）。
+    </div>`;
+  } else {
+    body = `
+      <pre class="input mono" style="white-space:pre-wrap;word-break:break-all;max-height:54vh;overflow:auto;font-size:11px;line-height:1.6;margin:0">${esc(text)}</pre>
+      <p class="dim" style="font-size:12px;margin:10px 0 0;line-height:1.6">
+        只显示最后 8 KB。找「通道」「错误」「error」这几行，
+        它们会写明连不上的具体原因。
+      </p>`;
+  }
+  return sheetFrame({
+    title: "Node 日志",
+    desc: "排查「运行中但通道未连接」看这里",
+    body,
+    foot: `<button class="btn btn--ghost" data-act="close-sheet" style="flex:1">关闭</button><button class="btn btn--primary" data-act="copy-node-log" style="flex:1.4">复制</button>`,
+  });
+}
+
 function newFileSheet() {
   return sheetFrame({
     title: "新建文件",
@@ -3488,6 +4022,15 @@ function bindEvents() {
 
     if (t.id === "cm-model-filter") {
       filterFormModels(t.value);
+      return;
+    }
+
+    if (t.id === "market-q") {
+      ui.market.query = t.value;
+      ui.market.limit = 40;
+      // 只重绘列表，不动输入框 —— 整页重绘会把光标弄丢
+      clearTimeout(ui.marketTimer);
+      ui.marketTimer = setTimeout(paintMarket, 160);
       return;
     }
 
@@ -3958,11 +4501,14 @@ function filterFormModels(keyword) {
 
 function applyCurrentModelFields({ silent = false } = {}) {
   const m = currentModel();
+  // 插件提供的模型没有端点 —— 它由 Node 里的 adapter 负责发请求，
+  // 所以不能拿「Base URL 不能为空」去卡它（否则用户改个上下文窗口都存不上）。
+  const nodeModel = isNodeLlmModel(m);
   const baseUrl = $("#set-base")?.value.trim().replace(/\/+$/, "") || "";
   const apiModel = $("#set-api")?.value.trim() || "";
   const ctxK = Math.max(4, Math.min(2000, Number($("#set-ctx")?.value) || 0));
-  if (!baseUrl || !apiModel) {
-    toast("Base URL 和模型 ID 都不能为空", "err");
+  if ((!nodeModel && !baseUrl) || !apiModel) {
+    toast(nodeModel ? "模型 ID 不能为空" : "Base URL 和模型 ID 都不能为空", "err");
     return false;
   }
   if (!ctxK) {
@@ -3971,7 +4517,7 @@ function applyCurrentModelFields({ silent = false } = {}) {
   }
   const def = m.defaults || {};
   saveModelOverride(m.id, {
-    baseUrl: baseUrl !== String(def.baseUrl || "") ? baseUrl : undefined,
+    baseUrl: nodeModel ? undefined : baseUrl !== String(def.baseUrl || "") ? baseUrl : undefined,
     apiModel: apiModel !== String(def.apiModel || "") ? apiModel : undefined,
     ctx: Math.round(ctxK * 1000) !== Number(def.ctx) ? Math.round(ctxK * 1000) : undefined,
   });
@@ -4000,6 +4546,160 @@ async function onClick(e) {
     case "tab":
       navigate(target.dataset.view);
       return;
+
+    case "plugins-tab": {
+      const v = String(target.dataset.value || "");
+      ui.pluginsTab = v === "page" ? "page" : v === "market" ? "market" : "node";
+      renderMain(true);
+      if (ui.pluginsTab === "market") ensureMarketLoaded();
+      if (ui.pluginsTab === "node") {
+        refreshDepCache().then(() => {
+          if (ui.view === "plugins" && ui.pluginsTab === "node") renderMain(true);
+        });
+      }
+      return;
+    }
+
+    case "market-cat": {
+      ui.market.category = String(target.dataset.value || "");
+      ui.market.limit = 40;
+      paintMarket();
+      return;
+    }
+
+    case "market-more": {
+      ui.market.limit = (Number(ui.market.limit) || 40) + 40;
+      paintMarket();
+      return;
+    }
+
+    case "market-reload": {
+      clearCatalogCache();
+      ui.market.items = [];
+      ui.market.at = 0;
+      ui.market.error = "";
+      ensureMarketLoaded();
+      return;
+    }
+
+    case "market-open": {
+      const name = String(target.dataset.name || "");
+      const item = (ui.market.items || []).find((x) => x.name === name);
+      if (!item) {
+        toast("这条记录丢了，刷新一下目录", "err");
+        return;
+      }
+
+      // 先把已知的画出来，别让用户对着空白等网络
+      openSheet("market-plugin", { item, preLoading: true });
+
+      // 同一时间只认一个详情面板：网络回来时用户可能已经关了又开了别的
+      const stillMine = () =>
+        ui.sheet &&
+        ui.sheet.type === "market-plugin" &&
+        ui.sheet.data &&
+        ui.sheet.data.item &&
+        ui.sheet.data.item.name === name;
+
+      try {
+        const pre = await inspectPackage(name);
+        if (stillMine()) {
+          ui.sheet.data = { item, pre };
+          renderSheet();
+        }
+      } catch (e) {
+        if (stillMine()) {
+          ui.sheet.data = { item, preError: String((e && e.message) || e) };
+          renderSheet();
+        }
+      }
+      return;
+    }
+
+    case "market-copy-repo": {
+      const repo = String(ui.sheet?.data?.item?.repo || "");
+      if (!repo) return;
+      navigator.clipboard?.writeText(repo).then(
+        () => toast("仓库地址已复制", "ok"),
+        () => toast("复制失败", "err")
+      );
+      return;
+    }
+
+    case "market-install": {
+      const name = String(target.dataset.name || "");
+      const version = String(target.dataset.version || "");
+      if (!name || !version) {
+        toast("这个条目没有可安装的版本", "err");
+        return;
+      }
+      // 同时只装一个：依赖解析会互相踩，而且手机上并行下载更慢
+      if (ui.market.installing) {
+        toast("还有插件在装，等它完成", "err");
+        return;
+      }
+
+      ui.market.installing = { name, stage: "准备…", done: 0, total: 0 };
+      paintMarket();
+
+      (async () => {
+        try {
+          await runNodeInstall({ url: npmTarballUrl(name, version) });
+        } finally {
+          if (ui.market.installing && ui.market.installing.name === name) {
+            ui.market.installing = null;
+            paintMarket();
+          }
+        }
+      })();
+      return;
+    }
+
+    case "clear-dep-cache": {
+      const c = ui.depCache || { count: 0, bytes: 0 };
+      openSheet("confirm", {
+        title: "清空依赖缓存？",
+        desc: `${c.count} 个包 · ${(c.bytes / 1024 / 1024).toFixed(1)} MB`,
+        detail:
+          "清掉的是下载过的安装包副本，已经装好的插件不受影响。" +
+          "之后装新插件时，这些包要重新下载一遍。",
+        danger: true,
+        confirmText: "清空",
+      });
+      ui.confirmAction = async () => {
+        try {
+          await clearDepCache();
+          await refreshDepCache();
+          renderMain(true);
+          toast("缓存已清空", "ok");
+        } catch (e) {
+          toast(String((e && e.message) || e), "err");
+        }
+      };
+      return;
+    }
+
+    case "goto-installed": {
+      // 市场卡片上的「已装 · 查看」→ 去已安装列表，并高亮这一行
+      const name = String(target.dataset.name || "");
+      ui.pluginsTab = "node";
+      ui.highlightPlugin = pluginIdOf(name);
+      renderMain(true);
+      setTimeout(() => {
+        if (ui.highlightPlugin === pluginIdOf(name)) {
+          ui.highlightPlugin = "";
+          if (ui.view === "plugins" && ui.pluginsTab === "node") renderMain(true);
+        }
+      }, 3200);
+      return;
+    }
+
+    case "goto-node-plugins": {
+      // 设置里的摘要行 → 插件页（Node 分段）
+      ui.pluginsTab = "node";
+      navigate("plugins");
+      return;
+    }
 
     case "open-drawer":
       openDrawer();
@@ -4583,21 +5283,160 @@ async function onClick(e) {
     }
 
     case "node-reload-plugins": {
-      // 重新加载 Node 插件：插件代码可能刚被改过，
-      // 或者上次加载失败了（改完代码想再试一次）。
+      // 热重载全部 Node 插件。
+      //
+      // ============ 为什么不是「再加载一次」 ============
+      //
+      // 以前的做法是 plugins.load —— 那只是把 apply 再跑一遍：
+      //   · 模块缓存没破，代码改了但跑的还是旧的（假重载）
+      //   · 旧 fiber 还在，同一个插件两个实例同时跑
+      //   · 宿主服务的注册会撞车（settings.register 直接抛错）
+      //
+      // plugins.reload 才是真重载：卸载 → 破缓存 → 重新加载。
       if (!nodeBridgeAvailable()) {
         toast("当前环境不支持", "err");
         return;
       }
-      const r = await refreshNodeTools();
-      const failed = Array.isArray(r?.failed) ? r.failed : [];
-      if (failed.length) {
-        toast(`${failed.length} 个插件加载失败`, "err");
-      } else {
-        toast(`已加载 ${r?.loaded ?? 0} 个插件`);
+      const btn = target;
+      if (btn) btn.disabled = true;
+      try {
+        const r = await nodeReloadPlugins();
+        const results = Array.isArray(r?.results) ? r.results : [];
+        const bad = results.filter((x) => !x.ok);
+        if (bad.length) {
+          // 把第一条失败原因说出来 —— 只说「失败了」用户没法处理
+          const first = bad[0];
+          toast(`${bad.length} 个插件重载失败：${first.error || "未知原因"}`, "err");
+        } else {
+          toast(`已重载 ${results.length} 个插件`);
+        }
+        await refreshNodeTools();
+        await syncNodePluginList();
+        renderMain(true);
+      } catch (err) {
+        toast(`重载失败：${err?.message || err}`, "err");
+      } finally {
+        if (btn) btn.disabled = false;
       }
-      await syncNodePluginList();
-      renderMain(true);
+      return;
+    }
+
+    case "node-reload-one": {
+      // 重载单个插件。
+      //
+      // 用户改代码通常只改一个插件，逐个重载比每次全量重载快得多，
+      // 也不会把其它正在工作的插件掀掉。
+      const id = String(target.dataset.id || "");
+      if (!id) return;
+      if (!nodeBridgeAvailable()) {
+        toast("当前环境不支持", "err");
+        return;
+      }
+      target.disabled = true;
+      try {
+        const r = await nodeReloadPlugin(id);
+        if (r?.ok) {
+          toast(`已重载 ${id}`);
+        } else {
+          // 失败要说清楚：是没换成，还是换了但起不来
+          const hint = r?.restored ? "（已回滚到旧版本）" : "";
+          toast(`${id} 重载失败：${r?.error || "未知原因"}${hint}`, "err");
+        }
+        await refreshNodeTools();
+        await syncNodePluginList();
+        renderMain(true);
+      } catch (err) {
+        toast(`重载失败：${err?.message || err}`, "err");
+      } finally {
+        target.disabled = false;
+      }
+      return;
+    }
+
+    case "node-plugin-detail": {
+      const id = String(target.dataset.id || "");
+      if (!id) return;
+      openSheet("node-plugin", { id });
+      try {
+        const detail = await nodePluginDetail(id);
+        // 期间用户可能已经关掉了面板 —— 只更新还停在同一个插件上的那个
+        if (ui.sheet && ui.sheet.type === "node-plugin" && ui.sheet.data?.id === id) {
+          ui.sheet.data = { id, detail };
+          renderSheet();
+        }
+      } catch (e) {
+        if (ui.sheet && ui.sheet.type === "node-plugin" && ui.sheet.data?.id === id) {
+          ui.sheet.data = { id, error: String((e && e.message) || e) };
+          renderSheet();
+        }
+      }
+      return;
+    }
+
+    case "node-install-open": {
+      openSheet("node-install");
+      return;
+    }
+
+    case "node-install-url": {
+      const url = $("#ni-url")?.value.trim() || "";
+      if (!url) {
+        toast("请填插件包网址", "err");
+        return;
+      }
+      await runNodeInstall({ url });
+      return;
+    }
+
+    case "node-install-file": {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = ".zip,.tgz,.gz,.js,.mjs,.cjs,application/zip,application/gzip";
+      input.onchange = async () => {
+        const file = input.files?.[0];
+        if (!file) return;
+        await runNodeInstall({ file });
+      };
+      input.click();
+      return;
+    }
+
+    case "node-uninstall": {
+      const id = String(target.dataset.id || "");
+      if (!id) return;
+      openSheet("confirm", {
+        title: "卸载这个插件？",
+        desc: id,
+        detail: "会删掉 plugins/" + id + "/ 下的所有文件。它注册的工具与模型会一起消失，聊天记录不受影响。",
+        danger: true,
+        confirmText: "卸载",
+      });
+      ui.confirmAction = async () => {
+        try {
+          const n = await uninstallNodePlugin(id);
+          await afterNodePluginChange();
+          toast(`已删除 ${n} 个文件`, "ok");
+        } catch (e) {
+          toast(String((e && e.message) || e), "err");
+        }
+      };
+      return;
+    }
+
+    case "node-log": {
+      // 「运行中但通道未连接」只能靠 Node 自己的日志定位 ——
+      // 页面看不到 Android/data 下的文件，所以由原生读出来。
+      const text = nodeLogTail();
+      openSheet("node-log", { text });
+      return;
+    }
+
+    case "copy-node-log": {
+      const text = ui.sheet?.data?.text || "";
+      navigator.clipboard?.writeText(text).then(
+        () => toast("日志已复制", "ok"),
+        () => toast("复制失败，可以长按选择", "err")
+      );
       return;
     }
 

@@ -375,16 +375,26 @@ public final class DshNodeRuntime {
      * plugins/ 目录下。Node 与 WebView 在同一个应用里，读的是同一个
      * 文件系统 —— 所以 Node 直接读那个目录就行，不需要再传一遍代码。
      *
-     * 路径必须和 DshFsBridge 用的一致（应用专属外部目录），
-     * 否则 Node 看到的和页面看到的不是同一份文件。
+     * 路径必须和 DshFsBridge 用的一致，否则 Node 看到的和页面看到的
+     * 不是同一份文件。
+     *
+     * ============ 曾经漏掉的那一层 workspace ============
+     *
+     * DshFsBridge 的区域根是 `getExternalFilesDir()`，而它的 "workspace"
+     * 区域是 `<根>/workspace`。这里原来直接返回了根目录本身 ——
+     * 于是页面把插件写到 `<根>/workspace/plugins/`，Node 却去
+     * `<根>/plugins/` 找。两边都觉得自己没错，用户看到的是
+     * 「明明放了文件，却说未找到插件」。
+     *
+     * 这就是必须在这里再拼一层的原因：**根 ≠ 工作区**。
      */
     private static String workspacePath(Context ctx) {
         try {
             File ext = ctx.getExternalFilesDir(null);
-            if (ext != null) return ext.getAbsolutePath();
+            if (ext != null) return new File(ext, "workspace").getAbsolutePath();
         } catch (Throwable ignored) {
         }
-        return ctx.getFilesDir().getAbsolutePath();
+        return new File(ctx.getFilesDir(), "workspace").getAbsolutePath();
     }
 
     private static native int nativeStart(String libPath, String[] args);

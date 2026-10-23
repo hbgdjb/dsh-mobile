@@ -101,6 +101,48 @@ public class DshNodeBridge {
     }
 
     /**
+     * 读 Node 自己的日志尾部。
+     *
+     * ============ 为什么需要这个 ============
+     *
+     * 「Node 运行中，但通道未连接」这句话没法定位问题：
+     * 可能是 Node 里 require 失败、可能是连回来被拒、可能是口令校验没过、
+     * 也可能是连上又断了。**只有 Node 自己写的日志能区分**。
+     *
+     * 而 node.log 在 filesDir/node/ 下 —— Android 11 起文件管理器
+     * 访问 Android/data 受限，用户根本看不到。所以必须由 App 自己读出来。
+     *
+     * 只取尾部 8 KB：日志会滚动（main.js 超过 200 KB 会清空），
+     * 而我们要的是「刚刚发生了什么」。
+     *
+     * @return 日志文本；读不到时返回一句可读的原因（不是空串）
+     */
+    @JavascriptInterface
+    public String logTail() {
+        try {
+            java.io.File dir = new java.io.File(ctx.getFilesDir(), "node");
+            java.io.File f = new java.io.File(dir, "node.log");
+            if (!f.exists()) {
+                return "";
+            }
+            long len = f.length();
+            long from = Math.max(0, len - 8192);
+            int size = (int) (len - from);
+            byte[] buf = new byte[size];
+            java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f, "r");
+            try {
+                raf.seek(from);
+                raf.readFully(buf);
+            } finally {
+                raf.close();
+            }
+            return new String(buf, java.nio.charset.StandardCharsets.UTF_8);
+        } catch (Throwable e) {
+            return "读取日志失败：" + e.getMessage();
+        }
+    }
+
+    /**
      * 一次性把状态问全。
      *
      * 拆成 available / running / reason 三个字段而不是一个布尔：
@@ -113,7 +155,20 @@ public class DshNodeBridge {
         try {
             boolean avail = DshNodeRuntime.available();
             o.put("available", avail);
-            o.put("running", DshNodeService.isRunning());
+            // ============ running 到底指什么 ============
+            //
+            // 原来这里报的是「服务在跑」（DshNodeService.isRunning），
+            // 而界面文案写的是「Node.js 运行时 运行中」—— 两件事被混成一件。
+            //
+            // 后果很具体：Node 进程崩了、服务还活着，界面照样说「运行中」，
+            // 用户看到的现象却是「运行中，但通道未连接」，而且没有任何线索。
+            //
+            // 现在分开报：
+            //   running         Node 进程真的在（nativeStart 阻塞中）
+            //   serviceRunning  前台服务被要求启动过
+            boolean nodeAlive = DshNodeRuntime.isRunning();
+            o.put("running", nodeAlive);
+            o.put("serviceRunning", DshNodeService.isRunning());
             // 运行时是下载来的：这三个字段让界面能区分
             // "没下载" / "正在下" / "下好了但没起来"
             o.put("installed", DshNodeRuntime.runtimeInstalled(ctx));

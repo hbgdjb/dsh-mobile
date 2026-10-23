@@ -25,7 +25,14 @@ initFiles()
     // 文件系统没准备好就读不到。
     loadEnabledPlugins()
       .catch((err) => console.warn("插件装载失败：", err))
-      .finally(() => initUI());
+      .finally(() => {
+        initUI();
+        // 启动动画退场：等界面画出第一帧再交棒，
+        // 否则淡出的时候后面还是空白，会闪一下。
+        requestAnimationFrame(() =>
+          requestAnimationFrame(() => window.DshSplash?.ready())
+        );
+      });
   });
 
 // Service Worker：
