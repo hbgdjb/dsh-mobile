@@ -1,6 +1,6 @@
 /* Service Worker — 壳缓存，保证断网也能打开；接口请求不缓存 */
 
-const CACHE = "dsh-mobile-v6.0.1";
+const CACHE = "dsh-mobile-v6.2.1";
 const SHELL = [
   "./",
   "./index.html",
@@ -13,10 +13,13 @@ const SHELL = [
   "./styles/components.css",
   "./styles/effort.css",
   "./styles/screens.css",
+  "./styles/ui-host.css",
   "./scripts/app.js",
   "./scripts/ui.js",
+  "./scripts/ui-host.js",
   "./scripts/store.js",
   "./scripts/runtime.js",
+  "./scripts/retry.js",
   "./scripts/native-http.js",
   "./scripts/hud.js",
   "./scripts/tools.js",

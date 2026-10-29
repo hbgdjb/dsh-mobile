@@ -28,9 +28,12 @@ import { buildSystemPromptText } from "./prompt.js";
 import { sanitizeUntrusted } from "./inject.js";
 import { toolSchemas, executeTool, availableToolNames, inspectPath } from "./tools.js";
 import { nativeStream, nativeHttpAvailable } from "./native-http.js";
+import { withRetry } from "./retry.js";
 import { isImagePath, imageMime, prepareImage } from "./image.js";
 import {
   buildPromptBlock,
+  buildMemoryBlock,
+  RULES as MEMORY_RULES,
   detectCorrection,
   createTagFilter,
   stripMemoryTags,
@@ -101,6 +104,8 @@ function promptContext() {
     mcpServers: Array.isArray(state.settings.mcpServers) ? state.settings.mcpServers : [],
     minimal: state.settings.mode === "minimal",
     now: new Date().toLocaleString("zh-CN", { hour12: false }),
+    // 记忆关掉时整段规则也不出现 —— 否则模型会去找一个不存在的库
+    memoryRules: state.settings.memoryEnabled === false ? "" : MEMORY_RULES,
   };
 }
 
@@ -132,7 +137,10 @@ function buildFullSystemPrompt(query = "", windowTokens = 0) {
     const maxTokens = win
       ? Math.max(300, Math.min(2000, Math.floor(win * 0.06)))
       : undefined;
-    return buildPromptBlock(query, base, maxTokens ? { maxTokens } : {});
+    // 只追加**数据块**。固定规则已经在 base 里（见 prompt.js 的 memory-rules 段）——
+    // 分开之后，规则部分每轮都能命中原生前缀缓存，只有这一小块数据会 miss。
+    const block = buildMemoryBlock(query, maxTokens ? { maxTokens } : {});
+    return block ? `${base}\n\n${block}` : base;
   } catch (err) {
     // 记忆库出问题不能连累主流程：退回基础 prompt
     console.warn("记忆库注入失败：", err);
@@ -515,7 +523,49 @@ async function chatViaNode(active, { messages, tools, signal, onText, onReasonin
   }
 }
 
-async function chatOnce({ messages, tools, signal, onText, onReasoning, onUsage }) {
+/* ---------------- 重试 ---------------- */
+
+/**
+ * 带重试的请求。
+ *
+ * 逻辑本身在 retry.js（可单独测）。这里只负责一件它做不到的事：
+ * 判断「这一次尝试是不是已经输出过内容」—— 那要盯着流式回调，
+ * 只有这一层看得见。
+ *
+ * 已经吐过字就不能重试：用户已经看到上半段了，重发会让
+ * 同一段话在屏幕上出现两遍，还多花一次钱。
+ */
+async function chatOnce(opts) {
+  let produced = false;
+
+  return await withRetry(
+    async () => {
+      produced = false;
+      try {
+        return await chatAttempt({
+          ...opts,
+          onText: (d) => {
+            produced = true;
+            opts.onText?.(d);
+          },
+          onReasoning: (d) => {
+            produced = true;
+            opts.onReasoning?.(d);
+          },
+        });
+      } catch (err) {
+        err.produced = produced;
+        throw err;
+      }
+    },
+    {
+      signal: opts.signal,
+      onRetry: opts.onRetry,
+    }
+  );
+}
+
+async function chatAttempt({ messages, tools, signal, onText, onReasoning, onUsage }) {
   const active = currentModel();
   if (!active) throw new Error("还没有添加模型。到 设置 → 模型管理 里添加一个，选好供应方一分钟就能接上。");
 
@@ -620,10 +670,21 @@ async function chatOnce({ messages, tools, signal, onText, onReasoning, onUsage 
       addDiagnostic(diag);
       recorded = true;
       setModelStatus(active.id, { ok: false, status: code, error: detail, model });
-      if (code) throw new Error(`${httpHint(code)}${detail ? ` · ${detail}` : ""}${imageHint}${effortFallback(active, detail)}`);
-      throw new Error(
+      // httpStatus / retryAfter 要挂在错误上：外层据此判断该不该重试、等多久。
+      // 以前这里只抛了文案，重试层拿不到状态码，只能一律不重试。
+      if (code) {
+        const e = new Error(
+          `${httpHint(code)}${detail ? ` · ${detail}` : ""}${imageHint}${effortFallback(active, detail)}`
+        );
+        e.httpStatus = code;
+        e.retryAfter = Number(err.retryAfter) || 0;
+        throw e;
+      }
+      const e = new Error(
         `无法连接模型服务：${detail}。请检查 Base URL、网络与证书；Android 端已走原生请求，不再受跨域限制。`
       );
+      e.httpStatus = 0;
+      throw e;
     });
 
     if (!consumer.sawEvent && raw.trim()) {
@@ -662,9 +723,11 @@ async function chatOnce({ messages, tools, signal, onText, onReasoning, onUsage 
       addDiagnostic(diag);
       recorded = true;
       setModelStatus(active.id, { ok: false, error: err.message, model });
-      throw new Error(
+      const e = new Error(
         `无法连接模型服务：${err.message}。请检查 Base URL 与网络；浏览器预览下还要求服务端允许跨域（CORS）。`
       );
+      e.httpStatus = 0;
+      throw e;
     }
     status = res.status;
     if (!res.ok) {
@@ -673,7 +736,14 @@ async function chatOnce({ messages, tools, signal, onText, onReasoning, onUsage 
       addDiagnostic({ ...diag, status, ms: Date.now() - started, error: detail || `HTTP ${status}` });
       recorded = true;
       setModelStatus(active.id, { ok: false, status, error: detail, model });
-      throw new Error(`${httpHint(status)}${detail ? ` · ${detail}` : ""}${imageHint}${effortFallback(active, detail)}`);
+      const e = new Error(
+        `${httpHint(status)}${detail ? ` · ${detail}` : ""}${imageHint}${effortFallback(active, detail)}`
+      );
+      e.httpStatus = status;
+      // 浏览器分支拿 Retry-After 要显式读头，原生桥那边已经带回来了
+      const ra = Number(res.headers.get("retry-after")) || 0;
+      e.retryAfter = ra;
+      throw e;
     }
     const { finish, raw, sawEvent } = await readSSE(res, {
       onText,
@@ -741,25 +811,69 @@ async function chatOnce({ messages, tools, signal, onText, onReasoning, onUsage 
 
 /* ---------------- 工具执行封装 ---------------- */
 
-async function runToolCall(msg, call, ctx) {
+/**
+ * 可以安全并行的只读工具。
+ *
+ * ============ 为什么只有这几个 ============
+ *
+ * 并行执行的前提是「互不影响」，而这需要很强的保证：
+ *   · 只读 —— 两个写操作并行，谁后写谁赢，结果不可预期
+ *   · 不弹审批 —— 同时弹三个确认框，用户根本不知道自己在批什么
+ *   · 彼此独立 —— 同一批 tool_calls 是模型一步返回的，它还没看到
+ *     任何结果，所以只读之间天然不依赖对方
+ *
+ * 网络类（web_search）、MCP、插件工具都不放进来：它们可能有速率
+ * 限制或副作用，而这一层看不见。
+ */
+const PARALLEL_SAFE = new Set([
+  "fs_list",
+  "fs_read",
+  "fs_inspect",
+  "library_list",
+  "library_read",
+  "calc",
+  "now",
+]);
+
+/**
+ * 这个工具能不能和相邻的只读工具一起并行跑。
+ *
+ * 导出是为了让测试能直接守住这条线 —— 白名单里混进一个写操作，
+ * 平时看不出来，出事就是「两个写同时落盘，谁后写谁赢」。
+ */
+export function isParallelSafeTool(name) {
+  return PARALLEL_SAFE.has(String(name || ""));
+}
+
+/**
+ * 建工具卡片占位（不执行）。
+ *
+ * ============ 为什么要拆成两步 ============
+ *
+ * 并行执行时，谁先跑完谁先 push，卡片顺序就跟着完成顺序乱跳 ——
+ * 模型说了「先读 A、再读 B」，界面上却先出现 B。
+ *
+ * 所以位置在**开始执行前**就占好，执行完只回填内容。
+ */
+function prepareToolCall(msg, call, args) {
   const tool = {
     id: call.id || `t_${Date.now()}`,
     name: call.name,
     argLabel: call.argLabel || call.argsPreview || "",
     status: "running",
-    args: call.args || {},
+    // 存**解析后的对象**：call.args 在流式聚合阶段是原始 JSON 字符串，
+    // 直接塞进去会让 UI 显示成一整行 JSON，也让执行层拿到字符串当对象用。
+    args: args || {},
     output: "",
     ms: 0,
   };
   msg.tools.push(tool);
-  ctx.onChange();
+  return tool;
+}
 
-  let parsed = {};
-  try {
-    parsed = call.args || JSON.parse(call.argsRaw || "{}");
-  } catch {
-    parsed = {};
-  }
+/** 执行一个已经占好位的工具卡片。 */
+async function executePreparedTool(tool, call, args, ctx) {
+  const parsed = args || {};
   tool.argLabel = previewOf(tool.name, parsed);
 
   const res = await executeTool(tool.name, parsed, {
@@ -950,6 +1064,9 @@ export async function runAgent({ session, text, msg, attachments, signal, onChan
       msg.status = "error";
       msg.error = err.message || "运行失败";
     }
+    // 失败收尾时把重试提示撤掉：它描述的是一个正在进行的动作，
+    // 留在消息上会让人以为还在重试
+    msg.retry = null;
   } finally {
     msg.duration = Date.now() - msg.startedAt;
     msg.tokens = msg.tokens || estimateTokens(msg.content + msg.reasoning);
@@ -1067,7 +1184,19 @@ async function liveRun({ session, text, msg, attachments, signal, ctx }) {
         onUsage(u) {
           if (u.total_tokens) msg.tokens = u.total_tokens;
         },
+        onRetry(info) {
+          // 界面上要说一声。悄悄重试的话，用户只会看到"卡了两秒才出字"，
+          // 以为应用在发呆。
+          msg.retry = info;
+          ctx.onChange();
+        },
       });
+
+      // 这一次成功了 —— 重试提示要撤掉，不能留一条"正在重试"挂在消息底下
+      if (msg.retry) {
+        msg.retry = null;
+        ctx.onChange();
+      }
 
       // 累计本步推理耗时（多步时累加），UI 上显示为「已思考 X」
       if (reasonEnd > reasonStart) {
@@ -1096,7 +1225,14 @@ async function liveRun({ session, text, msg, attachments, signal, ctx }) {
         })),
       });
 
-      for (const call of resolved) {
+      // ============ 分三步：占位 → 执行 → 组装 ============
+      //
+      // 拆开是因为"并行"和"顺序"必须解耦：
+      //   · 卡片位置要在执行前按模型给的顺序占好，否则谁先跑完谁先出现
+      //   · 执行可以并行（只读工具之间互不影响）
+      //   · 但回灌给模型的 tool 结果必须严格按原顺序 —— 那是模型自己
+      //     排好的，顺序变了它会看不懂「刚才那个结果对应哪次调用」
+      const items = resolved.map((call) => {
         let args = {};
         let parseError = null;
         try {
@@ -1116,20 +1252,57 @@ async function liveRun({ session, text, msg, attachments, signal, ctx }) {
             ms: 0,
           };
           msg.tools.push(badTool);
-          ctx.onChange();
+          return { call, args, parseError, tool: badTool, res: null };
+        }
+
+        const tool = prepareToolCall(msg, call, args);
+        return { call, args, parseError: null, tool, res: null };
+      });
+      ctx.onChange();
+
+      // 紧挨着的只读调用合成一批并行跑；遇到写操作就切断，
+      // 保证「读 → 写 → 读」的因果顺序不被并行打乱
+      let cursor = 0;
+      while (cursor < items.length) {
+        const head = items[cursor];
+        if (!head.parseError && PARALLEL_SAFE.has(head.call.name)) {
+          let end = cursor;
+          while (
+            end < items.length &&
+            !items[end].parseError &&
+            PARALLEL_SAFE.has(items[end].call.name)
+          ) {
+            end += 1;
+          }
+          if (end - cursor > 1) {
+            await Promise.all(
+              items.slice(cursor, end).map(async (it) => {
+                it.res = await executePreparedTool(it.tool, it.call, it.args, ctx);
+              })
+            );
+            cursor = end;
+            continue;
+          }
+        }
+        if (!head.parseError) {
+          head.res = await executePreparedTool(head.tool, head.call, head.args, ctx);
+        }
+        cursor += 1;
+      }
+
+      for (const it of items) {
+        const call = it.call;
+
+        if (it.parseError) {
           convo.push({
             role: "tool",
             tool_call_id: call.callId,
-            content: badTool.output,
+            content: it.tool.output,
           });
           continue;
         }
 
-        const res = await runToolCall(
-          msg,
-          { id: call.callId, name: call.name, argsRaw: call.args, args },
-          ctx
-        );
+        const res = it.res || { ok: false, output: "工具没有执行", ms: 0 };
         // 失败时补一句「这是中间状态」—— 模型很容易把工具报错读成任务失败，
         // 然后直接收工。这句是给模型的行为纠正，不是给用户的错误说明，
         // 所以放在工具结果里（模型读到的那一侧），不往 UI 上打。

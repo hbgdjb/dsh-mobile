@@ -44,6 +44,9 @@ function emitToPending(raw) {
     );
     err.httpStatus = Number(evt.status) || 0;
     err.body = String(evt.body || "");
+    // 服务端要求的重试间隔。429 之后立刻重试只会更糟，
+    // 有它就按它的来，没有才用页面的指数退避。
+    err.retryAfter = Number(evt.retryAfter) || 0;
     err.native = true;
     item.fail(err, evt);
   }

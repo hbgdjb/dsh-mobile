@@ -1,0 +1,11 @@
+{
+  "name": "dsh-plugin-writing-kit",
+  "version": "1.0.0",
+  "description": "示例：在输入框上方挂一条写作工具条",
+  "main": "index.js",
+  "dsh": {
+    "displayName": "写作套件",
+    "permissions": ["ui.slot"],
+    "surfaces": ["composer.toolbar"]
+  }
+}

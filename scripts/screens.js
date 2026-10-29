@@ -1048,7 +1048,36 @@ function nodePluginsSection() {
         </div>
         ${icon("chevron", "icon--sm")}
       </button>
+      <div class="settings__row">
+        <div class="settings__row-main">
+          <div class="settings__row-title">自动重载</div>
+          <div class="settings__row-sub">${watchSummary(st)}</div>
+        </div>
+        <button class="switch" role="switch" aria-checked="${s.pluginWatch ? "true" : "false"}" aria-label="插件自动重载" data-act="toggle-plugin-watch"></button>
+      </div>
     </div>`;
+}
+
+/**
+ * 自动重载那一行的小字。
+ *
+ * 三种状态必须分开说，否则用户看到开关是开的、
+ * 改代码没反应，就不知道是没监听成还是插件本身坏了：
+ *   · 没开          → 说清它要干什么
+ *   · 开但运行时没连 → 明说"等运行时"
+ *   · 开着且连着     → 报最近一次结果
+ */
+function watchSummary(st) {
+  const s = state.settings;
+  if (!s.pluginWatch) return "改插件文件后自动生效，不用手动点重载";
+  if (!st.channelConnected) return "已开启，等插件运行时连上后开始监听";
+  const w = state.watchStatus;
+  if (!w) return "已开启";
+  if (w.running === false) return "已开启，但监听没起来";
+  const parts = [`已开启 · 已重载 ${w.reloads || 0} 次`];
+  const err = (w.plugins || []).find((p) => p.lastError);
+  if (err) parts.push(`最近失败：${err.id}`);
+  return parts.join(" · ");
 }
 
 function voiceInputSection() {
@@ -1285,6 +1314,8 @@ function settingsHome() {
         </button>`
       ).join("")}
     </div>
+    <!-- 插件界面挂载点：设置首页底部，作为一个独立分区 -->
+    <div class="ui-slot ui-slot--settings" data-ui-slot="settings.section" hidden></div>
     <div style="height:20px"></div>
   </div>`;
 }
@@ -1838,6 +1869,8 @@ export function renderDrawer(search = "") {
     </div>
 
     <div class="drawer__foot">
+      <!-- 插件界面挂载点：抽屉底部，账号 / 设置之上 -->
+      <div class="ui-slot ui-slot--drawer" data-ui-slot="sidebar.footer" hidden></div>
       <div class="drawer__conn">${icon(modelReadyForChat() ? "bolt" : "info", "icon--xs")}
         <span>${modelReadyForChat() ? `已连接 · ${esc(currentModel().label)}` : "未连接模型"}</span>
       </div>

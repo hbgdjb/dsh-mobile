@@ -71,7 +71,7 @@ export const PERMISSIONS = {
  * 导致设置页显示的版本是错的、MCP 握手报出去的也是旧版本。
  * 从 0.37.0 起与 APK 版本保持一致。
  */
-export const APP_VERSION = "0.37.0";
+export const APP_VERSION = "0.53.0";
 
 /**
  * 不再预置任何模型：模型全部由用户在「模型管理」里自行添加。
@@ -632,6 +632,13 @@ const DEFAULT_STATE = () => ({
      * 那件事要用户自己去设置页点。
      */
     nodeEnabled: true,
+    /**
+     * 插件目录自动重载。
+     *
+     * 默认关闭：它会常驻一个目录监听，而且"改一下文件插件就重启"
+     * 不是所有人都想要的。写插件的人自己去设置里打开。
+     */
+    pluginWatch: false,
   },
   sessions: seedSessions(),
   activeSessionId: null,
@@ -653,6 +660,13 @@ const DEFAULT_STATE = () => ({
    * 不落盘 —— 和 nodePlugins 一样是运行时状态。
    */
   nodePluginsDiag: null,
+  /**
+   * 插件目录监听的运行状态（见 android/node/watcher.js 的 status）。
+   *
+   * 不落盘 —— 它是运行时的瞬时状态，落盘只会让下次启动显示
+   * 一个「正在监听」但其实没在监听的假象。
+   */
+  watchStatus: null,
   automations: seedAutomations(),
   runs: seedRuns(),
   stats: { runs: 0, tools: 0, tokens: 0 },
@@ -1082,7 +1096,12 @@ export function save(immediate = false) {
   clearTimeout(saveTimer);
   const write = () => {
     // 1) 轻量状态：不含会话正文
-    const light = { ...state, sessions: state.sessions.map((s) => ({ id: s.id, title: s.title, updatedAt: s.updatedAt })) };
+    const light = {
+      ...state,
+      sessions: state.sessions.map((s) => ({ id: s.id, title: s.title, updatedAt: s.updatedAt })),
+      // 运行时状态不落盘：下次启动时它们一定是过期的
+      watchStatus: undefined,
+    };
     if (!writeJson(LS_KEY, light)) {
       // 轻量部分都写不进去：清诊断历史再试一次（设置与模型必须保住）
       state.diagnostics = { requests: [] };
@@ -1770,6 +1789,12 @@ export function setNodePlugins(list) {
  * 「未找到插件」这句话本身不提供信息：可能是目录不存在、目录空、
  * 文件写到了别处。界面要靠这份快照把差别说出来。
  */
+/** 更新插件目录监听的状态（页面展示用）。 */
+export function setWatchStatus(st) {
+  state.watchStatus = st && typeof st === "object" ? st : null;
+  emit({ type: "node:watch", status: state.watchStatus });
+}
+
 export function setNodePluginsDiag(diag) {
   state.nodePluginsDiag = diag && typeof diag === "object" ? diag : null;
 }

@@ -1307,7 +1307,15 @@ export function toolSchemas() {
   const mcp = state.settings.mode === "minimal" ? [] : mcpToolSchemas();
   const plugins = state.settings.mode === "minimal" ? [] : pluginToolSchemas();
   const nodePlugins = state.settings.mode === "minimal" ? [] : nodeToolSchemas();
-  return [...base, ...mcp, ...plugins, ...nodePlugins];
+  // 按名字排序，而不是按注册顺序。
+  //
+  // 工具表是请求内容的一部分，紧跟 system prompt —— 顺序一变，
+  // 后面整段（包括全部历史）都命不中原生前缀缓存。
+  // 而注册顺序并不可靠：插件热重载、MCP 服务器重连都会重排。
+  // 排序之后，装不装插件只影响「多了哪几个」，不影响「原来的在哪」。
+  return [...base, ...mcp, ...plugins, ...nodePlugins].sort((a, b) =>
+    String(a?.function?.name || "").localeCompare(String(b?.function?.name || ""))
+  );
 }
 
 /* ---------------- 执行闸门 ---------------- */

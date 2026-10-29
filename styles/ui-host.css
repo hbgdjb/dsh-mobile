@@ -1,0 +1,638 @@
+/* ============================================================
+   界面宿主的样式 —— 插件声明的界面在这里有统一的形状
+
+   ============ 为什么插件不能自己写样式 ============
+
+   能写 `style` 就能写 `position: fixed; inset: 0` 盖住整个应用，
+   也能写 `background-image: url(https://…)` 把用户的操作回传给第三方。
+   所以插件只说"这是什么"（text / button / card），
+   长什么样由这份样式表决定，颜色走 data-tone 语义。
+
+   结果是任何插件挂上来的界面，看起来都还是这个应用的一部分。
+   ============================================================ */
+
+/* ---------------- 挂载点 ---------------- */
+
+.ui-slot {
+  display: block;
+}
+
+.ui-slot[hidden] {
+  display: none !important;
+}
+
+/* 输入框上方：与 composer 同宽，留一点呼吸 */
+.ui-slot--composer {
+  margin: 0 var(--gutter) 8px;
+}
+
+/* 对话页浮层：输入框上方的一条。
+   最初写成 absolute 定位，结果和 composer 里的工具条叠在一起 ——
+   两块插件界面互相盖住，文字压成一行两行。
+   改成正常流里的块：谁先谁后一目了然，也不会因为
+   composer 高度变化（多行输入、附件条）而错位。 */
+.ui-slot--overlay {
+  margin: 0 var(--gutter) 8px;
+  z-index: 2;
+}
+
+.ui-slot--overlay .ui-plugin {
+  pointer-events: auto;
+}
+
+.ui-slot--drawer {
+  margin-bottom: 8px;
+}
+
+.ui-slot--settings {
+  margin: 0 0 4px;
+}
+
+/* 一个插件挂上来的一块。多块之间留间距 */
+.ui-slot > .ui-plugin {
+  margin-bottom: 8px;
+}
+
+.ui-slot > .ui-plugin:last-child {
+  margin-bottom: 0;
+}
+
+/* ---------------- 通用节点 ---------------- */
+
+.uih {
+  font-family: var(--font-body);
+  font-size: var(--fs-13);
+  line-height: 1.55;
+  color: var(--text);
+  min-width: 0;
+}
+
+.uih--stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.uih--horizontal {
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: nowrap;
+}
+
+.uih--horizontal[data-wrap="true"] {
+  flex-wrap: wrap;
+}
+
+.uih--horizontal[data-align="center"] {
+  align-items: center;
+}
+
+.uih--horizontal[data-align="start"] {
+  align-items: flex-start;
+}
+
+.uih--horizontal[data-align="end"] {
+  align-items: flex-end;
+}
+
+.uih--horizontal[data-align="between"] {
+  justify-content: space-between;
+}
+
+/* ============ 横排里的收缩规则 ============
+
+   一行放不少东西时，flex 默认会把所有子项一起压扁：
+   按钮文字被截成「润…」，说明文字折成两行。
+
+   规则按"谁更能让"来定：
+     文字  —— 可以缩，缩到只剩省略号
+     按钮  —— 不缩（文字是它的全部意义）
+     开关 / 徽标 —— 不缩
+*/
+.uih--horizontal > .uih--text {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.uih--horizontal > .uih--button,
+.uih--horizontal > .uih--switch,
+.uih--horizontal > .uih__badge,
+.uih--horizontal > .uih--badge {
+  flex: 0 0 auto;
+}
+
+.uih--stack[data-gap="xs"] {
+  gap: 4px;
+}
+
+.uih--stack[data-gap="sm"] {
+  gap: 8px;
+}
+
+.uih--stack[data-gap="md"] {
+  gap: 12px;
+}
+
+.uih--stack[data-gap="lg"] {
+  gap: 18px;
+}
+
+/* ---------------- 文字 ---------------- */
+
+.uih--text[data-size="sm"] {
+  font-size: var(--fs-12);
+}
+
+.uih--text[data-size="lg"] {
+  font-size: var(--fs-15);
+}
+
+.uih--text[data-size="xl"] {
+  font-size: var(--fs-20);
+  font-family: var(--font-display);
+  letter-spacing: -0.01em;
+}
+
+.uih--text[data-mono="true"] {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.uih--text[data-strong="true"] {
+  font-weight: 600;
+}
+
+.uih--text[data-center="true"] {
+  text-align: center;
+}
+
+.uih--text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ---------------- 语义色 ---------------- */
+
+.uih[data-tone="muted"] {
+  color: var(--muted);
+}
+
+.uih[data-tone="strong"] {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.uih[data-tone="accent"] {
+  color: var(--accent-bright);
+}
+
+.uih[data-tone="ok"] {
+  color: var(--ok);
+}
+
+.uih[data-tone="warn"] {
+  color: var(--warn);
+}
+
+.uih[data-tone="danger"] {
+  color: var(--danger);
+}
+
+/* ---------------- 卡片 ---------------- */
+
+.uih--card {
+  padding: 12px 13px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+}
+
+.uih__title {
+  font-size: var(--fs-13);
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 2px;
+}
+
+.uih__sub {
+  font-size: var(--fs-12);
+  color: var(--muted);
+}
+
+.uih__body {
+  margin-top: 8px;
+}
+
+/* ---------------- 列表 ---------------- */
+
+.uih--list {
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  overflow: hidden;
+}
+
+.uih--list > * {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+
+.uih--list > *:last-child {
+  border-bottom: 0;
+}
+
+/* ---------------- 徽标 ---------------- */
+
+.uih__badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border-radius: var(--r-full);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  font-size: var(--fs-11);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+
+.uih__badge[data-tone="accent"] {
+  color: var(--accent-bright);
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+
+.uih__badge[data-tone="ok"] {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 32%, transparent);
+  background: var(--ok-soft);
+}
+
+.uih__badge[data-tone="warn"] {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 32%, transparent);
+  background: var(--warn-soft);
+}
+
+.uih__badge[data-tone="danger"] {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 32%, transparent);
+  background: var(--danger-soft);
+}
+
+/* ---------------- 按钮 ---------------- */
+
+.uih__btn {
+  appearance: none;
+  border: 1px solid var(--line-strong);
+  background: var(--surface-2);
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: var(--fs-13);
+  font-weight: 500;
+  padding: 7px 13px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition: background var(--dur-1) var(--ease-out), border-color var(--dur-1) var(--ease-out),
+    transform var(--dur-1) var(--ease-out);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.uih__btn:active {
+  transform: scale(0.97);
+}
+
+.uih__btn[data-grow="true"] {
+  flex: 1;
+  min-width: 0;
+}
+
+.uih__btn[data-tone="primary"] {
+  background: var(--accent);
+  border-color: transparent;
+  color: #fff;
+}
+
+.uih__btn[data-tone="ghost"] {
+  background: transparent;
+  border-color: var(--line);
+  color: var(--text-soft);
+}
+
+.uih__btn[data-tone="danger"] {
+  background: var(--danger-soft);
+  border-color: color-mix(in srgb, var(--danger) 34%, transparent);
+  color: var(--danger);
+}
+
+.uih__btn:disabled {
+  opacity: 0.42;
+  cursor: default;
+  transform: none;
+}
+
+/* ---------------- 输入 ---------------- */
+
+.uih__label {
+  display: block;
+  font-size: var(--fs-11);
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.uih__field {
+  width: 100%;
+  box-sizing: border-box;
+  appearance: none;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  padding: 8px 10px;
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: var(--fs-13);
+  resize: vertical;
+}
+
+.uih__field:focus {
+  outline: none;
+  border-color: var(--line-accent);
+}
+
+.uih__field::placeholder {
+  color: var(--dim);
+}
+
+/* 原生 select 的箭头被 appearance:none 去掉了，得自己画回来 */
+.uih__field--select {
+  padding-right: 30px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%238b94a6' stroke-width='2' stroke-linecap='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+
+/* ---------------- 开关 ---------------- */
+
+.uih__switch {
+  appearance: none;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: transparent;
+  border: 0;
+  padding: 2px 0;
+  color: var(--text);
+  font-family: var(--font-body);
+  font-size: var(--fs-13);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.uih__switch-label {
+  min-width: 0;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.uih__switch-track {
+  flex: none;
+  width: 38px;
+  height: 22px;
+  border-radius: var(--r-full);
+  background: var(--surface-3);
+  border: 1px solid var(--line);
+  position: relative;
+  transition: background var(--dur-2) var(--ease-out);
+}
+
+.uih__switch-track::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: transform var(--dur-2) var(--ease-spring), background var(--dur-2) var(--ease-out);
+}
+
+.uih__switch.is-on .uih__switch-track {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+}
+
+.uih__switch.is-on .uih__switch-track::after {
+  transform: translateX(16px);
+  background: var(--accent-bright);
+}
+
+/* ---------------- 进度 ---------------- */
+
+.uih__track {
+  height: 4px;
+  border-radius: var(--r-full);
+  background: var(--surface-3);
+  overflow: hidden;
+}
+
+.uih__bar {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width var(--dur-3) var(--ease-out);
+}
+
+/* ---------------- 图片 ---------------- */
+
+.uih__img {
+  display: block;
+  max-width: 100%;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+  object-fit: cover;
+}
+
+.uih--image.is-broken {
+  display: none;
+}
+
+/* ---------------- 分隔与留白 ---------------- */
+
+.uih--divider {
+  height: 1px;
+  background: var(--line);
+  margin: 2px 0;
+}
+
+.uih--spacer[data-size="xs"] {
+  height: 2px;
+}
+
+.uih--spacer[data-size="sm"] {
+  height: 6px;
+}
+
+.uih--spacer[data-size="md"] {
+  height: 12px;
+}
+
+/* ---------------- 表格 ---------------- */
+
+.uih__table-wrap {
+  /* 手机宽度放不下多列表格。横向滚动比把列压窄好用得多 ——
+     压窄之后每格只剩两三个字，等于没显示。 */
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface);
+}
+
+.uih__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-12);
+}
+
+.uih__table th {
+  padding: 8px 10px;
+  text-align: left;
+  font-weight: 500;
+  color: var(--muted);
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+  font-size: var(--fs-11);
+  letter-spacing: 0.03em;
+}
+
+.uih__table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text-soft);
+  vertical-align: top;
+  max-width: 220px;
+  word-break: break-word;
+}
+
+.uih__table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+/* 数字列右对齐 —— 不对齐的数字没法竖着比 */
+.uih__table th[data-align="right"],
+.uih__table td[data-align="right"] {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.uih__table th[data-align="center"],
+.uih__table td[data-align="center"] {
+  text-align: center;
+}
+
+.uih__table td[data-tone="ok"] {
+  color: var(--ok);
+}
+
+.uih__table td[data-tone="warn"] {
+  color: var(--warn);
+}
+
+.uih__table td[data-tone="danger"] {
+  color: var(--danger);
+}
+
+.uih__table td[data-tone="muted"] {
+  color: var(--muted);
+}
+
+.uih__table td[data-tone="accent"] {
+  color: var(--accent-bright);
+}
+
+.uih__table-empty {
+  padding: 14px 10px;
+  text-align: center;
+  font-size: var(--fs-12);
+  color: var(--dim);
+}
+
+/* ---------------- 分页签 ---------------- */
+
+.uih--tabs {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.uih__tabs-bar {
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+}
+
+.uih__tab {
+  flex: 1;
+  min-width: 0;
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--font-body);
+  font-size: var(--fs-12);
+  padding: 6px 8px;
+  border-radius: var(--r-xs);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  -webkit-tap-highlight-color: transparent;
+  transition: background var(--dur-1) var(--ease-out), color var(--dur-1) var(--ease-out);
+}
+
+.uih__tab.is-on {
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow-1);
+}
+
+.uih__panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+}
+
+.uih__panel[hidden] {
+  display: none !important;
+}
+
+/* ---------------- 不支持的类型 ---------------- */
+
+.uih--unknown {
+  font-size: var(--fs-12);
+  color: var(--dim);
+  font-family: var(--font-mono);
+  padding: 4px 6px;
+  border: 1px dashed var(--line);
+  border-radius: var(--r-xs);
+}

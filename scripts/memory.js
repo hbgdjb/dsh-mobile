@@ -323,7 +323,7 @@ export const MEMORY_LIMITS = {
  * @param {string} base 基础 system prompt
  * @param {{ maxCorrections?: number, maxEntries?: number, maxTokens?: number }} [options]
  */
-export function buildPromptBlock(query, base = "", options = {}) {
+export function buildMemoryBlock(query, options = {}) {
   const lim = { ...MEMORY_LIMITS, ...(options || {}) };
   const entries = retrieve(query, lim.maxEntries);
   // 纠正类永远带上：用户明确纠正过的事，不该因为本轮没提到就被忘掉
@@ -351,18 +351,28 @@ export function buildPromptBlock(query, base = "", options = {}) {
     used += cost;
   }
   const list = kept.length ? formatEntries(kept) : "- （暂无相关记录）";
-  return [
-    base,
-    "",
-    // 围栏 + 显式声明：模型看到裸的记忆条目时，
-    // 分不清这是「事实记录」还是「让我执行的任务」。
-    // 围栏把两者切开，声明把意图说死。
-    wrapAsData(list),
-    "",
-    "【回答规则】",
-    RULES,
-  ]
-    .filter((x) => x !== undefined && x !== null)
+
+  // 围栏 + 显式声明：模型看到裸的记忆条目时，
+  // 分不清这是「事实记录」还是「让我执行的任务」。
+  // 围栏把两者切开，声明把意图说死。
+  return wrapAsData(list);
+}
+
+/**
+ * 记忆块 + 回答规则（旧接口）。
+ *
+ * ============ 新代码请用 buildMemoryBlock ============
+ *
+ * 规则是**固定文本**，数据是**每轮都变**的。把两者黏在一起，
+ * 等于让固定部分跟着数据一起失效 —— 见 buildMemoryBlock 上方的说明。
+ *
+ * 这个函数保留，是为了不破坏既有调用方；顺序改成了「规则在前、数据在后」，
+ * 与新的拼接方式一致，行为不突变。
+ */
+export function buildPromptBlock(query, base = "", options = {}) {
+  const block = buildMemoryBlock(query, options);
+  return [base, "", "【回答规则】", RULES, "", block]
+    .filter((x) => x !== undefined && x !== null && x !== "")
     .join("\n");
 }
 

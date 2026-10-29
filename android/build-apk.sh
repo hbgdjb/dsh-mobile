@@ -11,6 +11,25 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$ROOT/android/.build"
 MIRROR="${MIRROR:-1}"
 
+# ============ 版本号只改这里 ============
+#
+# 以前版本号散在四个地方：build.gradle 的 versionName / versionCode、
+# 脚本末尾的 VERSION、以及 scripts/store.js 里的 APP_VERSION。
+# 结果 store.js 那个从 0.37.0 之后就没再动过 ——
+# 用户装的是 0.49.0，「关于」页里写着 v0.37.0。
+#
+# 现在这里说了算，并且校验 store.js 一致：
+# 不一致直接停下，而不是构建出一个版本号对不上的包。
+APP_VERSION="0.53.0"
+APP_CODE=123
+
+SRC_VER=$(grep -o 'APP_VERSION = "[^"]*"' "$ROOT/scripts/store.js" | head -1 | sed 's/.*"\(.*\)"/\1/')
+if [ "$SRC_VER" != "$APP_VERSION" ]; then
+  echo "版本号不一致：scripts/store.js 是 $SRC_VER，构建脚本是 $APP_VERSION"
+  echo "两处要一起改 —— 前者显示在「关于」页，后者决定安装包版本。"
+  exit 1
+fi
+
 command -v node >/dev/null || { echo "缺少 Node.js（>=18）"; exit 1; }
 command -v java >/dev/null || { echo "缺少 JDK（>=17）"; exit 1; }
 if [ -z "${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}" ]; then
@@ -40,8 +59,8 @@ npx cap sync android
 
 cd android
 echo "sdk.dir=$SDK" > local.properties
-sed -i 's/versionName "1.0"/versionName "0.49.0"/' app/build.gradle || true
-sed -i 's/versionCode 1/versionCode 119/' app/build.gradle || true
+sed -i "s/versionName \"1.0\"/versionName \"$APP_VERSION\"/" app/build.gradle || true
+sed -i "s/versionCode 1/versionCode $APP_CODE/" app/build.gradle || true
 
 echo "→ 注入原生 HTTP 桥"
 JAVA_DIR="app/src/main/java/ai/deepseek/dsh/mobile"
@@ -78,12 +97,13 @@ cp "$ROOT/android/node/main.js" "$ROOT/android/node/channel.js" \
    "$ROOT/android/node/plugin-host.js" "$ROOT/android/node/llm-service.js" \
    "$ROOT/android/node/llm-chat.js" \
    "$ROOT/android/node/plugin-reload.js" "$ROOT/android/node/hmr-service.js" \
+   "$ROOT/android/node/ui-service.js" "$ROOT/android/node/watcher.js" \
    "$NODE_ASSETS/"
 # VERSION 是"脚本已解压"的标记，必须随 APK 版本变化 ——
 # 否则升级 APK 后新代码配旧的解压结果，出现诡异的不一致。
-# 用 versionCode（119），不是版本名（0.49.0）：它是整数、单调递增、
+# 用 versionCode（$APP_CODE），不是版本名：它是整数、单调递增、
 # 且和 PackageManager 拿到的值一致。
-echo "119" > "$NODE_ASSETS/VERSION"
+echo "$APP_CODE" > "$NODE_ASSETS/VERSION"
 
 echo "→ 复制 AIDL（Shizuku UserService 接口）"
 # AIDL 必须放在 app/src/main/aidl 下，Gradle 才会自动编译成 IShizukuExec。
@@ -473,7 +493,7 @@ echo "→ Gradle 构建 Debug APK"
 ./gradlew assembleDebug --no-daemon
 
 APK="$WORK/android/app/build/outputs/apk/debug/app-debug.apk"
-VERSION="0.49.0"
+VERSION="$APP_VERSION"
 if [ -f "$APK" ]; then
   mkdir -p "$ROOT/android/out"
   cp "$APK" "$ROOT/android/out/dsh-mobile-$VERSION-debug.apk"

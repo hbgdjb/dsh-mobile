@@ -118,6 +118,10 @@ function listPlugins(workspace) {
             kind: 'package',
             inject: Array.isArray(pkg.dsh && pkg.dsh.inject) ? pkg.dsh.inject : null,
             declaredInject: pkg.inject || null,
+            // 清单里声明的权限。界面宿主靠它决定「这个插件能不能往页面上挂东西」，
+            // 没声明的插件调用 ctx.slots.mount 会被告知原因，而不是悄悄什么都不显示。
+            permissions: Array.isArray(pkg.dsh && pkg.dsh.permissions) ? pkg.dsh.permissions : [],
+            surfaces: Array.isArray(pkg.dsh && pkg.dsh.surfaces) ? pkg.dsh.surfaces : [],
           });
           continue;
         }
@@ -139,6 +143,10 @@ function listPlugins(workspace) {
           kind: 'script',
           inject: null,
           declaredInject: null,
+          // 单文件插件没有 package.json，也就没有清单可声明权限。
+          // 界面挂载要按清单放行，所以这类插件只写工具、不挂界面。
+          permissions: [],
+          surfaces: [],
         });
         break;
       }
@@ -244,6 +252,19 @@ function createHost(opts) {
   const failures = new Map();
   /** 工具表：name → { name, description, parameters, pluginId } */
   const tools = new Map();
+  /**
+   * 扫描到的清单：id → meta。
+   *
+   * ============ 为什么不能只查 loaded ============
+   *
+   * `loaded` 是「apply 成功之后」才写进去的。而插件申请界面挂载
+   * 恰恰是在 apply **期间** —— 那一刻它自己还不在 loaded 里，
+   * 于是查不到清单、权限为空，挂载被拒，插件直接加载失败。
+   *
+   * 报错还很有迷惑性：「未声明 ui.slot」—— 明明声明了。
+   * 所以清单要在加载之前就先记一份。
+   */
+  const metaById = new Map();
 
   /** 根上下文：用来拿「现在是谁在 apply」。 */
   const rootCtx = container && container.root ? container.root : null;
@@ -359,6 +380,11 @@ function createHost(opts) {
     const failed = [];
     let count = 0;
 
+    // 先把清单记下来，再逐个 apply —— 顺序不能反。
+    // 插件在 apply 里申请界面挂载时要查自己的权限，
+    // 那时它还没进 loaded，只能靠这份预扫的清单。
+    for (const meta of metas) metaById.set(meta.id, meta);
+
     for (const meta of metas) {
       try {
         const mod = await loadModule(meta.entry);
@@ -442,6 +468,29 @@ function createHost(opts) {
     loaded.clear();
     tools.clear();
     onTools([]);
+  }
+
+  /**
+   * 卸载单个插件。
+   *
+   * 自动重载用它在插件目录被删掉时收尾 ——
+   * 目录都删了，插件不该继续留在内存里提供工具。
+   *
+   * @returns {{ok:boolean, error?:string}}
+   */
+  function unloadOne(id) {
+    const key = String(id || '');
+    const rt = loaded.get(key);
+    if (!rt) return { ok: false, error: `没有加载这个插件：${key}` };
+    try {
+      if (typeof rt.disposer === 'function') rt.disposer();
+    } catch (e) {
+      log('warn', `卸载 ${key} 时出错：${e && e.message}`);
+    }
+    loaded.delete(key);
+    dropToolsOf(key);
+    onTools(listTools());
+    return { ok: true };
   }
 
   /** 当前工具表（不含 handler）。 */
@@ -654,8 +703,20 @@ function callerId() {
     const run = reloadChain.then(async () => {
       const rt = loaded.get(id);
       if (!rt) {
-        // 没在跑 —— 那就是首次加载
-        const r = await loadAll();
+        // 没在跑 —— 那就是首次加载。
+        //
+        // ============ 只能加载这一个 ============
+        //
+        // 以前这里调的是 `loadAll()`（不带参数 = 全部）。
+        // 结果：想加载一个插件，把**已经跑起来的插件全部又 apply 了一遍** ——
+        // 同一个插件两个实例，宿主服务注册撞车（settings.register 抛
+        // 「命名空间已注册」），甚至界面叠两份。
+        const metas = listPlugins(workspace);
+        const meta = metas.find((m) => m.id === id);
+        if (!meta) {
+          return { ok: false, error: `找不到插件：${id}`, restored: false, mode: 'fresh-load' };
+        }
+        const r = await loadAll([meta]);
         const ok = !r.failed.some((f) => f.id === id);
         return {
           ok,
@@ -688,7 +749,8 @@ function callerId() {
     for (const meta of metas) {
       const rt = loaded.get(meta.id);
       if (!rt) {
-        const r = await loadAll();
+        // 同上：只加载这一个，不要顺手把别人再 apply 一遍
+        const r = await loadAll([meta]);
         const f = r.failed.find((x) => x.id === meta.id);
         results.push({
           id: meta.id,
@@ -711,6 +773,7 @@ function callerId() {
     unloadAll,
     listTools,
     callTool,
+    unloadOne,
     listPlugins,
     toolsService,
     reloadOne,
@@ -718,6 +781,28 @@ function callerId() {
     dropToolsOf,
     /** 当前工具调用属于哪个插件（不在工具调用里就是空串）。 */
     callerId,
+    /**
+     * 插件的权限清单与声明的挂载点。
+     *
+     * 界面宿主用它做两件事：
+     *   1. 没声明 `ui.slot` 就不给挂界面（和工具注册同一套「按清单放行」）
+     *   2. 声明了 surfaces 但挂了别的挂载点，能给出准确的报错
+     *
+     * @param {string} id 插件 id
+     * @returns {{permissions:string[], surfaces:string[]}}
+     */
+    manifestOf(id) {
+      const key = String(id || '');
+      const rt = loaded.get(key);
+      // apply 期间插件还不在 loaded 里 —— 从预扫的清单里补
+      const meta = (rt && rt.meta) || metaById.get(key) || null;
+      if (!meta) return null;
+      return {
+        permissions: Array.isArray(meta.permissions) ? meta.permissions : [],
+        surfaces: Array.isArray(meta.surfaces) ? meta.surfaces : [],
+        name: meta.name || meta.id || key,
+      };
+    },
     /** 当前运行时是否支持完整的 ESM 热重载。 */
     supportsEsmReload: reload.supportsEsmReload,
     loadedCount: () => loaded.size,

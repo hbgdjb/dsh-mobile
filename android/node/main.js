@@ -39,6 +39,8 @@ const { createServices } = require('./ctx-services');
 const { createHostServices } = require('./host-services');
 const { createHost, diagnose } = require('./plugin-host');
 const { createHmrService } = require('./hmr-service');
+const { createUiService } = require('./ui-service');
+const { createWatcher } = require('./watcher');
 const { createLlmService } = require('./llm-service');
 const { runAdapterStream } = require('./llm-chat');
 
@@ -181,6 +183,12 @@ function makeChunkSink(callId) {
 
 /** 插件工具注册服务依赖 host，先建 host 再把服务塞回容器。 */
 let host = null;
+
+/** 界面宿主服务。host 建好之后才有。 */
+let uiService = null;
+
+/** 插件目录监听（自动重载）。默认关闭，由页面按设置打开。 */
+let watcher = null;
 const services = createServices({
   workspace,
   log: (level, scope, message) => log(level, scope, message),
@@ -288,6 +296,75 @@ const handlers = {
     if (!name) throw new Error('缺少工具名');
     const args = (params && params.args) || {};
     return await host.callTool(name, args);
+  },
+
+  /* ---------------- 界面宿主 ---------------- */
+
+  /**
+   * Java 调用：插件界面上的交互。
+   *
+   * 页面点了一个插件按钮 → 回调插件在 Node 里注册的 handler →
+   * handler 可以返回一棵新树（局部更新）。
+   *
+   * 这条路必须能失败得清楚：界面已经卸载了、插件没注册回调、
+   * 回调抛错 —— 三种原因要分开报，否则用户只看到「点不动」。
+   */
+  'ui.action': async (params) => {
+    if (!uiService) throw new Error('界面宿主还没准备好');
+    return await uiService.handleAction(params || {});
+  },
+
+  /**
+   * Java 调用：拉全量界面快照。
+   *
+   * 页面重建（切后台被杀、WebView 重载）之后，Node 里的插件还活着、
+   * 挂载也还在，但页面是新的。开场拉一次，界面就回来了 ——
+   * 不用让插件重新 apply 一遍。
+   */
+  'ui.snapshot': async () => {
+    if (!uiService) return { mounts: [] };
+    return { mounts: uiService.snapshot() };
+  },
+
+  /** Java 调用：界面挂载清单（不含树，供诊断页显示）。 */
+  'ui.list': async () => {
+    if (!uiService) return { mounts: [], slots: [] };
+    return { mounts: uiService.list(), slots: uiService.slots };
+  },
+
+  /* ---------------- 自动重载 ---------------- */
+
+  /**
+   * Java 调用：开关插件目录监听。
+   *
+   * 页面在通道连上后按设置调一次 `{on:true}`；
+   * 用户关掉开关时调 `{on:false}`。
+   *
+   * 返回的是**真实结果**：监听开不起来（老内核 / 老 Node 不支持
+   * recursive watch）时返回 ok:false 与原因，不假装成功 ——
+   * 否则用户改了半天代码，以为在自动重载，其实一次都没跑。
+   */
+  'plugins.watch': async (params) => {
+    if (!host) throw new Error('插件宿主还没准备好');
+    const on = params && params.on !== false;
+    if (!watcher) {
+      watcher = createWatcher({
+        workspace,
+        host,
+        log: (level, scope, message) => log(level, scope, message),
+        send: (event, data) => {
+          if (channel) channel.send({ event, data });
+        },
+      });
+    }
+    const r = on ? watcher.start() : watcher.stop();
+    return { ...r, status: watcher.status() };
+  },
+
+  /** Java 调用：监听的运行状态（页面上显示「正在监听」或失败原因）。 */
+  'plugins.watchstatus': async () => {
+    if (!watcher) return { running: false, dir: '', plugins: [] };
+    return watcher.status();
   },
 
   /**
@@ -528,7 +605,23 @@ if (port > 0) {
       container.provide('sessionQuery', hostServices.sessionQuery);
 
       // 其余宿主服务装进容器
-      container.provide('slots', services.slots);
+      // ============ 界面宿主 ============
+      //
+      // 这一项以前是 ctx-services 里那个只记录的占位实现：
+      // register() 记一笔，界面上永远什么都不出现。
+      // 现在换成真渲染 —— 插件 mount 一棵界面树，页面用原生 DOM 画出来。
+      //
+      // 必须在 host 建好之后创建：要读清单里的 permissions 才能决定放不放行。
+      uiService = createUiService({
+        ctx: container.root,
+        host,
+        log: (level, scope, message) => log(level, scope, message),
+        send: (event, data) => {
+          if (channel) channel.send({ event, data });
+        },
+      });
+      container.provide('slots', uiService);
+
       container.provide('sessions', services.sessions);
       container.provide('modelDirectories', services.modelDirectories);
       container.provide('remote', services.remote);

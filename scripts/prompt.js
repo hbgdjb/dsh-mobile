@@ -64,6 +64,7 @@ export const PROMPT_TIERS = {
  * · 设备时间：砍掉只省十几个 token，不值得 → 最后砍
  */
 export const PROMPT_CUT_ORDER = {
+  "memory-rules": 89,
   workspace: 10,
   library: 11,
   ui: 12,
@@ -84,8 +85,22 @@ export const PROMPT_CUT_ORDER = {
  */
 export const PROMPT_NEVER_CUT = new Set(["mcp"]);
 
-/** system prompt 的软预算（token）。超了就按 PROMPT_CUT_ORDER 降级。 */
-export const PROMPT_BUDGET = 640;
+/**
+ * system prompt 的软预算（token）。超了就按 PROMPT_CUT_ORDER 降级。
+ *
+ * ============ 为什么从 640 提到 1100 ============
+ *
+ * 「记忆使用规则」（约 500 字）以前是拼在 system 之外的 —— 也就是说
+ * 它一直存在，只是不参与这层预算。把它搬进固定段之后，如果预算不动，
+ * 它会把「当前模式」「插件列表」这些段挤掉（实测就是这样）。
+ *
+ * 结果不是省 token，而是**拿掉了有用的信息**：模型不知道当前是标准
+ * 还是极简模式，也不知道有哪些插件。
+ *
+ * 所以预算按实际体积重新给：固定段（含规则）约 800，留给地图/插件
+ * 还有 300。总量和改动前基本一致，只是现在它们在一个篮子里算账。
+ */
+export const PROMPT_BUDGET = 1100;
 
 /**
  * 低于这个体量的段落不值得砍（砍了也省不下几个 token）。
@@ -301,6 +316,23 @@ export function buildPromptSections(ctx = {}) {
     tier: PROMPT_TIERS.core,
     text: ["【行为准则】", ...BEHAVIOR_RULES].join("\n"),
   });
+
+  // ---- 记忆使用规则（固定文本） ----
+  //
+  // 必须排在 system 的**前部**，不能跟在记忆数据后面。
+  //
+  // 原因只对带前缀缓存的端点有意义（DeepSeek 就是）：缓存按
+  // 从头开始的连续相同 token 命中，记忆数据每轮都变 —— 规则要是
+  // 写在数据后面，这段固定文本就永远命不中，每轮白付一次 prefill。
+  if (ctx.memoryRules) {
+    sections.push({
+      id: "memory-rules",
+      // 不进 core：core 的语义是「永不裁剪」，而这条规则在极端超预算时
+      // 是可以让步的（89 只比设备时间早）—— 但它仍然排在所有易变内容之前。
+      tier: PROMPT_TIERS.state,
+      text: `【回答规则】\n${ctx.memoryRules}`,
+    });
+  }
 
   // ---- tier 1：状态层。用户改设置才变。 ----
   sections.push({

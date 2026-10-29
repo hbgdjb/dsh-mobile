@@ -18,6 +18,9 @@ import java.nio.charset.StandardCharsets;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 /**
  * DSH 原生 HTTP 桥。
@@ -84,14 +87,92 @@ public class DshHttpBridge {
         }
     }
 
+    /**
+     * 一次请求的运行时状态。看门狗靠它判断"是不是卡住了"。
+     */
+    private static final class Req {
+        final HttpURLConnection conn;
+        final long startAt;
+        final long firstByteMs;
+        final long idleMs;
+        volatile long lastAt;
+        volatile boolean firstByte;
+        /** 被看门狗掐断时写在这里，异常分支据此给出人话。 */
+        volatile String timeoutReason = "";
+
+        Req(HttpURLConnection conn, long firstByteMs, long idleMs) {
+            this.conn = conn;
+            this.startAt = System.currentTimeMillis();
+            this.lastAt = this.startAt;
+            this.firstByteMs = firstByteMs;
+            this.idleMs = idleMs;
+        }
+    }
+
+    private static final Map<String, Req> META = new ConcurrentHashMap<>();
+
+    /**
+     * 卡死检测。
+     *
+     * ============ 为什么需要它 ============
+     *
+     * HttpURLConnection 只有一个读超时，没法分别表达
+     * 「多久没收到第一个字节」和「流中间停了多久」。
+     *
+     * 而这两件事的合理阈值差了两个数量级：首字节超过 45 秒基本就是
+     * 网关卡住了（等下去也没用），但一个长回答中间停 30 秒可能是
+     * 模型在思考，不该掐。
+     *
+     * 所以另起一个线程看着：谁超了就 disconnect，让阻塞的 read 抛异常。
+     */
+    private static final ScheduledExecutorService WATCHDOG =
+            Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "dsh-http-watchdog");
+                t.setDaemon(true);
+                return t;
+            });
+
+    static {
+        WATCHDOG.scheduleAtFixedRate(() -> {
+            long now = System.currentTimeMillis();
+            for (Map.Entry<String, Req> e : META.entrySet()) {
+                Req r = e.getValue();
+                try {
+                    if (!r.firstByte && now - r.startAt > r.firstByteMs) {
+                        r.timeoutReason = "等待响应超时：" + (r.firstByteMs / 1000) + " 秒内没有收到任何数据";
+                        r.conn.disconnect();
+                    } else if (r.firstByte && now - r.lastAt > r.idleMs) {
+                        r.timeoutReason = "连接空闲超过 " + (r.idleMs / 1000) + " 秒，已中断";
+                        r.conn.disconnect();
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+        }, 1, 1, TimeUnit.SECONDS);
+    }
+
+    /** 首字节超时：连上了但服务端一直不吐字。 */
+    private static final long FIRST_BYTE_MS = 45_000L;
+
+    /** 流式空闲超时：两块数据之间最多等这么久。 */
+    private static final long STREAM_IDLE_MS = 120_000L;
+
+    /** 连接超时：弱网下宁可快点失败去重试，也不要干等。 */
+    private static final int CONNECT_TIMEOUT_MS = 8000;
+
     private void run(String id, String url, String headersJson, String bodyJson, int timeoutSec, String method) {
         HttpURLConnection conn = null;
+        Req meta = null;
         boolean hasBody = !"GET".equals(method);
+        // 读完流之后不能 disconnect —— 见 finally 里的说明
+        boolean reusable = false;
         try {
             conn = (HttpURLConnection) new URL(url).openConnection();
             conn.setRequestMethod(method);
-            conn.setConnectTimeout(20000);
-            conn.setReadTimeout(Math.max(15, timeoutSec) * 1000);
+            conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
+            // 读超时给一个足够大的上限，真正的卡死判定交给看门狗：
+            // 它区分"首字节"和"流中途停顿"，比一个笼统的读超时准得多。
+            conn.setReadTimeout((int) Math.max(15, timeoutSec) * 1000);
             // doOutput 只能在有请求体时才开。
             // HttpURLConnection.setDoOutput(true) 会把方法从 GET 悄悄改成 POST
             // （JDK 实现里就是这么干的），而「拉取插件清单」必须是真的 GET。
@@ -100,6 +181,9 @@ public class DshHttpBridge {
             conn.setUseCaches(false);
             conn.setRequestProperty("Accept", "text/event-stream, application/json");
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            // 明确要求复用连接。默认就是 keep-alive，但显式写出来
+            // 免得中间经过的代理按 http/1.0 的默认值把连接关掉。
+            conn.setRequestProperty("Connection", "keep-alive");
 
             JSONObject headers = new JSONObject(headersJson == null ? "{}" : headersJson);
             for (Iterator<String> it = headers.keys(); it.hasNext(); ) {
@@ -109,6 +193,8 @@ public class DshHttpBridge {
             }
 
             active.put(id, conn);
+            meta = new Req(conn, FIRST_BYTE_MS, STREAM_IDLE_MS);
+            META.put(id, meta);
 
             if (hasBody) {
                 byte[] payload = (bodyJson == null ? "{}" : bodyJson).getBytes(StandardCharsets.UTF_8);
@@ -125,7 +211,7 @@ public class DshHttpBridge {
             if (status < 200 || status >= 300) {
                 String body = readAll(conn.getErrorStream());
                 if (body.isEmpty()) body = readAll(conn.getInputStream());
-                emitError(id, status, "HTTP " + status, body);
+                emitError(id, status, "HTTP " + status, body, retryAfterOf(conn));
                 return;
             }
 
@@ -135,20 +221,45 @@ public class DshHttpBridge {
                 int n;
                 while ((n = reader.read(buffer)) >= 0) {
                     if (!active.containsKey(id)) return; // 已被 abort
-                    if (n > 0) emitChunk(id, new String(buffer, 0, n));
+                    if (n > 0) {
+                        if (meta != null) {
+                            meta.firstByte = true;
+                            meta.lastAt = System.currentTimeMillis();
+                        }
+                        emitChunk(id, new String(buffer, 0, n));
+                    }
                 }
             }
             active.remove(id);
+            META.remove(id);
+            // ============ 关键：正常结束不要 disconnect ============
+            //
+            // InputStream 已经在 try-with-resources 里关掉了，
+            // 连接这时会**自动归还连接池**，下一个请求可以直接复用
+            // （省掉 TCP + TLS 握手，弱网下一次能省几百毫秒到一秒）。
+            //
+            // 调了 disconnect() 就等于通知底层"这条连接不要了"，
+            // 池子会把它关掉 —— 于是每个请求、每一轮工具调用都要重新握手。
+            reusable = true;
             emitEnd(id);
         } catch (Exception err) {
             boolean aborted = !active.containsKey(id);
+            String reason = meta != null ? meta.timeoutReason : "";
             active.remove(id);
+            META.remove(id);
             if (!aborted) {
-                emitError(id, 0, err.getClass().getSimpleName() + ": " + String.valueOf(err.getMessage()), "");
+                if (!reason.isEmpty()) {
+                    // 看门狗掐断的：库里抛的是 SocketException，对用户没有意义，
+                    // 换成他真正需要知道的那句
+                    emitError(id, 0, reason, "", 0);
+                } else {
+                    emitError(id, 0, err.getClass().getSimpleName() + ": " + String.valueOf(err.getMessage()), "", 0);
+                }
             }
         } finally {
             active.remove(id);
-            if (conn != null) {
+            META.remove(id);
+            if (conn != null && !reusable) {
                 try {
                     conn.disconnect();
                 } catch (Exception ignored) {
@@ -157,15 +268,28 @@ public class DshHttpBridge {
         }
     }
 
+    /** 服务端要求的重试间隔（秒）。没有就是 0。 */
+    private long retryAfterOf(HttpURLConnection conn) {
+        try {
+            String v = conn.getHeaderField("Retry-After");
+            if (v == null) return 0;
+            return Math.max(0, Math.min(600, Long.parseLong(v.trim())));
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
     /** 单次下载的上限。Base64 会膨胀 4/3，再大就可能在低端机上 OOM。 */
     private static final int MAX_BINARY = 24 * 1024 * 1024;
 
     private void runBinary(String id, String url, int timeoutSec) {
         HttpURLConnection conn = null;
+        // 同 run()：读完就归还连接池，不要主动断
+        boolean reusable = false;
         try {
             conn = (HttpURLConnection) new URL(url).openConnection();
             conn.setRequestMethod("GET");
-            conn.setConnectTimeout(20000);
+            conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
             conn.setReadTimeout(Math.max(15, timeoutSec) * 1000);
             conn.setInstanceFollowRedirects(true);
             conn.setUseCaches(false);
@@ -198,6 +322,7 @@ public class DshHttpBridge {
             }
 
             active.remove(id);
+            reusable = true;
             String b64 = android.util.Base64.encodeToString(buf.toByteArray(), android.util.Base64.NO_WRAP);
             emitBytes(id, status, conn.getContentType(), b64);
         } catch (Exception err) {
@@ -208,7 +333,7 @@ public class DshHttpBridge {
             }
         } finally {
             active.remove(id);
-            if (conn != null) {
+            if (conn != null && !reusable) {
                 try {
                     conn.disconnect();
                 } catch (Exception ignored) {
@@ -280,6 +405,14 @@ public class DshHttpBridge {
     }
 
     private void emitError(String id, int status, String message, String body) {
+        emitError(id, status, message, body, 0);
+    }
+
+    /**
+     * @param retryAfter 服务端要求的重试间隔（秒）。页面据此决定等多久，
+     *                   比它自己猜的指数退避更准 —— 429 之后立刻重试只会更糟。
+     */
+    private void emitError(String id, int status, String message, String body, long retryAfter) {
         try {
             JSONObject obj = new JSONObject();
             obj.put("id", id);
@@ -287,6 +420,7 @@ public class DshHttpBridge {
             obj.put("status", status);
             obj.put("message", message == null ? "请求失败" : message);
             obj.put("body", body == null ? "" : body);
+            if (retryAfter > 0) obj.put("retryAfter", retryAfter);
             eval(obj.toString());
         } catch (Exception ignored) {
         }

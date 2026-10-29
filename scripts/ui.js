@@ -16,6 +16,7 @@ import {
   setSettings,
   setNodePlugins,
   setNodePluginsDiag,
+  setWatchStatus,
   togglePlugin,
   installPlugin,
   toggleAutomation,
@@ -134,7 +135,16 @@ import {
   searchTrajectories as searchTrajectories,
   exportCorpus as exportTrajCorpus,
 } from "./traj.js";
-import { nodeBridgeAvailable, nodeStatus, nodeStart, nodeStop, nodeDownload, nodePing, nodeCall, nodeLogTail, nodeReloadPlugin, nodeReloadPlugins } from "./node-runtime.js";
+import { nodeBridgeAvailable, nodeStatus, nodeStart, nodeStop, nodeDownload, nodePing, nodeCall, nodeLogTail, nodeReloadPlugin, nodeReloadPlugins, nodeOnEvent, nodeUiAction, nodeUiSnapshot, nodeWatchPlugins, nodeWatchStatus } from "./node-runtime.js";
+import {
+  attach as uiAttach,
+  listMounts as uiListMounts,
+  mount as uiMount,
+  setActionSink as uiSetActionSink,
+  unmount as uiUnmountMount,
+  unmountPlugin as uiUnmountPluginMounts,
+  update as uiUpdateMount,
+} from "./ui-host.js";
 import { refreshNodeTools, loadNewNodePlugins, nodePluginDetail } from "./node-plugins.js";
 import { syncNodeLlmModels, isNodeLlmModel } from "./llm-bridge.js";
 import {
@@ -288,6 +298,8 @@ export function initUI() {
   initNativeBack();
   startHudLoop();
   installLifecycleHooks();
+  wireUiHost();
+  wirePluginWatch();
   startNodeRuntime();
   startNodePoll();
 }
@@ -437,13 +449,154 @@ function startNodePoll() {
       syncNodePluginList();
       // Node 侧的模型供应方这时也注册好了 → 同步进手机端模型表
       syncNodeLlmModels();
+      // 插件可能已经往界面上挂了东西 —— 拉一次快照把它们贴回来。
+      // 页面被系统杀掉重开时，Node 进程往往还活着、挂载也还在，
+      // 不拉的话用户会看到「插件明明在跑，界面却是空的」。
+      syncNodeUiMounts();
+      // 监听是"页面要求"才开的：Node 不知道用户的设置。
+      // 通道刚连上这一刻，按设置决定开不开。
+      if (state.settings.pluginWatch) applyPluginWatch(true);
     }
     if (ui.view === "settings") renderMain(true);
   }, 1000);
 }
 
-/* ---------------- 生命周期钩子 ---------------- */
+/* ---------------- 插件界面宿主 ---------------- */
 
+/**
+ * 接上界面宿主。
+ *
+ * 两件事：
+ *   1. 页面上的点击 → 转发给 Node 里的插件
+ *   2. Node 里的 mount/update/unmount → 落到 DOM
+ *
+ * 为什么要单独一层而不是让 ui-host 自己发通道：
+ * ui-host 是纯渲染器，不认识 Node。让它保持"给树就画"，
+ * 才能在测试里不启动运行时也能验证渲染逻辑。
+ */
+function wireUiHost() {
+  uiSetActionSink(async ({ mountId, action, value, name }) => {
+    if (!mountId) return;
+    try {
+      const r = await nodeUiAction({ id: mountId, action, name, value });
+      if (r && r.ok === false) {
+        toast(r.error || "插件没有处理这个操作");
+      }
+    } catch (err) {
+      // 通道断了 / 插件崩了：说清楚是哪一层出的问题。
+      // 只说"操作失败"，用户会以为是自己点错了。
+      toast(`插件没有响应：${err?.message || err}`);
+    }
+  });
+
+  nodeOnEvent((event, data) => {
+    if (!event || event.slice(0, 3) !== "ui.") return;
+    if (event === "ui.mount") {
+      const r = uiMount(data || {});
+      if (!r.ok) {
+        console.warn("[ui-host] 挂载被拒：", r.error);
+        return;
+      }
+      uiAttach(); // 当前视图里如果有对应占位符，立刻画出来
+      return;
+    }
+    if (event === "ui.update") {
+      uiUpdateMount(data?.id, data?.tree);
+      return;
+    }
+    if (event === "ui.unmount") {
+      uiUnmountMount(data?.id);
+    }
+  });
+}
+
+/**
+ * 拉一次全量界面快照。
+ *
+ * 通道刚连上、或页面被系统重建后调用：Node 里的挂载还在，
+ * 这台设备上的 DOM 却是新的。不拉就永远是空的。
+ */
+async function syncNodeUiMounts() {
+  if (!nodeBridgeAvailable()) return;
+  try {
+    const list = await nodeUiSnapshot();
+    if (!Array.isArray(list) || !list.length) return;
+    // 先清掉旧的：页面重建前挂的可能已经在别处删掉了
+    uiListMounts().forEach((m) => uiUnmountMount(m.id));
+    list.forEach((m) => uiMount(m));
+    uiAttach();
+  } catch (err) {
+    // 快照失败不影响主流程 —— 插件自己重新 apply 时还会再挂一次
+    console.warn("[ui-host] 拉取界面快照失败：", err?.message || err);
+  }
+}
+
+/* ---------------- 自动重载 ---------------- */
+
+/**
+ * 订阅自动重载的推送。
+ *
+ * 重载成功要**静默**：用户正在写代码，每次保存都弹一个提示很烦。
+ * 只有失败才说话 —— 失败时插件可能是坏的，必须让人知道。
+ */
+function wirePluginWatch() {
+  nodeOnEvent((event, data) => {
+    if (!event || event.slice(0, 6) !== "watch.") return;
+
+    if (event === "watch.reloaded") {
+      // 工具表 / 清单都可能变了，刷新一次
+      syncNodePluginList();
+      refreshNodeTools().catch(() => {});
+      nodeWatchStatus()
+        .then((st) => setWatchStatus(st))
+        .catch(() => {});
+      if (ui.view === "plugins" || ui.view === "settings") renderMain(true);
+      return;
+    }
+
+    if (event === "watch.error") {
+      const who = data?.id ? `「${data.id}」` : "";
+      toast(`自动重载失败${who}：${data?.error || "未知原因"}`);
+      nodeWatchStatus()
+        .then((st) => setWatchStatus(st))
+        .catch(() => {});
+      if (ui.view === "settings") renderMain(true);
+      return;
+    }
+
+    if (event === "watch.unloaded") {
+      syncNodePluginList();
+      refreshNodeTools().catch(() => {});
+      if (ui.view === "plugins") renderMain(true);
+      return;
+    }
+
+    if (event === "watch.state") {
+      nodeWatchStatus()
+        .then((st) => setWatchStatus(st))
+        .catch(() => {});
+    }
+  });
+}
+
+/**
+ * 按设置打开 / 关闭目录监听。
+ *
+ * 关的时候直接调 —— 不关的话监听会一直挂着，直到进程退出。
+ */
+async function applyPluginWatch(on) {
+  if (!nodeBridgeAvailable()) return;
+  const st = nodeStatus();
+  if (!st.channelConnected) return;
+  try {
+    const r = await nodeWatchPlugins(on);
+    setWatchStatus(r?.status || null);
+  } catch (err) {
+    toast(`插件监听开启失败：${err?.message || err}`);
+  }
+}
+
+/* ---------------- 生命周期钩子 ---------------- */
 /**
  * 切后台 / 回前台的收尾。
  *
@@ -653,6 +806,9 @@ function renderMain(force = false) {
     if (force || ui.lastBuilt !== sid) {
       renderChat(target, "bottom");
       ui.lastBuilt = sid;
+      // 对话页刚被整块重写，占位符是新的 —— 插件界面要重新贴上去。
+      // 只在重建时贴：流式输出每帧都走 updateMessages，那时贴会打断输入框焦点。
+      uiAttach(target);
     } else {
       updateMessages();
     }
@@ -673,6 +829,11 @@ function renderMain(force = false) {
     if (fresh) fresh.scrollTop = top;
     ui.settingsScroll = undefined;
   }
+
+  // 非对话页每次都是整块 innerHTML 重写，占位符也跟着换了一批。
+  // 统一在这里贴 —— 四个挂载点里只有 shell.overlay 在对话页，
+  // 但有挂载点落在设置页，这里不贴它就永远是空的。
+  uiAttach(target);
 }
 
 function navigate(view) {
@@ -716,6 +877,9 @@ function renderChat(root, anchor = "bottom") {
         }
         <button class="scroll-anchor" id="scroll-anchor" data-act="scroll-bottom" aria-label="回到底部">${icon("arrowDown", "icon--sm")}</button>
       </div>
+      <!-- 插件界面挂载点：浮在输入区上方（通知条、状态卡这类）。
+           放在 composer 之前 —— 它在布局里占一行，不会压住输入框上方的工具条。 -->
+      <div class="ui-slot ui-slot--overlay" data-ui-slot="shell.overlay" hidden></div>
       ${renderComposer(s)}
     </div>`;
 
@@ -1091,6 +1255,8 @@ function renderComposer(s) {
   const mode = currentMode();
   return `
   <div class="composer-wrap">
+    <!-- 插件界面挂载点：输入框上方。空的时候整块收起来，不留缝 -->
+    <div class="ui-slot ui-slot--composer" data-ui-slot="composer.toolbar" hidden></div>
     <div class="composer">
       <div class="composer__files" id="composer-files" ${ui.attachments.length ? "" : "hidden"}>${attachmentChips()}</div>
       <div class="voice-strip" id="voice-strip" ${voiceState() === "idle" ? "hidden" : ""} aria-live="polite">
@@ -1399,11 +1565,21 @@ function bodyHtml(m, running) {
 }
 
 function tailHtml(m, done, tools) {
+  // 正在自动重试：说清楚"不是你点错了，是连接断了，我在重来"。
+  // 不给按钮 —— 这时除了等，用户没有别的动作可做。
+  const retry =
+    m.retry && m.status === "running"
+      ? `<div class="msg__notice">${icon("loader", "icon--xs icon--loader")} 连接中断，${Math.max(
+          1,
+          Math.round((m.retry.waitMs || 0) / 1000)
+        )} 秒后重试（第 ${m.retry.attempt} 次，最多 ${m.retry.total} 次）</div>`
+      : "";
+
   // 被系统中断：不当作错误处理，也不出"测试连接"这类误导按钮，
   // 只说明发生了什么，并给一个"继续"入口。
   if (m.interrupted) {
     const note = `<div class="msg__notice">${icon("alert", "icon--xs")} ${esc(m.error || "本次运行被系统中断。")}</div>`;
-    return `${note}${
+    return `${retry}${note}${
       done && (m.duration || tools.length)
         ? `<button class="runmeta" data-act="trace" data-id="${m.id}" style="background:none;border:0;width:100%;text-align:left;cursor:pointer">
              <span class="runmeta__item">${icon("clock", "icon--xs")}<b>${fmtClock(m.duration)}</b></span>
@@ -1435,7 +1611,7 @@ function tailHtml(m, done, tools) {
            <span class="runmeta__item" style="color:var(--accent-bright)">轨迹 ${icon("chevron", "icon--xs")}</span>
          </button>`
       : "";
-  return err + meta;
+  return retry + err + meta;
 }
 
 /** 工具卡片只在状态/输出长度等真正变化时重建，避免 spinner 反复从头转。 */
@@ -3927,6 +4103,8 @@ function renameSheet() {
 
 function renderDrawer() {
   els.drawer.innerHTML = renderDrawerHTML(ui.search || "");
+  // 抽屉整块重写 —— 底部的插件界面要重新贴
+  uiAttach(els.drawer);
 }
 
 function pushLayer() {
@@ -5733,6 +5911,30 @@ async function onClick(e) {
       setSettings({ notifyOnDone: !state.settings.notifyOnDone });
       renderMain(ui.view !== "chat");
       return;
+
+    case "toggle-plugin-watch": {
+      const on = !state.settings.pluginWatch;
+      setSettings({ pluginWatch: on });
+      renderMain(true);
+
+      if (!on) {
+        applyPluginWatch(false);
+        toast("已停止监听插件目录");
+        return;
+      }
+
+      // 打开了开关但运行时还没连上：说明白，不要让它看起来"开好了"
+      if (!nodeStatus().channelConnected) {
+        toast("已开启，等插件运行时连上后开始监听");
+        return;
+      }
+      applyPluginWatch(true).then(() => {
+        const w = state.watchStatus;
+        if (w && w.running) toast("已开始监听，改插件文件后自动生效");
+        else toast(w?.error || "监听没起来：这台设备的 Node 不支持目录监听");
+      });
+      return;
+    }
 
     case "toggle-haptics":
       setSettings({ haptics: !state.settings.haptics });

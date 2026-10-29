@@ -374,6 +374,52 @@ export async function nodeCallTool(name, args = {}) {
   return await nodeCall("tool.call", { name, args });
 }
 
+/* ---------------- 界面宿主 ---------------- */
+
+/**
+ * 把界面上的交互转发给插件。
+ *
+ * @param {{id:string, action:string, name?:string, value?:any}} payload
+ * @returns {Promise<{ok:boolean, error?:string}>}
+ */
+export async function nodeUiAction(payload) {
+  return await nodeCall("ui.action", payload || {});
+}
+
+/**
+ * 拉全量界面快照。
+ *
+ * 页面重建之后 Node 里的挂载还在 —— 用这个把它们找回来。
+ *
+ * @returns {Promise<Array<{id,slot,tree,pluginId,pluginName,order}>>}
+ */
+export async function nodeUiSnapshot() {
+  const r = await nodeCall("ui.snapshot", {});
+  return Array.isArray(r?.mounts) ? r.mounts : [];
+}
+
+/** 界面挂载清单（不含树，诊断用）。 */
+export async function nodeUiList() {
+  return await nodeCall("ui.list", {});
+}
+
+/* ---------------- 自动重载 ---------------- */
+
+/**
+ * 开关插件目录监听。
+ *
+ * @param {boolean} on
+ * @returns {Promise<{ok:boolean, error?:string, status:object}>}
+ */
+export async function nodeWatchPlugins(on) {
+  return await nodeCall("plugins.watch", { on: !!on });
+}
+
+/** 监听的运行状态。 */
+export async function nodeWatchStatus() {
+  return await nodeCall("plugins.watchstatus", {});
+}
+
 /** 运行时信息（版本、插件数、工具数）。 */
 export async function nodeRuntimeInfo() {
   return await nodeCall("runtime.info", {});
