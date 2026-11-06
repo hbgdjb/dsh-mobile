@@ -565,6 +565,22 @@ export function createTagFilter() {
     get tags() {
       return tags;
     },
+    /**
+     * 记下当前状态，供"这次请求白跑了、重来一遍"时回滚。
+     *
+     * 断流重试会把同一段内容重新吐一遍；如果不把过滤器也退回去，
+     * 缓冲里那半截 `<memory_update` 会跟新内容拼在一起，正文就乱了。
+     */
+    snapshot() {
+      return { buf, out, tags: tags.slice() };
+    },
+    restore(snap) {
+      if (!snap) return;
+      buf = snap.buf;
+      out = snap.out;
+      tags.length = 0;
+      tags.push(...snap.tags);
+    },
   };
 }
 

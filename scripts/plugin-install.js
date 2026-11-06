@@ -225,6 +225,19 @@ export async function uninstallPlugin(id) {
 export async function setPluginEnabled(id, enabled) {
   const p = state.plugins.find((x) => x.id === id);
   if (!p) return { ok: false, error: "插件不存在" };
+
+  // 内置插件没有沙箱代码，开关只改能力表。
+  //
+  // 之前这里不看 codePath，一律去读插件代码 —— 于是「子智能体」「智能体团队」
+  // 「自动授权审查」这三个内置项永远开不起来：读不到文件 → 回滚成 false →
+  // 用户看到的是「插件代码是空的 / 读不到」，而它们本来就不该有代码文件。
+  if (!p.codePath) {
+    p.enabled = !!enabled;
+    save();
+    emit({ type: "plugin:toggle", id, enabled: p.enabled });
+    return { ok: true };
+  }
+
   p.enabled = !!enabled;
   save();
   if (enabled) {

@@ -94,9 +94,14 @@ const definedOrder = await page.evaluate(async () => {
   return out;
 });
 
-// 1) 会话上方 → 模型 chip → 「选择模型」
-await page.click('.chip[data-act="open-model"]');
+// 1) 顶栏胶囊 → 会话面板 → 模型行 → 「选择模型」
+//    0.60.0 起模型入口挪进了顶栏胶囊弹出的面板，路径多一步，终点没变。
+await page.click(".appbar__pill");
+await page.waitForSelector('[data-act="open-model"]', { timeout: 8000 });
+await page.waitForTimeout(400);
+await page.click('[data-act="open-model"]');
 await page.waitForSelector('[data-act="open-model-list"]', { timeout: 8000 });
+await page.waitForTimeout(500);
 await page.click('[data-act="open-model-list"]');
 await page.waitForSelector('[data-act="set-model"]', { timeout: 8000 });
 await page.waitForTimeout(300);

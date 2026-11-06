@@ -120,11 +120,26 @@ check("契约：快照带 messages 字段", /messages,/.test(uiJs));
 check("契约：快照带 running 字段（停止按钮据此置灰）", /running: !!ui\.run/.test(uiJs));
 check("契约：只收有内容的消息", /if \(!text\) continue/.test(uiJs));
 check("契约：消息按 role 区分", /role: m\.role === "user" \? "user" : "assistant"/.test(uiJs));
-check("契约：长消息截断", /text\.length > 60/.test(uiJs));
+check("契约：长消息仍有上限（1200 字，防快照无限膨胀）", /HUD_MSG_MAX = 1200/.test(uiJs));
 check("契约：原生侧渲染消息区", /optJSONArray\("messages"\)/.test(svc));
 check("契约：原生侧区分「你 / DSH」", /"你"/.test(svc) && /"DSH"/.test(svc));
 check("契约：应用内降级版也渲染消息区", /hud-msg/.test(hudJs));
 check("契约：最多显示 4 条消息", /messages\.length < 4/.test(uiJs) && /i < 4/.test(svc));
+
+/* ============================================================
+   五之二、完整回复：能换行、能滑
+   ============================================================ */
+
+check("契约：原生消息行可折行（不再单行省略）",
+  /setSingleLine\(false\)/.test(svc) && /setEllipsize\(null\)/.test(svc));
+check("契约：原生消息区套了 ScrollView", /MaxHeightScrollView/.test(svc)
+  && /class MaxHeightScrollView extends ScrollView/.test(svc));
+check("契约：滚动高度有上限（不超过半屏）", /0\.40f/.test(svc));
+check("契约：应用内消息区可滚动",
+  /overflow-y:auto/.test(hudJs) && /touch-action:pan-y/.test(hudJs));
+check("契约：应用内消息允许折行", /\.hud-msg\{white-space:pre-wrap/.test(hudJs));
+check("契约：刷新时保留滚动位置",
+  /bodyEl\.scrollTop = wasAtBottom/.test(hudJs) && /sv\.scrollTo\(0, toBottom/.test(svc));
 
 /* ============================================================
    六、停止会话

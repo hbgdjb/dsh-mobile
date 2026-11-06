@@ -1,6 +1,7 @@
 package ai.deepseek.dsh.mobile;
 
 import android.app.Service;
+import android.content.Context;
 import android.content.Intent;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
@@ -23,6 +24,7 @@ import android.view.WindowManager;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 
 import org.json.JSONArray;
@@ -56,8 +58,8 @@ public class DshHudService extends Service {
     private TextView capsule;
     private DshBotView ball;
 
-    /** 消息区（每次刷新重建）。 */
-    private LinearLayout msgBox;
+    /** 消息的滚动容器：回复再长也能滑着读完，不再被压成一行省略号。 */
+    private ScrollView msgScroll;
     /** 输入行：提示条 + 真正的输入框 + 发送键。 */
     private LinearLayout actionRow;
     private TextView inputHint;
@@ -155,7 +157,7 @@ public class DshHudService extends Service {
         capRow = null;
         capsule = null;
         ball = null;
-        msgBox = null;
+        msgScroll = null;
         actionRow = null;
         inputHint = null;
         inputBox = null;
@@ -239,6 +241,57 @@ public class DshHudService extends Service {
         // 默认用展开态的宽度；胶囊行在 buildViews / fillBody 里单独收窄。
         tv.setMaxWidth(clampWidth(W_MAX_DP));
         return tv;
+    }
+
+    /**
+     * 可换行的段落：给「最近消息」用。
+     *
+     * ============ 为什么不再用 line() ============
+     *
+     * 回复是给人读的，一行 300dp 只装得下二十来个汉字。
+     * 旧版每条消息单行 + END 省略，用户永远只能看到开头半句 ——
+     * 悬浮窗「不用切应用就能瞄一眼」的意义就没了。
+     *
+     * 这里保留限宽（否则长 URL / 无空格英文会把窗口撑爆），
+     * 但允许折行，配合外层 ScrollView 限高滚动。
+     */
+    private TextView para(String text, float sizeSp, int color) {
+        TextView tv = line(text, sizeSp, color, false);
+        tv.setSingleLine(false);
+        tv.setEllipsize(null);
+        tv.setMaxLines(60);
+        tv.setLineSpacing(0f, 1.18f);
+        tv.setPadding(dp(2), dp(2), dp(2), dp(2));
+        return tv;
+    }
+
+    /**
+     * 有高度上限的 ScrollView。
+     *
+     * ScrollView 本身没有 setMaxHeight —— 放在 WRAP_CONTENT 的父容器里，
+     * 它会一路长到内容高度，一条长回复就能把浮窗顶出屏幕。
+     * 覆写 onMeasure，把父容器给的 AT_MOST 再压一道，超了就滚。
+     */
+    private static class MaxHeightScrollView extends ScrollView {
+        private int maxHeight = Integer.MAX_VALUE;
+
+        MaxHeightScrollView(Context context) {
+            super(context);
+        }
+
+        void setMaxHeight(int px) {
+            maxHeight = px;
+        }
+
+        @Override
+        protected void onMeasure(int widthSpec, int heightSpec) {
+            int mode = MeasureSpec.getMode(heightSpec);
+            int size = MeasureSpec.getSize(heightSpec);
+            int limit = mode == MeasureSpec.UNSPECIFIED
+                    ? maxHeight
+                    : Math.min(size, maxHeight);
+            super.onMeasure(widthSpec, MeasureSpec.makeMeasureSpec(limit, MeasureSpec.AT_MOST));
+        }
     }
 
     private void buildViews() {
@@ -558,12 +611,28 @@ public class DshHudService extends Service {
             capsule.setText("DSH · " + statusText);
             driveBot(o);
 
+            /* 重建前记住消息区滚到哪了。
+               快照每 1.2s 推一次，流式输出时几乎每次都变；
+               每次都把 ScrollView 换成新的，滚动位置会跳回顶部 ——
+               正在读长回复的人每 1.2 秒被弹回去一次，根本读不完。
+               本来在底部（或没滚过）就继续跟到底，停在中间就停在原处。 */
+            int keepY = 0;
+            boolean keepBottom = true;
+            if (msgScroll != null) {
+                keepY = msgScroll.getScrollY();
+                if (msgScroll.getChildCount() > 0) {
+                    int inner = msgScroll.getChildAt(0).getHeight();
+                    keepBottom = inner - keepY - msgScroll.getHeight() < dp(24);
+                }
+            }
+
             if (collapsed) {
                 // 收缩态：只保留胶囊，宽度回到内容自适应
                 root.setMinimumWidth(0);
                 capsule.setMaxWidth(clampWidth(W_COLLAPSED_DP));
                 while (body.getChildCount() > 0) body.removeAllViews();
-                if (actionRow != null) actionRow.setVisibility(View.GONE);
+                msgScroll = null;
+                        if (actionRow != null) actionRow.setVisibility(View.GONE);
                 return;
             }
             // ============ 展开态要给一个**固定**宽度，不能只放开上限 ============
@@ -584,7 +653,8 @@ public class DshHudService extends Service {
             if (actionRow != null) actionRow.setVisibility(View.VISIBLE);
 
             body.removeAllViews();
-            if (!TextUtils.isEmpty(step)) {
+            msgScroll = null;
+                if (!TextUtils.isEmpty(step)) {
                 body.addView(line(step, 10.5f, Color.parseColor("#9FB4D8"), false));
             }
 
@@ -617,19 +687,54 @@ public class DshHudService extends Service {
             //
             // 这一段是「接消息」：把最近几条对话显示在悬浮窗里，
             // 便于在屏幕控制过程中瞄一眼 AI 说了什么。
+            //
+            // ============ 为什么整段塞进 ScrollView ============
+            //
+            // 消息是唯一会「读不完」的内容：一段解释动辄几百字。
+            // 行数固定 4 条、每条限高 40% 屏高，超了就滑 ——
+            // 浮窗不会被一条长回复撑到屏幕外，也不会再把半句话截掉。
             int m = messages == null ? 0 : messages.length();
             if (m > 0) {
                 body.addView(divider());
                 body.addView(line("消息", 9.5f, Color.parseColor("#7B8497"), true));
+
+                LinearLayout box = new LinearLayout(this);
+                box.setOrientation(LinearLayout.VERTICAL);
                 for (int i = 0; i < m && i < 4; i++) {
                     JSONObject msg = messages.getJSONObject(i);
-                    String who = "user".equals(msg.optString("role")) ? "你" : "DSH";
-                    int c = "user".equals(msg.optString("role"))
-                            ? Color.parseColor("#9FB4D8") : Color.WHITE;
-                    body.addView(line(
-                            who + "：" + msg.optString("text", ""),
-                            10.5f, c, false));
+                    boolean isUser = "user".equals(msg.optString("role"));
+                    String who = isUser ? "你" : "DSH";
+                    int c = isUser ? Color.parseColor("#9FB4D8") : Color.WHITE;
+                    TextView tv = para(who + "：" + msg.optString("text", ""), 10.5f, c);
+                    LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                            LinearLayout.LayoutParams.MATCH_PARENT,
+                            LinearLayout.LayoutParams.WRAP_CONTENT);
+                    if (i > 0) lp.topMargin = dp(4);
+                    box.addView(tv, lp);
                 }
+
+                MaxHeightScrollView sv = new MaxHeightScrollView(this);
+                // 40% 屏高：再大就把「会话 / 任务 / 输入行」挤出可视区
+                sv.setMaxHeight(Math.round(
+                        getResources().getDisplayMetrics().heightPixels * 0.40f));
+                sv.setFillViewport(false);
+                sv.setVerticalScrollBarEnabled(true);
+                sv.setScrollBarStyle(View.SCROLLBARS_INSIDE_INSET);
+                sv.addView(box, new ScrollView.LayoutParams(
+                        ScrollView.LayoutParams.MATCH_PARENT,
+                        ScrollView.LayoutParams.WRAP_CONTENT));
+                body.addView(sv, new LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.MATCH_PARENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT));
+                msgScroll = sv;
+
+                final boolean toBottom = keepBottom;
+                final int restoreY = keepY;
+                sv.post(() -> {
+                    if (sv.getChildCount() == 0) return;
+                    int inner = sv.getChildAt(0).getHeight();
+                    sv.scrollTo(0, toBottom ? inner : Math.min(restoreY, inner));
+                });
             }
 
             // ===== 快捷操作行状态 =====

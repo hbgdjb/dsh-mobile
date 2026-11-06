@@ -270,18 +270,21 @@
 
 .uih__badge[data-tone="ok"] {
   color: var(--ok);
+  border-color: transparent; /* 老内核兜底：color-mix 是 Chrome 111 */
   border-color: color-mix(in srgb, var(--ok) 32%, transparent);
   background: var(--ok-soft);
 }
 
 .uih__badge[data-tone="warn"] {
   color: var(--warn);
+  border-color: transparent;
   border-color: color-mix(in srgb, var(--warn) 32%, transparent);
   background: var(--warn-soft);
 }
 
 .uih__badge[data-tone="danger"] {
   color: var(--danger);
+  border-color: transparent;
   border-color: color-mix(in srgb, var(--danger) 32%, transparent);
   background: var(--danger-soft);
 }
@@ -331,6 +334,7 @@
 
 .uih__btn[data-tone="danger"] {
   background: var(--danger-soft);
+  border-color: transparent;
   border-color: color-mix(in srgb, var(--danger) 34%, transparent);
   color: var(--danger);
 }

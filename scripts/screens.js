@@ -19,8 +19,11 @@ import {
   PROVIDER_COUNT,
   APP_VERSION,
   MODES,
+  PRESETS,
+  PRESET_LIST,
   PERMISSIONS,
   currentMode,
+  activeSession,
   currentModel,
   fmtRelative,
   fmtFuture,
@@ -29,6 +32,8 @@ import {
   listFiles,
   listLibrary,
   filesStats,
+  sessionWorkspaceInfo,
+  orphanWorkspaceInfo,
 } from "./store.js";
 import { fmtContext } from "./context.js";
 import { icon } from "./icons.js";
@@ -49,6 +54,14 @@ import {
 } from "./mcp-local.js";
 import { listAll as listMemories } from "./memory.js";
 import { trajStats } from "./traj.js";
+import {
+  imeStatus,
+  openImeSettings,
+  switchIme,
+  listPhrases,
+  listClipboard,
+  clearClipboard,
+} from "./ime.js";
 
 /** 记忆条数（设置页摘要用）。 */
 const memoryCount = () => listMemories().length;
@@ -95,30 +108,54 @@ const fileKind = (path) => {
 /* ---------------- 首页 ---------------- */
 
 export function renderHome() {
-  const recent = [...state.sessions].sort((a, b) => b.updatedAt - a.updatedAt)[0];
-  const mode = currentMode();
-  const tools = availableToolNames().length;
+  const sid = activeSession()?.id;
+  // "最近"要跳过当前这个空会话 —— 它就在眼前，列出来只会是一张
+  // 「新会话 · 0 条消息」的卡片。同时要求有消息，避免把另一个空壳也算进去。
+  const recent = [...state.sessions]
+    .filter((x) => x.id !== sid && x.messages.length > 0)
+    .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+  const preset = sid ? PRESETS[state.sessions.find((s) => s.id === sid)?.preset] : null;
+
+  // 工作模式选择器刻意不挂 .reveal：.reveal 默认 opacity:0，要靠 JS 加 is-in 才显形。
+  // 装饰可以等动画，功能入口不能被动画挡住 —— JS 出问题时至少还能看见它。
+  //
+  // 形状是一排横滑胶囊，不是四宫格：胶囊比卡片矮一半，占的竖向空间小，
+  // 首屏才有地方留给球和问候语。选中后另起一行说明这个模式怎么干活。
+  const presetBar = `
+    <div class="home__preset">
+      <div class="preset__grid">
+        ${PRESET_LIST.map((p) => {
+          const on = !!preset && preset.id === p.id;
+          return `
+        <button class="preset${on ? " preset--on" : ""}" data-act="set-preset" data-value="${p.id}"
+          aria-pressed="${on ? "true" : "false"}" title="${esc(p.brief)}">
+          <span class="preset__name">${esc(p.name)}</span>
+        </button>`;
+        }).join("")}
+      </div>
+      <p class="preset-note">${preset ? `已进入「${esc(preset.name)}」· ${esc(preset.intro)}` : "挑一个，或者直接说要做什么"}</p>
+    </div>`;
 
   return `
   <div class="home">
-    <div class="home__hero reveal">
-      <span class="home__eyebrow">DSH MOBILE · ${esc(mode.name)}模式 · ${tools} 个工具</span>
-      <h1 class="home__title">你只管说，<br>它负责做完。</h1>
-      <p class="home__sub">读写文件、跑命令、改内容，动手前先问你。</p>
+    <div class="home__hero">
+      <!-- 悬浮窗那颗小球（DshBall）。这里只放画布，绘制交给 ui.js 的 mountHomeBall ——
+           首页是字符串拼出来的，canvas 得在挂上 DOM 之后才画得了。 -->
+      <canvas class="home__ball" id="home-ball" aria-hidden="true"></canvas>
+      <h1 class="home__title">今天想做点什么？</h1>
+      <p class="home__sub">说一句就行，动手前会先问你。</p>
     </div>
+
+    ${presetBar}
 
     ${
       recent
         ? `
-    <div class="home__section reveal">
-      <span>最近</span>
-      <span>${esc(fmtRelative(recent.updatedAt))}</span>
-    </div>
-    <button class="resume reveal" data-act="resume" data-id="${recent.id}">
+    <button class="resume" data-act="resume" data-id="${recent.id}">
       <span class="resume__dot"></span>
       <span class="resume__text">
         <span class="resume__title">${esc(recent.title)}</span>
-        <span class="resume__sub">${esc(MODES[recent.mode]?.name || "标准")}模式 · ${recent.messages.length} 条消息</span>
+        <span class="resume__sub">${esc(fmtRelative(recent.updatedAt))} · ${recent.messages.length} 条消息</span>
       </span>
       ${icon("chevron", "icon--sm")}
     </button>`
@@ -133,6 +170,8 @@ export function renderWorkspace(tab = "workspace") {
   const isLib = tab === "library";
   const files = isLib ? listLibrary() : listFiles();
   const stats = filesStats();
+  const wsInfo = sessionWorkspaceInfo();
+  const sessionTitle = activeSession()?.title || "当前会话";
   const total = files.reduce((sum, f) => sum + (Number(f.size) || 0), 0);
   const groups = new Map();
 
@@ -154,6 +193,15 @@ export function renderWorkspace(tab = "workspace") {
   return `
   <div class="page-summary">${tabs}
     <span class="ws-meta">${files.length} 个文件 · ${(total / 1024).toFixed(1)} KB · ${PERMISSIONS[state.settings.permission].name}</span>
+    <div class="ws-meta" style="margin-top:6px;opacity:.72;line-height:1.5">${
+      isLib
+        ? "资料库始终跨会话可用。"
+        : wsInfo.isolated
+          ? `独立工作区 · ${esc(sessionTitle)}：本会话写入的文件别的会话看不到${
+              wsInfo.shared ? `；另有 ${wsInfo.shared} 个共享文件（升级前的数据，只读基底）` : ""
+            }。`
+          : "所有会话共用同一份工作区，同名文件会互相覆盖。"
+    }</div>
   </div>
 
   <div class="workspace__body scroll">
@@ -176,7 +224,7 @@ export function renderWorkspace(tab = "workspace") {
             <button class="file-row" data-act="open-file" data-area="${isLib ? "library" : "workspace"}" data-path="${esc(f.path)}">
               <span class="fileicon ${k.cls}">${k.label}</span>
               <span class="file-row__name">${esc(name)}</span>
-              <span class="file-row__meta">${fmtSize(f)}</span>
+              <span class="file-row__meta">${!isLib && f.shared && wsInfo.isolated ? "共享 · " : ""}${fmtSize(f)}</span>
               ${icon("chevron", "icon--xs")}
             </button>`;
             })
@@ -297,11 +345,41 @@ export function renderPlugins(tab = "node", market = {}, highlight = "", depCach
   </div>`;
   }
 
+  // 技能包（SKILL.md）不是页面内插件：它不注册工具，也不占界面槽位，
+  // 只是一份"怎么做事"的说明 + 参考资料。但用户装完总得能看见 ——
+  // 没有这一块，装成功的反馈只存在于对话里，翻插件页还是「一个都没有」。
+  const skills = Array.isArray(state.skills) ? state.skills : [];
+  const skillRows = skills
+    .map(
+      (s) => `
+    <div class="plugin-row">
+      <span class="avatar" aria-hidden="true">${icon("fileText", "icon--sm")}</span>
+      <div class="plugin-row__main">
+        <div class="plugin-row__top">
+          <span class="plugin-row__name">${esc(s.name || s.id)}</span>
+          <span class="tag">${Number(s.files) || 0} 文件</span>
+        </div>
+        <p class="plugin-row__desc">${esc(String(s.description || "（SKILL.md 没写说明）").slice(0, 90))}</p>
+      </div>
+    </div>`
+    )
+    .join("");
+
   return `
-  <div class="page-summary">${enabled.length} / ${state.plugins.length} 已启用</div>
+  <div class="page-summary">${enabled.length} / ${state.plugins.length} 已启用${
+    skills.length ? ` · ${skills.length} 个技能包` : ""
+  }</div>
 
   <div class="workspace__body scroll" style="padding-top:0">
     ${switcher}
+
+    ${
+      skills.length
+        ? `<div class="section-label">技能包 · ${skills.length}</div>
+    <p class="dim" style="font-size:11.5px;margin:-2px 0 8px;line-height:1.7">装在 skills/&lt;id&gt;/，模型按 SKILL.md 执行。</p>
+    ${skillRows}`
+        : ""
+    }
 
     <button class="creator-row" data-act="plugin-search" style="margin-top:12px">
       <span class="avatar">${icon("download", "icon--sm")}</span>
@@ -328,7 +406,7 @@ export function renderPlugins(tab = "node", market = {}, highlight = "", depCach
     ${disabled.map(card).join("") || '<p class="dim" style="font-size:12px;padding:6px 0">全部已启用。</p>'}
 
     <p class="eyebrow" style="margin:20px 0 0;line-height:1.9;letter-spacing:.04em">
-      开关会即时改变模型可用的工具。
+      带「内置」标记的插件随内核提供，不需要下载；开关会即时改变模型可用的工具。
     </p>
   </div>`;
 }
@@ -566,6 +644,13 @@ const fontName = () => {
   return v < 1 ? "小" : v > 1 ? "大" : "标准";
 };
 
+/** 输入法状态；浏览器环境（无原生桥）视为不可用。 */
+function imeStatusSafe() {
+  const st = imeStatus();
+  if (!st) return { supported: false, enabled: false, current: false };
+  return { supported: true, ...st };
+}
+
 export const SETTINGS_CATS = [
   {
     id: "account",
@@ -592,7 +677,7 @@ export const SETTINGS_CATS = [
     id: "agent",
     icon: "cpu",
     title: "Agent 行为",
-    desc: "运行模式、写入权限、审批策略与单次步数上限。",
+    desc: "运行模式、写入权限与审批策略；工具调用步数不设上限。",
     summary: () =>
       `${currentMode().name}模式 · ${PERMISSIONS[state.settings.permission].name} · ${approvalName()}`,
   },
@@ -634,6 +719,19 @@ export const SETTINGS_CATS = [
     summary: () => {
       const st = filesStats();
       return `工作区 ${st.workspace.count} 个 · 资料库 ${st.library.count} 个`;
+    },
+  },
+  {
+    id: "keyboard",
+    icon: "keyboard",
+    title: "键盘与输入",
+    desc: "DSH 键盘（系统输入法）、快捷短语与截图回传。",
+    summary: () => {
+      const st = imeStatusSafe();
+      if (!st.supported) return "浏览器环境 · 不可用";
+      if (st.current) return "DSH 键盘正在使用";
+      if (st.enabled) return "已启用 · 未在用";
+      return "未启用";
     },
   },
   {
@@ -1349,6 +1447,7 @@ export function renderSettings(cat = null) {
   const mode = currentMode();
   const files = listFiles();
   const filesBytes = files.reduce((n, f) => n + (Number(f.size) || 0), 0);
+  const orphans = orphanWorkspaceInfo();
   const meta = cat ? SETTINGS_CAT_MAP[cat] : null;
   if (!meta) return settingsHome();
 
@@ -1396,6 +1495,12 @@ export function renderSettings(cat = null) {
           ? { tone: "idle", text: "未验证" }
           : st.ok
           ? { tone: "ok", text: `已连接 · ${(st.ms || 0) < 1000 ? `${st.ms || 0} ms` : `${((st.ms || 0) / 1000).toFixed(1)}s`}` }
+          : st.phase === "stream"
+          ? { tone: "err", text: `响应中断 · HTTP ${st.httpStatus || 200} 已连上` }
+          : st.status === 401
+          ? { tone: "err", text: "Key 未被接受 · 401" }
+          : st.status === 403
+          ? { tone: "err", text: "无权限 · 403" }
           : st.status === 429
           ? { tone: "err", text: "限流 · 稍后再试" }
           : { tone: "err", text: `连接失败${st.status ? ` · HTTP ${st.status}` : ""}` };
@@ -1412,7 +1517,8 @@ export function renderSettings(cat = null) {
         </div>
         <span class="conn-pill conn-pill--${conn.tone}"><span class="conn-pill__dot"></span>${esc(conn.text)}</span>
       </div>
-      ${st && !st.ok ? `<p class="field__hint" style="color:var(--danger);margin-bottom:10px">${esc(st.error || "最近一次请求失败，可点下方测试连接。")}</p>` : ""}
+      ${st && !st.ok ? `<p class="field__hint" style="color:var(--danger);margin-bottom:10px;white-space:pre-wrap">${esc(st.error || "最近一次请求失败，可点下方测试连接。")}</p>
+        ${st.hint ? `<details style="margin:-2px 0 10px"><summary class="field__hint" style="cursor:pointer;color:var(--accent)">为什么被拒 · 排查建议</summary><pre style="white-space:pre-wrap;word-break:break-word;margin:8px 0 0;padding:10px;background:var(--soft);border-radius:7px;font:11.5px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)">${esc(st.hint)}</pre></details>` : ""}` : ""}
       ${
         isNodeLlmModel(model)
           ? `<p class="field__hint" style="margin:10px 0 14px">
@@ -1433,7 +1539,7 @@ export function renderSettings(cat = null) {
             value="${esc(apiKeyForCurrent())}" data-key-field="1" autocomplete="off" spellcheck="false">
           <button class="icon-btn" data-act="paste-key" aria-label="粘贴">${icon("copy", "icon--sm")}</button>
         </div>
-        <p class="field__hint">只保存在本机；不同服务分槽保存。留空则无法发送消息。</p>
+        <p class="field__hint">只保存在本机；不同服务分槽保存。只粘贴密钥本身，不要带 <code>Bearer </code> 前缀、引号或换行（本版会自动清理）。留空则无法发送消息。</p>
       </div>
 
       <div class="field"${isNodeLlmModel(model) ? ' style="display:none"' : ""}>
@@ -1445,7 +1551,7 @@ export function renderSettings(cat = null) {
       <div class="field">
         <label class="field__label" for="set-api">模型 ID</label>
         <input class="input mono" id="set-api" value="${esc(modelApiId(model))}" data-model-field="apiModel" spellcheck="false" placeholder="deepseek-chat">
-        <p class="field__hint">会原样放进请求体的 <code>model</code> 字段。</p>
+        <p class="field__hint">会原样放进请求体的 <code>model</code> 字段。要填 ID（如 <code>deepseek-v4.1-flash</code>），不是「DeepSeek V4.1 Flash」这类显示名。</p>
       </div>
 
       <div class="field">
@@ -1514,14 +1620,10 @@ export function renderSettings(cat = null) {
 
       <div class="settings__row">
         <div class="settings__row-main">
-          <div class="settings__row-title">单次最大步数</div>
-          <div class="settings__row-sub">工具调用回合上限，默认 24，最高 100</div>
+          <div class="settings__row-title">工具调用步数</div>
+          <div class="settings__row-sub">不设上限，模型不再调工具时自然结束；随时可点「停止」</div>
         </div>
-        <div style="display:flex;align-items:center;gap:6px">
-          <button class="icon-btn icon-btn--sm" data-act="max-steps" data-value="-2" aria-label="减少">${icon("minus", "icon--sm")}</button>
-          <span class="mono" style="font-size:13px;min-width:18px;text-align:center">${s.maxSteps}</span>
-          <button class="icon-btn icon-btn--sm" data-act="max-steps" data-value="2" aria-label="增加">${icon("plus", "icon--sm")}</button>
-        </div>
+        <span class="tag">不限</span>
       </div>
     </div>
 
@@ -1711,6 +1813,25 @@ export function renderSettings(cat = null) {
       ).toFixed(1)} KB</b></div>
       <div class="settings__row">
         <div class="settings__row-main">
+          <div class="settings__row-title">按会话隔离工作区</div>
+          <div class="settings__row-sub">每个会话的文件互不干扰；关闭后回到所有会话共用。资料库不受影响，始终跨会话可用。</div>
+        </div>
+        <button class="switch" role="switch" aria-checked="${s.isolateWorkspace !== false}"
+          aria-label="按会话隔离工作区" data-act="toggle-isolate-workspace"></button>
+      </div>
+      ${
+        orphans.count
+          ? `<div class="settings__row">
+        <div class="settings__row-main">
+          <div class="settings__row-title">无主文件</div>
+          <div class="settings__row-sub">${orphans.sessions} 个已删除会话留下 ${orphans.count} 个文件 · ${(orphans.bytes / 1024).toFixed(1)} KB，任何会话都看不到</div>
+        </div>
+        <button class="chip" data-act="purge-orphan">清理</button>
+      </div>`
+          : ""
+      }
+      <div class="settings__row">
+        <div class="settings__row-main">
           <div class="settings__row-title">工作区数据</div>
           <div class="settings__row-sub">导入 / 导出 JSON 备份</div>
         </div>
@@ -1754,6 +1875,13 @@ export function renderSettings(cat = null) {
     </div>
     <div class="settings__group">
       <div class="settings__group-head">诊断与隐私</div>
+      <button class="settings__row" data-act="open-selfcheck" style="width:100%;text-align:left">
+        <div class="settings__row-main">
+          <div class="settings__row-title">环境自检</div>
+          <div class="settings__row-sub">WebView 版本、样式支持、布局实测、关键文件</div>
+        </div>
+        ${icon("chevron", "icon--sm")}
+      </button>
       <button class="settings__row" data-act="open-diagnostics" style="width:100%;text-align:left">
         <div class="settings__row-main">
           <div class="settings__row-title">请求日志</div>
@@ -1776,6 +1904,117 @@ export function renderSettings(cat = null) {
         ${icon("key", "icon--sm")}
       </button>
     </div>`,
+
+    keyboard: () => {
+      const st = imeStatusSafe();
+      const phrases = listPhrases();
+      const clips = listClipboard();
+      return `
+    <div class="settings__group">
+      <div class="settings__group-head">DSH 键盘</div>
+      ${
+        !st.supported
+          ? `<div class="settings__row">
+               <div class="settings__row-main">
+                 <div class="settings__row-title">当前环境不支持</div>
+                 <div class="settings__row-sub">输入法是 Android 系统能力，浏览器与 PWA 里没有。装成 APK 后可用。</div>
+               </div>
+             </div>`
+          : st.current
+          ? `<div class="settings__row">
+               <div class="settings__row-main">
+                 <div class="settings__row-title">正在使用</div>
+                 <div class="settings__row-sub">DSH 键盘已经是当前输入法。在任意应用的输入框都能唤起。</div>
+               </div>
+               <span class="conn-pill conn-pill--ok"><span class="conn-pill__dot"></span>使用中</span>
+             </div>`
+          : st.enabled
+          ? `<div class="settings__row">
+               <div class="settings__row-main">
+                 <div class="settings__row-title">已启用，未在用</div>
+                 <div class="settings__row-sub">切到别的输入法了。点右边按钮切回来。</div>
+               </div>
+               <button class="chip" data-act="ime-switch">切换</button>
+             </div>`
+          : `<div class="settings__row">
+               <div class="settings__row-main">
+                 <div class="settings__row-title">未启用</div>
+                 <div class="settings__row-sub">需要在系统设置里打开「DSH 键盘」，才能在输入框里唤起它。</div>
+               </div>
+               <button class="chip" data-act="ime-open-settings">去启用</button>
+             </div>`
+      }
+      ${
+        st.supported && !st.current
+          ? `<button class="btn btn--primary btn--block" style="margin:4px 0 12px" data-act="ime-switch">${icon(
+              "keyboard",
+              "icon--xs"
+            )} 切换到 DSH 键盘</button>`
+          : ""
+      }
+      <div class="settings__row settings__row--stack">
+        <div class="settings__row-title" style="margin-bottom:6px">键盘能力</div>
+        <p class="field__hint">
+          全拼中文输入（3 万词本地词库）· AI 润色/纠错/缩写/扩写/翻译 · 语音输入 · 快捷短语 · 剪贴板 · 截图回传到对话
+        </p>
+        <p class="field__hint">
+          密码输入框里 AI、语音与截图一律禁用 —— 这是安全边界，不是可选项。
+        </p>
+      </div>
+      <div class="settings__row">
+        <div class="settings__row-main">
+          <div class="settings__row-title">截完图直接分析</div>
+          <div class="settings__row-sub">关闭时截图只加为附件，由你决定何时发出去</div>
+        </div>
+        <button class="switch" role="switch" aria-checked="${s.imeAutoSend ? "true" : "false"}" aria-label="截完图直接分析" data-act="toggle-ime-auto-send"></button>
+      </div>
+    </div>
+
+    <div class="settings__group">
+      <div class="settings__group-head">快捷短语</div>
+      ${
+        phrases.length
+          ? phrases
+              .map(
+                (p) => `<div class="settings__row">
+                  <div class="settings__row-main">
+                    <div class="settings__row-title">${esc(p.text || "")}</div>
+                    ${p.title ? `<div class="settings__row-sub">${esc(p.title)}</div>` : ""}
+                  </div>
+                  <button class="icon-btn icon-btn--sm" data-act="ime-delete-phrase" data-id="${esc(p.id || "")}" aria-label="删除">${icon(
+                    "trash",
+                    "icon--sm"
+                  )}</button>
+                </div>`
+              )
+              .join("")
+          : `<div class="settings__row">
+               <div class="settings__row-main">
+                 <div class="settings__row-title">还没有短语</div>
+                 <div class="settings__row-sub">加一条常用的话（比如自己的邮箱），在键盘里点「短语」就能插进去。</div>
+               </div>
+             </div>`
+      }
+      <div class="settings__row">
+        <div class="settings__row-main">
+          <div class="settings__row-title">新增短语</div>
+          <div class="settings__row-sub">文本与备注分开填</div>
+        </div>
+        <button class="chip" data-act="ime-add-phrase">添加</button>
+      </div>
+    </div>
+
+    <div class="settings__group">
+      <div class="settings__group-head">剪贴板历史</div>
+      <div class="settings__row">
+        <div class="settings__row-main">
+          <div class="settings__row-title">已记 ${clips.length} 条</div>
+          <div class="settings__row-sub">只在你打开键盘时记录，上限 30 条，系统标记为敏感的内容不记</div>
+        </div>
+        ${clips.length ? `<button class="chip" data-act="ime-clear-clips">清空</button>` : ""}
+      </div>
+    </div>`;
+    },
 
     about: () => `
     <div class="settings__group">
@@ -1800,7 +2039,7 @@ export function renderSettings(cat = null) {
 
 /* ---------------- 会话抽屉 ---------------- */
 
-export function renderDrawer(search = "") {
+export function renderDrawer(search = "", runningId = "") {
   const q = search.trim().toLowerCase();
   const sessions = state.sessions.filter(
     (s) =>
@@ -1850,10 +2089,10 @@ export function renderDrawer(search = "") {
               .map((s) => {
                 const last = s.messages[s.messages.length - 1];
                 return `
-              <div class="session-item" data-active="${s.id === state.activeSessionId}">
+              <div class="session-item" data-active="${s.id === state.activeSessionId}" data-running="${s.id === runningId}">
                 <button class="session-item__main" data-act="open-session" data-id="${s.id}">
                   <span class="session-item__top">
-                    <span class="session-item__title">${esc(s.title)}</span>
+                    <span class="session-item__title">${s.id === runningId ? `<span class="session-item__run" aria-label="运行中"></span>` : ""}${esc(s.title)}</span>
                     <span class="session-item__time">${fmtTime(s.updatedAt)}</span>
                   </span>
                   <span class="session-item__preview">${esc(last ? plainText(last.content, 42) : "空会话")}</span>

@@ -1,0 +1,1393 @@
+/* ============================================================
+   Clean — 视觉覆盖层
+   ------------------------------------------------------------
+   设计参考：纯黑底 + 胶囊控件 + 大留白 + 单一品牌球。
+   目标是把界面从「工业面板」推到「手机原生」，具体三条：
+
+     1. 分层靠填充色差，不靠 1px 描边。深色底上描边会糊成一片噪点。
+     2. 圆角收敛到两种：胶囊（999px）与卡片（20px）。中间那些
+        5/8/12/16 的过渡值全部让位，扫一眼才有规律。
+     3. 固定件（顶栏 / 输入条 / 底栏）压到最低存在感，内容才是主角。
+
+   这份文件在 tokens/base/components/screens 之后加载，只做覆盖，
+   不改结构，删掉就能退回旧版。上一层的布局规则一律保留。
+   ============================================================ */
+
+/* ---------------- 令牌 ---------------- */
+
+:root {
+  --bg: #000000;
+  --bg-deep: #000000;
+  --surface: #1a1a1c;
+  --surface-2: #232326;
+  --surface-3: #2c2c30;
+  --surface-glass: rgba(0, 0, 0, 0.72);
+
+  /* 描边整体降权：只在必须分界的地方留一丝，其余交给填充 */
+  --line: rgba(255, 255, 255, 0.055);
+  --line-strong: rgba(255, 255, 255, 0.10);
+  --line-accent: rgba(90, 122, 255, 0.40);
+
+  --text: #f2f2f4;
+  --text-soft: #dedee2;
+  --muted: #93939a;
+  --dim: #6a6a72;
+
+  --accent: #4b6ff2;
+  --accent-bright: #6d8bff;
+  --accent-soft: rgba(75, 111, 242, 0.14);
+  --accent-line: rgba(75, 111, 242, 0.34);
+
+  /* 结构尺寸：顶栏和底栏都比旧版矮一档，把高度还给内容 */
+  --appbar-h: 56px;
+  --tabbar-h: 54px;
+  --gutter: 18px;
+
+  /* 阴影只留最淡的一层，深色底上的大投影会显脏 */
+  --shadow-1: 0 1px 2px rgba(0, 0, 0, 0.5);
+  --shadow-2: 0 8px 28px rgba(0, 0, 0, 0.55);
+  --glow-accent: 0 0 0 1px rgba(75, 111, 242, 0.28), 0 6px 22px rgba(75, 111, 242, 0.22);
+}
+
+[data-theme="light"] {
+  --bg: #ffffff;
+  --bg-deep: #f5f5f7;
+  --surface: #f2f2f4;
+  --surface-2: #e8e8ec;
+  --surface-3: #dededf;
+  --surface-glass: rgba(255, 255, 255, 0.78);
+
+  --line: rgba(0, 0, 0, 0.07);
+  --line-strong: rgba(0, 0, 0, 0.13);
+
+  --text: #0d0d10;
+  --text-soft: #2a2a30;
+  --muted: #5c5c66;
+  --dim: #83838d;
+
+  --accent: #2f56e0;
+  --accent-bright: #1f3fc4;
+  --accent-soft: rgba(47, 86, 224, 0.09);
+  --accent-line: rgba(47, 86, 224, 0.24);
+}
+
+/* ---------------- 外壳 ---------------- */
+
+/* 旧版在页面外围铺了网格和两团径向光。手机屏上这两样都在抢注意力，
+   而且截图里能明显看到中缝一条亮线。这里全部收掉。 */
+.stage__grid,
+.stage__atmosphere,
+.stage__meta,
+.stage__word {
+  display: none !important;
+}
+
+.stage {
+  background: var(--bg);
+}
+
+.app,
+.device {
+  background: var(--bg);
+}
+
+/* 滚动条：手机上有系统指示条，WebView 的细条叠上去是双重阴影 */
+.scroll::-webkit-scrollbar,
+.chat__scroll::-webkit-scrollbar,
+.views::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+/* ---------------- 顶栏 ---------------- */
+
+.appbar {
+  min-height: calc(var(--appbar-h) + var(--safe-top));
+  padding: var(--safe-top) var(--gutter) 0;
+  gap: 8px;
+  display: flex;
+  align-items: center;
+  background: var(--bg);
+  border: 0;
+}
+
+/* 左右各 40px 圆钮，靠 grid 让中间胶囊真正居中 —— 用 flex 的话
+   右侧按钮一多一少，中间就会左右漂。 */
+.appbar {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr) 40px;
+  align-items: center;
+  column-gap: 8px;
+}
+
+.round-btn,
+.appbar .icon-btn {
+  width: 40px;
+  height: 40px;
+  min-width: 40px;
+  min-height: 40px;
+  border-radius: 999px;
+  border: 0;
+  background: var(--surface);
+  color: var(--text-soft);
+  display: grid;
+  place-items: center;
+  padding: 0;
+  transition: background var(--dur-1) var(--ease-out), transform var(--dur-1);
+}
+
+.round-btn:active,
+.appbar .icon-btn:active {
+  background: var(--surface-3);
+  transform: scale(0.94);
+}
+
+.appbar .icon-btn .icon {
+  width: 19px;
+  height: 19px;
+}
+
+/* 中间状态胶囊：标题 + 模式，单行，超出省略。
+   这是全屏唯一常驻的文字控件，做成一枚胶囊而不是标题栏，
+   视觉上它就跟内容是一层而不是两层。 */
+.appbar__mid {
+  min-width: 0;
+  display: flex;
+  justify-content: center;
+}
+
+.appbar__pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 40px;
+  max-width: 100%;
+  padding: 0 15px;
+  border-radius: 999px;
+  background: var(--surface);
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.appbar__pill b {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 46vw;
+}
+
+.appbar__pill em {
+  font-style: normal;
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--muted);
+  flex: none;
+}
+
+.appbar__pill .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: none;
+}
+
+.appbar__pill .sep {
+  width: 1px;
+  height: 11px;
+  background: var(--line-strong);
+  flex: none;
+}
+
+.appbar__end {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+}
+
+.appbar__end:empty::after {
+  content: "";
+  width: 40px;
+  height: 40px;
+}
+
+/* 旧结构残留：万一某处仍按老 DOM 渲染，也别露出描边标题 */
+.appbar__titles {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.appbar__title,
+.appbar__kicker {
+  display: none;
+}
+
+.badge-dot {
+  top: 9px;
+  right: 9px;
+  width: 7px;
+  height: 7px;
+  background: var(--accent-bright);
+  box-shadow: 0 0 0 2px var(--surface);
+}
+
+/* ---------------- 底栏 ---------------- */
+
+/* 四个 tab 是功能入口，不能删；但可以压到几乎不占视觉重量：
+   无描边、无高光条、只留图标和极淡文字，未选中时退到背景里。 */
+.tabbar {
+  border-top: 0;
+  background: var(--bg);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  min-height: calc(var(--tabbar-h) + var(--safe-bottom));
+  padding-top: 2px;
+}
+
+.tab {
+  gap: 3px;
+  font-size: 10px;
+  letter-spacing: 0.02em;
+  color: var(--dim);
+}
+
+.tab__icon {
+  width: 22px;
+  height: 22px;
+}
+
+.tab__icon .icon {
+  width: 21px;
+  height: 21px;
+  stroke-width: 1.6;
+}
+
+.tab[aria-selected="true"] {
+  color: var(--text);
+}
+
+/* 顶部那根发光蓝条换成图标下的小点：面积小了，但仍然一眼能定位 */
+.tab[aria-selected="true"]::before {
+  display: none;
+}
+
+.tab[aria-selected="true"] .tab__icon::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: -3px;
+  width: 3px;
+  height: 3px;
+  margin-left: -1.5px;
+  border-radius: 50%;
+  background: var(--accent-bright);
+}
+
+/* ---------------- 首页 ---------------- */
+
+/* 空会话 = 首屏。整块垂直居中，不靠顶部堆内容 —— 这是参考图最核心的一条：
+   屏幕中间只有一个球、一句话、一排胶囊，剩下全是留白。 */
+.messages--empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100%;
+  padding: 0;
+}
+
+.home {
+  width: 100%;
+  padding: 8px var(--gutter) 12px;
+  text-align: center;
+}
+
+.home__hero {
+  padding: 0;
+  margin-bottom: 26px;
+}
+
+/* 首页中间那颗球：和悬浮窗同源（dsh-ball.js），同一套眼神与呼吸。
+   尺寸由 DshBall.resize 写成内联（side 60 → 画布 96），样式表只管定位。
+   画布比球体大一圈是有意的：头顶符号（思考和睡着的 ≡ / z）画在球外，
+   边距不够会被裁掉一半。 */
+.home__ball {
+  display: block;
+  margin: 0 auto;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  cursor: pointer;
+}
+
+.home__title {
+  font-family: var(--font-body);
+  font-size: 23px;
+  font-weight: 500;
+  line-height: 1.45;
+  letter-spacing: -0.01em;
+  color: var(--text);
+  max-width: none;
+  margin: 0 auto;
+}
+
+.home__sub {
+  margin: 9px auto 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--muted);
+  max-width: 22em;
+}
+
+/* 旧版眉标（DSH MOBILE · 标准模式 · 17 个工具）是终端味最重的一行，
+   首屏不需要它。工具数这类信息在设置页有专门位置。 */
+.home__eyebrow {
+  display: none;
+}
+
+/* ---------------- 模式选择：一排横滑胶囊 ---------------- */
+
+.home__preset {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.preset__head,
+.preset__intro {
+  display: none;
+}
+
+.preset__grid {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  padding: 2px 0;
+  /* 两边贴边滚，但首尾胶囊要留出 gutter 的呼吸 */
+  margin: 0 calc(var(--gutter) * -1);
+  padding-left: var(--gutter);
+  padding-right: var(--gutter);
+  justify-content: center;
+}
+
+.preset__grid::-webkit-scrollbar {
+  display: none;
+}
+
+.preset {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 38px;
+  padding: 0 15px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-soft);
+  text-align: center;
+  transition: background var(--dur-1) var(--ease-out), color var(--dur-1), transform var(--dur-1);
+}
+
+.preset:active {
+  transform: scale(0.96);
+}
+
+.preset__name {
+  font-size: 13.5px;
+  font-weight: 500;
+  color: inherit;
+  line-height: 1;
+}
+
+/* 每个模式一个小圆点做识别色，比图标省地方，也比纯文字好定位 */
+.preset__name::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 7px;
+  border-radius: 50%;
+  background: var(--dim);
+  vertical-align: 1px;
+}
+
+.preset[data-value="design"] .preset__name::before { background: #a78bfa; }
+.preset[data-value="code"] .preset__name::before   { background: #4fd1a5; }
+.preset[data-value="office"] .preset__name::before { background: #f0b35a; }
+.preset[data-value="learn"] .preset__name::before  { background: #6d8bff; }
+
+/* 简介在胶囊里放不下，选中后统一用下方一行小字交代 */
+.preset__brief {
+  display: none;
+}
+
+.preset--on {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.preset--on .preset__name {
+  color: var(--text);
+}
+
+/* 选中态另起一行，说明这个模式会怎么干活。只在选了之后出现，
+   不占未选状态的空间。 */
+.preset-note {
+  margin: 14px auto 0;
+  max-width: 26em;
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--dim);
+}
+
+/* ---------------- 最近会话 ---------------- */
+
+.home__section {
+  display: none;
+}
+
+.resume {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  margin-top: 30px;
+  padding: 12px 14px;
+  border: 0;
+  border-radius: 20px;
+  background: var(--surface);
+  text-align: left;
+}
+
+.resume:active {
+  background: var(--surface-3);
+}
+
+.resume__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: none;
+}
+
+.resume__text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+
+.resume__title {
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.resume__sub {
+  font-size: 11.5px;
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.resume .icon {
+  color: var(--dim);
+  flex: none;
+}
+
+/* ---------------- 输入区 ---------------- */
+
+/* 参考图里输入条是一整枚胶囊：左 + 号、中间文本、右侧功能键。
+   这里保持同样的形状，但把语音和发送做成同一个位置的互斥按钮 ——
+   有字时是发送，没字时是麦克风。少一个常驻按钮，条就干净一分。 */
+.composer-wrap {
+  padding: 4px var(--gutter) 8px;
+  background: var(--bg);
+}
+
+.composer-wrap::before {
+  display: none;
+}
+
+.composer {
+  position: relative;
+  border: 0;
+  border-radius: 26px;
+  background: var(--surface);
+  padding: 7px 8px 7px 6px;
+  box-shadow: none;
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  transition: background var(--dur-2) var(--ease-out);
+}
+
+.composer:focus-within {
+  border: 0;
+  background: var(--surface-2);
+  box-shadow: none;
+}
+
+.composer__input {
+  flex: 1;
+  min-width: 0;
+  font-size: 15px;
+  line-height: 1.5;
+  padding: 10px 4px;
+  min-height: 40px;
+  max-height: 120px;
+  color: var(--text);
+}
+
+.composer__input::placeholder {
+  color: var(--dim);
+}
+
+/* 附件区、语音条在胶囊内部时要把内边距让出来 */
+.composer__files {
+  order: -1;
+  flex-basis: 100%;
+  padding: 2px 4px 4px;
+}
+
+.composer .voice-strip {
+  order: -1;
+  flex-basis: 100%;
+}
+
+/* 旧的"工具行 + 右下角发送"结构在这里折进胶囊：foot 变成
+   一个不换行的工具容器，贴着输入框右侧。 */
+.composer__foot {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+  padding-bottom: 2px;
+}
+
+.composer__tools {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: none;
+}
+
+/* 圆形工具键：40px，跟顶栏圆钮同尺寸，全屏尺寸语言统一 */
+.composer__tools .icon-btn,
+.composer .icon-btn--sm {
+  width: 36px;
+  height: 36px;
+  min-width: 36px;
+  min-height: 36px;
+  border-radius: 999px;
+  border: 0;
+  background: transparent;
+  color: var(--text-soft);
+}
+
+.composer__tools .icon-btn:active,
+.composer .icon-btn--sm:active {
+  background: var(--surface-3);
+}
+
+.send {
+  width: 40px;
+  height: 40px;
+  border-radius: 999px;
+  background: var(--text);
+  color: var(--bg);
+  box-shadow: none;
+  flex: none;
+}
+
+.send:hover {
+  background: #ffffff;
+}
+
+.send:disabled {
+  background: var(--surface-3);
+  color: var(--dim);
+  box-shadow: none;
+}
+
+.send[data-stop="true"] {
+  background: var(--text);
+  color: var(--bg);
+}
+
+.send .icon {
+  width: 18px;
+  height: 18px;
+  stroke-width: 2;
+}
+
+/* 输入条下方那行提示（token 数、快捷键）在手机上没人读，
+   折成一行 9px 的极淡字，或者干脆藏起来 */
+.composer__hint {
+  font-size: 9px;
+  color: var(--dim);
+  opacity: 0.7;
+  padding: 6px 4px 0;
+}
+
+/* ---------------- 会话正文 ---------------- */
+
+.chat__meta {
+  padding: 0 var(--gutter) 6px;
+}
+
+/* 日期头：居中的极小字，代替原来那行带圆点的元信息 */
+.chat__date {
+  font-family: var(--font-body);
+  font-size: 11px;
+  letter-spacing: 0;
+  text-transform: none;
+  color: var(--dim);
+  padding: 12px 0 10px;
+}
+
+.messages {
+  padding: 4px var(--gutter) 12px;
+  gap: 4px;
+}
+
+/* 用户消息：右侧灰胶囊。旧版是蓝紫渐变 + 描边 + 外发光，
+   一条消息三重装饰，读起来吵。 */
+.msg--user {
+  padding: 10px 0 6px;
+}
+
+.msg__bubble {
+  max-width: 82%;
+  background: var(--surface);
+  border: 0;
+  border-radius: 20px 20px 5px 20px;
+  color: var(--text);
+  padding: 11px 15px;
+  font-size: 15px;
+  line-height: 1.6;
+  box-shadow: none;
+}
+
+[data-theme="light"] .msg__bubble {
+  background: var(--surface);
+}
+
+/* 助手消息：无气泡、无头像、无名字标签，正文直接落在背景上。
+   参考图就是这样 —— 只有文字和留白，读到第三段也不会觉得在表格里。 */
+.msg--assistant {
+  padding: 8px 0 18px;
+}
+
+.msg__head {
+  display: none;
+}
+
+.msg__body {
+  font-size: 15px;
+  line-height: 1.78;
+  color: var(--text-soft);
+}
+
+.msg__body p {
+  margin: 0 0 14px;
+}
+
+.msg__body p:last-child {
+  margin-bottom: 0;
+}
+
+.msg__body strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* 引用块：一根 2px 竖线，不加背景色 */
+.msg__body blockquote {
+  margin: 16px 0;
+  padding: 2px 0 2px 14px;
+  border-left: 2px solid var(--surface-3);
+  color: var(--muted);
+  background: transparent;
+  border-radius: 0;
+}
+
+/* 有序列表：序号用品牌蓝，正文缩进对齐 —— 参考图里最显眼的一处细节 */
+.msg__body ol {
+  margin: 14px 0;
+  padding-left: 0;
+  list-style: none;
+  counter-reset: clean-ol;
+}
+
+.msg__body ol > li {
+  position: relative;
+  counter-increment: clean-ol;
+  padding-left: 26px;
+  margin-bottom: 9px;
+}
+
+.msg__body ol > li::before {
+  content: counter(clean-ol) ".";
+  position: absolute;
+  left: 0;
+  top: 0;
+  color: var(--accent-bright);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.msg__body ul {
+  margin: 14px 0;
+  padding-left: 20px;
+}
+
+.msg__body ul > li {
+  margin-bottom: 8px;
+}
+
+.msg__body ul > li::marker {
+  color: var(--dim);
+}
+
+/* 行内代码与代码块 */
+.msg__body code {
+  background: var(--surface);
+  border-radius: 5px;
+  padding: 1.5px 5px;
+  font-size: 0.9em;
+  color: var(--text);
+}
+
+.msg__body pre {
+  background: #101012;
+  border: 0;
+  border-radius: 16px;
+  padding: 14px 16px;
+  margin: 16px 0;
+  overflow-x: auto;
+}
+
+.msg__body pre code {
+  background: transparent;
+  padding: 0;
+}
+
+[data-theme="light"] .msg__body pre {
+  background: #f2f2f4;
+}
+
+/* 表格：去掉竖线，只留行分隔 */
+.msg__body table {
+  border-collapse: collapse;
+  margin: 16px 0;
+  width: 100%;
+}
+
+.msg__body th,
+.msg__body td {
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  padding: 9px 10px;
+  text-align: left;
+}
+
+.msg__body th {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 12.5px;
+}
+
+/* 消息操作条：常驻太吵，降成极淡的灰，悬停/点按才亮 */
+.msg__actions,
+.msg__foot {
+  opacity: 0.55;
+  transition: opacity var(--dur-2);
+}
+
+.msg__actions:hover,
+.msg__foot:hover {
+  opacity: 1;
+}
+
+/* ---------------- 连接提示 / 模型提示 ---------------- */
+
+/* 旧版是一个橙色描边大卡，占掉首屏三分之一。改成一行胶囊：
+   信息不丢，但不再像报警。 */
+.banner,
+.conn-banner,
+.notice {
+  border: 0;
+  border-radius: 16px;
+  background: var(--surface);
+  padding: 10px 14px;
+  margin: 0 var(--gutter) 10px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--muted);
+}
+
+/* ---------------- 状态条 ---------------- */
+
+.chat__more {
+  border: 0;
+  background: var(--surface);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 8px 14px;
+}
+
+/* ---------------- 抽屉 ---------------- */
+
+.drawer {
+  background: #0c0c0e;
+  border-right: 0;
+}
+
+[data-theme="light"] .drawer {
+  background: #fafafa;
+}
+
+/* ---------------- 通用卡片降噪 ---------------- */
+
+/* 工作区、插件、任务、设置里的卡片同样去掉描边，改成填充块。
+   只改外观三件套（border / background / radius），不动任何布局属性 ——
+   这些页面结构复杂，动 padding 容易塌。 */
+.card,
+.panel,
+.tile,
+.plugin-card,
+.task-card,
+.setting-row,
+.setting-group,
+.ws-item {
+  border-color: transparent;
+  border-radius: 20px;
+  background: var(--surface);
+}
+
+.segmented {
+  border: 0;
+  background: var(--surface);
+  border-radius: 999px;
+  padding: 3px;
+}
+
+.segmented__item {
+  border-radius: 999px;
+}
+
+.segmented__item[aria-pressed="true"] {
+  background: var(--surface-3);
+  box-shadow: none;
+}
+
+/* ---------------- 连接提示：一行胶囊 ---------------- */
+
+/* 旧版 .conn-banner 是"图标 + 标题 + 说明 + 两个按钮"的四件套大卡。
+   这里换成一行：状态点 + 一句原因 + 一个主行动，次要操作点整行进详情。 */
+.conn-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 var(--gutter) 8px;
+  padding: 6px 6px 6px 14px;
+  border-radius: 999px;
+  background: var(--surface);
+}
+
+.conn-note__main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  padding: 4px 0;
+  background: transparent;
+  border: 0;
+  text-align: left;
+  color: var(--text-soft);
+}
+
+.conn-note__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--warn);
+}
+
+.conn-note--ok .conn-note__dot { background: var(--ok); }
+.conn-note--fail .conn-note__dot,
+.conn-note--err .conn-note__dot { background: var(--danger); }
+
+.conn-note__text {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.conn-note__go {
+  flex: none;
+  height: 32px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--surface-3);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.conn-note__go:active {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* ---------------- 元信息条：只在异常时出现 ---------------- */
+
+.chat__meta[hidden] {
+  display: none;
+}
+
+.chat__meta {
+  padding: 0 var(--gutter) 4px;
+  gap: 6px;
+}
+
+.chip {
+  border: 0;
+  background: var(--surface);
+  color: var(--muted);
+  border-radius: 999px;
+  min-height: 28px;
+  padding: 0 11px;
+  font-size: 11.5px;
+}
+
+.chip--accent {
+  background: var(--surface);
+  color: var(--text-soft);
+}
+
+.chip--accent .icon {
+  color: var(--accent-bright);
+}
+
+/* ---------------- 收尾修正 ---------------- */
+
+/* 输入胶囊：允许附件/语音条换行到输入框上方 */
+.composer {
+  flex-wrap: wrap;
+}
+
+.composer > .composer__input {
+  flex: 1 1 0;
+  order: 0;
+}
+
+.composer > .composer__foot {
+  order: 1;
+}
+
+.composer > .icon-btn[data-act="attach"] {
+  order: 0;
+  margin-bottom: 2px;
+}
+
+/* 没字时右侧只留麦克风：发送键禁用态直接不占位，
+   否则一个灰圆加一个麦克风，右侧会挤成两个圈。 */
+.composer__foot .send:disabled {
+  display: none;
+}
+
+/* 选中态小点需要定位上下文 */
+.tab__icon {
+  position: relative;
+}
+
+/* 顶栏胶囊在极窄屏上收边距和字号，而不是砍掉模式名 ——
+   砍掉之后会剩一个孤零零的分隔符，看起来像渲染坏了。 */
+@media (max-width: 360px) {
+  .appbar__pill { padding: 0 12px; gap: 5px; font-size: 13.5px; }
+  .appbar__pill b { max-width: 34vw; }
+  .appbar__pill em { font-size: 11.5px; }
+}
+
+/* ---------------- 第二轮微调 ---------------- */
+
+/* 模式胶囊：四个正好铺满一行时，等分比各随文字宽度更整齐。
+   改成四列 grid 后不再需要横滑，负 margin 一并撤掉。 */
+.preset__grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  overflow: visible;
+  justify-content: initial;
+}
+
+.preset {
+  justify-content: center;
+  padding: 0 6px;
+}
+
+/* 文字 2 字 + 圆点 + padding 在 360px 屏上会挤，圆点缩到 5px */
+.preset__name::before {
+  width: 5px;
+  height: 5px;
+  margin-right: 6px;
+}
+
+.preset-note {
+  margin-top: 11px;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+
+/* 连接提示条离顶栏留一点气，不要贴着 */
+.conn-note {
+  margin-top: 4px;
+}
+
+/* + 号做成圆形浅底，跟右侧的圆形键对称 —— 纯文字加号在深色底上太虚 */
+.composer > .icon-btn[data-act="attach"] {
+  width: 36px;
+  height: 36px;
+  min-width: 36px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  color: var(--text);
+  margin-left: 2px;
+}
+
+.composer > .icon-btn[data-act="attach"] .icon {
+  width: 17px;
+  height: 17px;
+  stroke-width: 2;
+}
+
+/* 未选中的 tab 再退后一步，选中项才立得住 */
+.tab {
+  color: #55555c;
+}
+
+.tab[aria-selected="true"] {
+  color: var(--text);
+}
+
+/* 顶栏胶囊在对话页是按钮：点它改推理档位。
+   样式要压掉浏览器给 button 的默认外观，看起来仍是一枚胶囊。 */
+button.appbar__pill {
+  border: 0;
+  font-family: inherit;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+button.appbar__pill:active {
+  background: var(--surface-3);
+}
+
+/* ---------------- 选中态 ---------------- */
+
+/* 之前用 --surface-3 做选中底色，跟未选中只差一档灰，在深色屏上几乎看不出。
+   提高对比：底色再亮一档，圆点加一圈柔光，扫一眼就能定位当前模式。 */
+.preset--on {
+  background: #333338;
+}
+
+.preset--on .preset__name::before {
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.07);
+}
+
+/* toast 不要描边：深色底上一圈亮边会让它像弹窗 */
+.toast {
+  border: 0;
+  background: #333338;
+  color: var(--text);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6);
+}
+
+/* ---------------- 抽屉 ---------------- */
+
+/* 新建会话原来是整块品牌蓝按钮 —— 抽屉一打开最亮的是它，
+   但真正要看的是会话列表。改成深灰胶囊，蓝色只在按下时出现。 */
+.drawer__search .btn--primary {
+  background: var(--surface-3);
+  color: var(--text);
+  border: 0;
+  border-radius: 999px;
+  box-shadow: none;
+  min-height: 46px;
+  font-weight: 500;
+}
+
+.drawer__search .btn--primary:active {
+  background: var(--accent);
+  color: #ffffff;
+}
+
+.drawer__search .input-suffix,
+.drawer__search .input {
+  border: 0;
+  border-radius: 999px;
+  background: var(--surface);
+}
+
+.drawer__search .input {
+  padding-left: 16px;
+}
+
+/* 选中会话：填充色差，不用蓝底 + 蓝边（两重强调反而看不出选中） */
+.session-item {
+  border-radius: 16px;
+}
+
+.session-item[data-active="true"] {
+  background: var(--surface-2);
+  border-color: transparent;
+}
+
+.session-item:hover {
+  background: var(--surface);
+}
+
+.drawer__section .eyebrow,
+.drawer__section {
+  color: var(--dim);
+}
+
+.drawer__pill {
+  border: 0;
+  background: var(--surface);
+  border-radius: 18px;
+}
+
+.drawer__pill:active {
+  background: var(--surface-2);
+}
+
+/* 文件类型图标：原来每类一个彩色块，一列排下来像调色板。
+   统一成灰块，靠两三个字母区分类型 —— 信息没丢，视线不乱。 */
+.fileicon {
+  background: var(--surface-3);
+  color: var(--text-soft);
+  border: 0;
+  border-radius: 10px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+[data-theme="light"] .fileicon {
+  background: var(--surface-2);
+  color: var(--text-soft);
+}
+
+/* ---------------- 弹层选项 ---------------- */
+
+/* 模式选项原来用内联的蓝底 + 蓝边标当前项，两重强调反而显脏。
+   改成灰底 + 一圈极淡内描边，把颜色留给左边的图标。 */
+.mode-opt {
+  margin-bottom: 8px;
+  border: 0;
+  background: var(--surface);
+}
+
+.mode-opt--on {
+  background: var(--surface-2);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.07);
+}
+
+[data-theme="light"] .mode-opt--on {
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.08);
+}
+
+/* 设置页那一列图标块：原来每行一个蓝紫方块，竖着排下来像色卡。
+   统一灰底，按下时才上色 —— 颜色留给真正需要区分的地方。
+   36 → 32：和收紧后的行高（44）配套，图标不再顶着上下边。 */
+.settings .avatar,
+.setting-group .avatar,
+.settings .avatar--accent,
+.setting-group .avatar--accent {
+  width: 32px;
+  height: 32px;
+  border-radius: 10px;
+  border: 0;
+  background: var(--surface-2);
+  color: var(--text-soft);
+}
+
+.settings-card:active .avatar--accent,
+.settings__row:active .avatar--accent {
+  background: var(--accent-soft);
+  color: var(--accent-bright);
+}
+
+/* ---------------- 浅色模式修正 ---------------- */
+
+/* 未选中的 tab 之前写死成深灰，浅色下过重 */
+[data-theme="light"] .tab {
+  color: var(--dim);
+}
+
+[data-theme="light"] .tab[aria-selected="true"] {
+  color: var(--text);
+}
+
+/* 代码块底色比背景亮一档：原来几乎同色，只剩圆角在暗示"这是一块代码" */
+.msg__body pre {
+  background: #141417;
+}
+
+[data-theme="light"] .msg__body pre {
+  background: #eeeef1;
+}
+
+/* 连接提示的文案放宽一点，短结论能一行放完 */
+.conn-note__text {
+  font-size: 12.5px;
+  color: var(--text-soft);
+}
+
+.conn-note__main:active .conn-note__text {
+  color: var(--text);
+}
+
+/* 选中态再加一圈内描边：底色差一档在部分屏幕上不够明确，
+   加一圈 8% 的白线就能"提"起来，又不至于变成第二个边框系统。 */
+.preset--on {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.09);
+}
+
+[data-theme="light"] .preset--on {
+  background: #ffffff;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.10);
+}
+
+.preset--on .preset__name {
+  font-weight: 600;
+}
+
+/* ---------------- 时间线 ---------------- */
+
+/* 一条助手消息不再分「思考区 / 工具区 / 正文区」三块固定槽位，
+   而是按发生顺序一段段排下来。段与段之间统一 8px，
+   连续的工具卡收紧到 4px —— 它们是同一批调用，不该跟"下一段思路"一样疏。 */
+.msg__flow {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* 段自己不再带外边距，间距全交给容器管，避免两套规则打架 */
+.msg__flow > .reasoning,
+.msg__flow > .tool,
+.msg__flow > .msg__body {
+  margin: 0;
+}
+
+.msg__flow > .tool + .tool {
+  margin-top: -4px;
+}
+
+/* 每段思考都是一个独立的折叠块：用户只想知道"这一步它在想什么"，
+   不需要一份从头到尾的完整心路历程。 */
+.msg__flow > .reasoning {
+  padding-left: 11px;
+}
+
+/* 正文段：和旧的 .msg__body 一样排版，只是不再是唯一的那个 */
+.msg__flow > .msg__body--seg {
+  color: var(--text-soft);
+}
+
+.msg__flow > .msg__body--seg.dim {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* 旧布局容器：没有 timeline 的历史消息才走这条路径 */
+.msg__legacy[hidden],
+.msg__flow[hidden] {
+  display: none;
+}
+
+/* 时间线里会出现好几段思考，标签会重复。让每一段都退到背景里：
+   字号小一档、颜色再淡一档、竖线压到几乎看不见。
+   这样扫一眼先看到的是工具卡和正文，思考是「需要时再看」的东西。 */
+.msg__flow > .reasoning {
+  border-left-color: rgba(255, 255, 255, 0.06);
+  padding-left: 10px;
+}
+
+.msg__flow > .reasoning .reasoning__toggle {
+  font-size: 11.5px;
+  color: var(--dim);
+  min-height: 22px;
+}
+
+.msg__flow > .reasoning .reasoning__label {
+  letter-spacing: 0.01em;
+}
+
+.msg__flow > .reasoning .reasoning__text {
+  font-size: 12.5px;
+  line-height: 1.68;
+  color: var(--muted);
+}
+
+[data-theme="light"] .msg__flow > .reasoning {
+  border-left-color: rgba(0, 0, 0, 0.08);
+}
+
+/* 思考段与它后面那张工具卡是同一件事，贴紧一点；
+   正文段前后要多留白，它是这一段话的落点。 */
+.msg__flow > .reasoning + .tool {
+  margin-top: -3px;
+}
+
+.msg__flow > .tool + .msg__body,
+.msg__flow > .reasoning + .msg__body {
+  margin-top: 3px;
+}
+
+.msg__flow > .msg__body + .tool {
+  margin-top: 4px;
+}
+
+/* 折叠标题后面的首句摘要：给每段思考一个"这一段在琢磨什么"的提示，
+   否则四个一模一样的「深度思考」排下来等于没写。
+   用 mask 做淡出而不是 text-overflow —— 中文省略号在窄屏上很占位。 */
+.reasoning__hint {
+  min-width: 0;
+  flex: 1;
+  margin-left: 2px;
+  font-size: 11px;
+  color: #4a4a52;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+[data-theme="light"] .reasoning__hint {
+  color: #9a9aa2;
+}

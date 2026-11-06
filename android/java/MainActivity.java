@@ -2,8 +2,10 @@ package ai.deepseek.dsh.mobile;
 
 import android.content.Intent;
 import android.content.res.Configuration;
+import android.graphics.Color;
 import android.os.Build;
 import android.os.Bundle;
+import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.RenderProcessGoneDetail;
@@ -12,6 +14,10 @@ import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.widget.Button;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
 import android.widget.Toast;
 
 import com.getcapacitor.Bridge;
@@ -46,7 +52,17 @@ public class MainActivity extends BridgeActivity {
 
     @Override
     public void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
+        // WebView 本身起不来时（系统里那份被停用、被卸载、或版本过旧），
+        // Capacitor 会在 super.onCreate 里抛异常。那种情况页面一行 JS 都不会执行，
+        // 网页里那条看门狗也没机会跑 —— 宿主进程直接退出，用户看到的就是"打开就黑/闪退"。
+        // 这里接住它，用原生 View 把原因写在屏幕上。
+        try {
+            super.onCreate(savedInstanceState);
+        } catch (Throwable t) {
+            appendCrashLog("WebView 初始化失败：" + t);
+            showNativeFailure(t);
+            return;
+        }
         if (getBridge() != null && getBridge().getWebView() != null) {
             getBridge().getWebView().addJavascriptInterface(
                     new DshHttpBridge(getBridge().getWebView()),
@@ -87,6 +103,11 @@ public class MainActivity extends BridgeActivity {
                     new DshNodeBridge(getApplicationContext(), getBridge().getWebView()),
                     "DshNode"
             );
+            // IME 主机桥：把模型配置拍给键盘、接收键盘截的图
+            getBridge().getWebView().addJavascriptInterface(
+                    new DshImeHostBridge(getApplicationContext()),
+                    "DshImeHost"
+            );
             installCrashGuard(getBridge());
             keepRendererAlive();
             // 登记 WebView：悬浮窗要用它把「发消息 / 停止」指令送回页面里的 JS。
@@ -96,8 +117,40 @@ public class MainActivity extends BridgeActivity {
             DshHudState.webView = getBridge().getWebView();
             // Node 通道同理：Node 的响应要送回页面。
             DshNodeChannel.get().attach(getBridge().getWebView());
+            // IME 截图投递要往这个 WebView 里推 JS
+            DshImeState.mainWebView = getBridge().getWebView();
         }
         lockTextZoom();
+        writeEnvLog();
+    }
+
+    /**
+     * 每次启动覆盖写一份运行环境。
+     *
+     * 排障时最先要问的两个问题永远是"什么系统"和"WebView 什么版本"——
+     * 前者决定生命周期差异，后者直接决定哪几行语法能不能跑。
+     * 单独一个文件、只保留最近一次，不会把 crash.log 撑大。
+     */
+    private void writeEnvLog() {
+        try {
+            String wv;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                android.content.pm.PackageInfo pi = WebView.getCurrentWebViewPackage();
+                wv = pi == null
+                        ? "不可用（getCurrentWebViewPackage 返回 null，可能被停用）"
+                        : pi.packageName + " " + pi.versionName;
+            } else {
+                wv = "未知（API < 26）";
+            }
+            String s = "Android " + Build.VERSION.RELEASE + " (API " + Build.VERSION.SDK_INT + ")\n"
+                    + "设备 " + Build.MANUFACTURER + " " + Build.MODEL + "\n"
+                    + "WebView " + wv + "\n"
+                    + "应用 " + getPackageName() + "\n";
+            try (PrintWriter w = new PrintWriter(new FileWriter(new File(getFilesDir(), "env.log"), false))) {
+                w.print(s);
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     @Override
@@ -107,6 +160,8 @@ public class MainActivity extends BridgeActivity {
         DshHudState.webView = null;
         // Node 通道同理 —— 它也持有 WebView 引用。
         DshNodeChannel.get().detach();
+        DshImeState.mainWebView = null;
+        DshImeState.mainReady = false;
         super.onDestroy();
     }
 
@@ -160,6 +215,26 @@ public class MainActivity extends BridgeActivity {
         try {
             bridge.setWebViewClient(new BridgeWebViewClient(bridge) {
                 @Override
+                public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
+                    // 主文档都拉不起来时，页面里不会剩下任何 JS，网页那条看门狗也就不会响。
+                    // 这里至少留个日志 + 一句提示，别让用户对着一块黑屏猜。
+                    if (request != null && request.isForMainFrame()) {
+                        String desc = "";
+                        try {
+                            desc = error.getErrorCode() + " " + error.getDescription();
+                        } catch (Throwable ignored) {
+                        }
+                        appendCrashLog("主文档加载失败：" + desc + " " + request.getUrl());
+                        try {
+                            Toast.makeText(MainActivity.this,
+                                    "界面加载失败（" + error.getErrorCode() + "）", Toast.LENGTH_LONG).show();
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                    super.onReceivedError(view, request, error);
+                }
+
+                @Override
                 public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
                     boolean crashed = detail != null && detail.didCrash();
                     appendCrashLog("渲染进程" + (crashed ? "崩溃" : "被杀")
@@ -198,6 +273,70 @@ public class MainActivity extends BridgeActivity {
                 w.println(stamp + " " + reason);
             }
         } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * WebView 彻底不可用时，用原生控件把话说清楚。
+     *
+     * 这条路径比网页里的看门狗更底层：看门狗需要 WebView 能跑 JS，
+     * 而这里处理的是"连 WebView 都起不来"。典型场景是系统里那份
+     * Android System WebView 被用户在「应用」里停用了（部分 ROM 允许），
+     * 或者被清理软件卸载成了旧版本。
+     */
+    private void showNativeFailure(Throwable t) {
+        try {
+            float d = getResources().getDisplayMetrics().density;
+            int pad = (int) (22 * d);
+
+            ScrollView scroll = new ScrollView(this);
+            scroll.setBackgroundColor(Color.parseColor("#0B0C0E"));
+
+            LinearLayout box = new LinearLayout(this);
+            box.setOrientation(LinearLayout.VERTICAL);
+            box.setPadding(pad, pad, pad, pad);
+            scroll.addView(box);
+
+            TextView title = new TextView(this);
+            title.setText("DSH 没能启动");
+            title.setTextColor(Color.parseColor("#F5F7FA"));
+            title.setTextSize(19);
+            title.setPadding(0, 0, 0, (int) (10 * d));
+            box.addView(title);
+
+            TextView body = new TextView(this);
+            body.setText("这台设备的系统 WebView 不可用，或者版本太旧。\n\n"
+                    + "请到「设置 → 应用」里找到「Android System WebView」，"
+                    + "如果它被停用了就点「启用」，能更新就更新；"
+                    + "也可以在应用商店更新一次 Chrome。然后重新打开 DSH。\n\n"
+                    + "错误信息：" + t);
+            body.setTextColor(Color.parseColor("#9AA3AF"));
+            body.setTextSize(14);
+            body.setLineSpacing(0, 1.45f);
+            box.addView(body);
+
+            Button retry = new Button(this);
+            retry.setText("重新打开");
+            retry.setAllCaps(false);
+            retry.setOnClickListener(v -> {
+                try {
+                    Intent i = new Intent(this, MainActivity.class);
+                    i.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                    startActivity(i);
+                    finish();
+                } catch (Throwable ignored) {
+                }
+            });
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.topMargin = (int) (18 * d);
+            lp.gravity = Gravity.START;
+            box.addView(retry, lp);
+
+            setContentView(scroll);
+        } catch (Throwable ignored) {
+            // 连原生视图都建不起来，就只能退出 —— 至少 crash.log 里有记录
+            finish();
         }
     }
 

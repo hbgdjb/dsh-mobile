@@ -85,7 +85,17 @@ async function renderHud(width, height) {
         tasks: [{ title: "下载离线语音模型", progress: 45 }],
         messages: [
           { role: "user", text: "帮我看看这个报错是什么意思" },
-          { role: "assistant", text: "这是 SDK 版本不匹配导致的" },
+          {
+            role: "assistant",
+            text:
+              (
+                "这是 SDK 版本不匹配导致的。构建脚本里用的是 build-tools 34，" +
+                "而 Gradle 插件锁在 33，两者对 aapt2 的参数理解不一致，" +
+                "所以资源编译这一步会报 unrecognized flag。把 build-tools 改成 33.0.2，" +
+                "或者把 AGP 升到 8.1 以上就一致了。改完记得 ./gradlew clean，" +
+                "缓存里还留着上一轮的 aapt2 产物。"
+              ).repeat(5),
+          },
         ],
         running: true,
         look: "thinking",
@@ -105,9 +115,12 @@ async function renderHud(width, height) {
 
     const cs = getComputedStyle(el);
     const rect = el.getBoundingClientRect();
-    const rows = [...el.querySelectorAll(".hud-body .hud-row, .hud-body .hud-msg")];
+    const rows = [...el.querySelectorAll(".hud-body .hud-row")];
+    const msgs = [...el.querySelectorAll(".hud-body .hud-msg")];
+    const bodyEl = el.querySelector(".hud-body");
+    const bodyCs = getComputedStyle(bodyEl);
 
-    // 把宽度强行改成 250 / 300，看高度变不变
+    // 把宽度强行改成 250 / 300，看单行行高会不会被折行带偏
     el.style.width = "250px";
     const h250 = el.getBoundingClientRect().height;
     el.style.width = "300px";
@@ -123,6 +136,14 @@ async function renderHud(width, height) {
       overflowX: document.documentElement.scrollWidth > window.innerWidth,
       rowCount: rows.length,
       rowWhiteSpace: rows.length ? getComputedStyle(rows[0]).whiteSpace : "",
+      msgCount: msgs.length,
+      msgWhiteSpace: msgs.length ? getComputedStyle(msgs[0]).whiteSpace : "",
+      msgLines: msgs.length ? Math.round(msgs[msgs.length - 1].getBoundingClientRect().height) : 0,
+      bodyOverflowY: bodyCs.overflowY,
+      bodyTouchAction: bodyCs.touchAction,
+      bodyMaxHeight: bodyCs.maxHeight,
+      bodyScrollable: bodyEl.scrollHeight > bodyEl.clientHeight + 1,
+      bodyClientHeight: bodyEl.clientHeight,
       h250: Math.round(h250),
       h300: Math.round(h300),
     };
@@ -145,16 +166,26 @@ check(
   big.bg
 );
 check(
-  "每行都是单行（宽度变化不会换行）",
+  "会话 / 任务行仍是单行（不被折行带高）",
   big.rowWhiteSpace === "nowrap",
   big.rowWhiteSpace
 );
+/* 0.62.0：消息区从「一行省略」改成「折行 + 可滚动」。
+   这条断言反过来守：消息**必须**能换行，否则长回复又被截成半句。 */
+check("消息不再单行省略", big.msgWhiteSpace === "pre-wrap", big.msgWhiteSpace);
+check("消息真的折成了多行", big.msgLines > 40, `${big.msgLines}px 高`);
+check("消息区可纵向滚动", big.bodyOverflowY === "auto", big.bodyOverflowY);
+check("消息区允许手指上下滑", big.bodyTouchAction === "pan-y", big.bodyTouchAction);
+check("消息区高度有上限", big.bodyMaxHeight !== "none" && big.bodyClientHeight <= 400,
+  `${big.bodyMaxHeight} / 实际 ${big.bodyClientHeight}px`);
+check("长回复确实撑出了滚动", big.bodyScrollable === true, "");
 check(
-  "高度不随宽度变化",
-  big.h250 === big.h300,
-  `250px 宽时 ${big.h250}px 高 / 300px 宽时 ${big.h300}px 高`
+  "消息折行后整体高度仍受控",
+  big.h300 <= 520,
+  `300px 宽时 ${big.h300}px 高`
 );
 check("有内容行（不是空壳）", big.rowCount >= 4, `${big.rowCount} 行`);
+check("消息渲染出 2 条", big.msgCount === 2, `${big.msgCount} 条`);
 check("没有横向溢出", big.overflowX === false, "");
 
 /* ============================================================

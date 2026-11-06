@@ -37,6 +37,10 @@ export function retryable(err) {
   if (err.produced) return false;
 
   const code = Number(err.httpStatus) || 0;
+  // 已连上、流读到一半断了：这是网络抖动，不是服务端拒绝。
+  // 它没有状态码（0），文案也不一定带 Socket / 超时字样，所以单独认。
+  // 放在 produced 检查之后 —— 已经吐过字仍然不能重试，否则同一段说两遍。
+  if (err.streamBroken) return true;
   if (code === 408 || code === 425 || code === 429) return true;
   if (code >= 500 && code <= 599) return true;
   if (code >= 400 && code < 500) return false;

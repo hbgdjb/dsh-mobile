@@ -136,7 +136,9 @@ check("长会话：无首页残留", !r2.hasHome);
 check("长会话：渲染窗口生效", r2.domCount === 60, `DOM消息数=${r2.domCount}`);
 check("长会话：顺序单调", r2.orderOk);
 check("长会话：无横向溢出", r2.overflowX === 0);
-check("长会话：停在底部", r2.atBottom === 0, `atBottom=${r2.atBottom}`);
+// 允许 1px：scrollHeight 是取整值，而 scrollTop 会被浏览器裁到真实可滚范围，
+   // 行高不是整数时（15px × 1.78）两者天然差 1。语义是「差不到一行」，不是「精确等于 0」。
+check("长会话：停在底部", r2.atBottom <= 1, `atBottom=${r2.atBottom}`);
 check("无未捕获异常", errors.length === 0, errors.join(" | "));
 
 console.log(failed === 0 ? "\n全部通过 ✓" : `\n${failed} 项失败 ✗`);

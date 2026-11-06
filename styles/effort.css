@@ -114,6 +114,11 @@
 
 .ces-ticks {
   position: absolute;
+  /* inset 是 Chrome 87 的简写，老内核整条丢弃 —— 先逐边写一遍 */
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
   inset: 0;
   pointer-events: none;
 }
@@ -134,6 +139,11 @@
 
 .ces-energy__sweep {
   position: absolute;
+  /* inset 是 Chrome 87 的简写，老内核整条丢弃 —— 先逐边写一遍 */
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
   inset: 0;
   background: linear-gradient(100deg, transparent 18%, rgba(255, 255, 255, 0.3) 50%, transparent 82%);
   transform: translateX(100%);

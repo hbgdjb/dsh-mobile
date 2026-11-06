@@ -4,6 +4,8 @@
    ============================================================ */
 
 import * as FS from "./fs.js";
+import { FORMAT_IDS, MODEL_ID_RE, normalizeFormat } from "./formats.js";
+import { normalizeApiKey, keyShape } from "./apikeys.js";
 
 const LS_KEY = "dsh.mobile.state.v1";
 const DAY = 86400000;
@@ -50,6 +52,72 @@ export const MODES = {
   },
 };
 
+/**
+ * 会话预设：决定「这一场要干什么活」，与 MODES 是两回事。
+ *
+ * MODES 管能力（装哪些工具），PRESETS 管做法（怎么交付）。
+ * 分开的理由：用户可能想用极简模式跑设计任务，两者不该互相锁死。
+ *
+ * 每个 preset 只有一段 prompt，选中的会话才注入 —— 没选就完全不出现，
+ * system prompt 的体积和以前一样。手机上上下文很贵，不能默认常驻四份契约。
+ */
+export const PRESETS = {
+  design: {
+    id: "design",
+    name: "设计",
+    brief: "网页 · 界面 · 图",
+    intro: "产出看得见的东西",
+    prompt: [
+      "【工作模式：设计】做出来，不是描述出来。",
+      "· 先定：给谁看、像什么、交付什么形态。缺信息一次问完。",
+      "· 交付必须能直接打开：网页给单文件 HTML，图给图片文件。只有文字 = 没做完。",
+      "· 做完自己看一眼：手机上会不会塌、字号够不够、对比够不够。",
+      "· 别拿「简约大气」当方向，要说具体的参考或数字。",
+    ].join("\n"),
+  },
+  code: {
+    id: "code",
+    name: "代码",
+    brief: "改代码 · 修 bug",
+    intro: "改动可验证，步子最小",
+    prompt: [
+      "【工作模式：代码】改动可验证，步子最小。",
+      "· 先读再改，不要凭想象重写整个文件。",
+      "· 只改必要的地方，不顺手重构、不换风格。",
+      "· 改完必须真跑一次，把输出贴出来；没跑就说没跑。",
+      "· 报错先定位，连试三次不成就停下说清楚卡在哪。",
+    ].join("\n"),
+  },
+  office: {
+    id: "office",
+    name: "办公",
+    brief: "文档 · 表格 · 汇报",
+    intro: "交付文件，不是聊天记录",
+    prompt: [
+      "【工作模式：办公】交付文件，不是给一段聊天记录。",
+      "· 先给结构，确认后再填内容；信息不够就问，别编。",
+      "· 产物落到工作区文件：文档 .docx / .pdf，表格 .xlsx，汇报 .pptx；源稿留 .md 方便再改。",
+      "· 每个数字标来源；估算要写明是估算。",
+      "· 结论在前，论据在后。",
+    ].join("\n"),
+  },
+  learn: {
+    id: "learn",
+    name: "学习",
+    brief: "问问题 · 留档",
+    intro: "正常回答，答完留档",
+    prompt: [
+      "【工作模式：学习】正常回答，答完留档。不改讲法、不加测验。",
+      "· 答完调用 learn_add：一句话结论 + 2–4 条要点 + 1–3 个标签。",
+      "· 只记结论和要点，不要存整段原文。",
+      "· 寒暄、纯时效查询、无结论的闲聊不记；用户说别记就不记。",
+      "· 记完回一行「已记入学习库：标题」。",
+    ].join("\n"),
+  },
+};
+
+export const PRESET_LIST = Object.values(PRESETS);
+
 export const PERMISSIONS = {
   readonly: { id: "readonly", name: "只读", desc: "只能读取工作区，任何写入都会被拒绝", write: false },
   workspace: { id: "workspace", name: "工作区写入", desc: "可修改工作区文件，越界操作需要批准", write: true },
@@ -71,7 +139,7 @@ export const PERMISSIONS = {
  * 导致设置页显示的版本是错的、MCP 握手报出去的也是旧版本。
  * 从 0.37.0 起与 APK 版本保持一致。
  */
-export const APP_VERSION = "0.53.0";
+export const APP_VERSION = "0.84.0";
 
 /**
  * 不再预置任何模型：模型全部由用户在「模型管理」里自行添加。
@@ -297,6 +365,30 @@ export const PROVIDERS = {
     hint: "聚合多家开源模型的国内推理平台，OpenAI 兼容。",
     console: "https://cloud.siliconflow.cn/account/ak",
   },
+  agnes: {
+    name: "Agnes AI",
+    // 默认国内站：本应用的用户大多在国内，.cn 走境内节点，首字节快一个量级。
+    // 国际站的 Key 也别担心 —— 连不上时会自动换到 .com 并记住结果。
+    baseUrl: "https://apihub.agnes-ai.cn/v1",
+    endpoints: [
+      // 每个 chip 都必须带 format：只给 Anthropic 那个带的话，用户从
+      // Anthropic 切回「标准」时，地址换了、格式还停在 anthropic，照样 404。
+      { label: "国内站 · 境内节点", baseUrl: "https://apihub.agnes-ai.cn/v1", format: "openai" },
+      { label: "国际站 · 新加坡", baseUrl: "https://apihub.agnes-ai.com/v1", format: "openai" },
+      { label: "Anthropic 兼容（实验）", baseUrl: "https://apihub.agnes-ai.cn/v1", format: "anthropic" },
+    ],
+    defaultCtx: 524288,
+    suggest: [
+      { id: "agnes-3.0-flash", ctx: 524288, note: "agnes-3.0-flash · 512K 上下文" },
+      { id: "agnes-2.5-flash", ctx: 262144, note: "agnes-2.5-flash · 快速档" },
+      { id: "agnes-2.5-pro-alpha", ctx: 262144, note: "agnes-2.5-pro-alpha · 预览版" },
+    ],
+    // 文档只承诺 model / messages / temperature / top_p / max_tokens / stream /
+    // tools / tool_choice / chat_template_kwargs。不要照搬 OpenAI 的
+    // stream_options 与 reasoning_effort，Agnes 没列这两个字段。
+    hint: "Agnes AI，OpenAI 兼容；思考模式用 chat_template_kwargs.enable_thinking 开启，本应用会自动换算。国内站与国际站的 Key 不通用：国内站（platform.agnes-ai.cn）的 Key 配 https://apihub.agnes-ai.cn/v1，国际站的配 https://apihub.agnes-ai.com/v1，配错会一律回 401。本版在遇到 401 时会自动试另一个站，成功后写回配置。建议用「标准 · OpenAI 兼容」；Anthropic 兼容档走 /v1/messages，鉴权与参数不同。",
+    console: "https://platform.agnes-ai.cn/",
+  },
   openai: {
     name: "OpenAI",
     baseUrl: "https://api.openai.com/v1",
@@ -308,6 +400,34 @@ export const PROVIDERS = {
     ],
     hint: "OpenAI 官方 API。",
     console: "https://platform.openai.com/api-keys",
+  },
+  /* Claude 官方 API 不是 OpenAI 协议：请求走 /v1/messages，鉴权用
+     x-api-key + anthropic-version，流是命名事件。接它必须经过
+     formats.js 的 anthropic 适配器，不能靠「兼容网关」碰运气。 */
+  anthropic: {
+    name: "Anthropic · Claude 官方",
+    baseUrl: "https://api.anthropic.com",
+    format: "anthropic",
+    defaultCtx: 200000,
+    suggest: [
+      { id: "claude-sonnet-4-5", ctx: 200000 },
+      { id: "claude-opus-4-1", ctx: 200000 },
+      { id: "claude-haiku-4-5", ctx: 200000 },
+    ],
+    hint: "Claude 官方 API，Anthropic Messages 协议；填到域名即可，应用自动补 /v1/messages。",
+    console: "https://console.anthropic.com/settings/keys",
+  },
+  google: {
+    name: "Google · Gemini 官方",
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+    format: "gemini",
+    defaultCtx: 1048576,
+    suggest: [
+      { id: "gemini-2.5-pro", ctx: 1048576 },
+      { id: "gemini-2.5-flash", ctx: 1048576 },
+    ],
+    hint: "Google AI Studio 的 Gemini 接口；Key 走 x-goog-api-key 头，不会出现在 URL 里。",
+    console: "https://aistudio.google.com/apikey",
   },
   groq: {
     name: "Groq",
@@ -333,6 +453,20 @@ export const PROVIDERS = {
     hint: "本机或局域网 Ollama；APK 内已走原生请求，填局域网 IP 即可（如 http://192.168.1.10:11434/v1）。",
     console: "https://ollama.com",
   },
+  /* 原生 Ollama：/api/chat + NDJSON 流，不校验 Key。
+     上面那个 ollama 预设走的是 OpenAI 兼容的 /v1，两条路别混：
+     老用户填的是 /v1，改成新协议会直接把他打挂。 */
+  ollamaNative: {
+    name: "Ollama · 原生协议",
+    baseUrl: "http://localhost:11434",
+    format: "ollama",
+    defaultCtx: 128000,
+    suggest: [],
+    hint: "Ollama 自己的 /api/chat（NDJSON 流），不用 Key；局域网填电脑 IP。",
+    console: "https://ollama.com",
+    local: true,
+    placeholderKey: "ollama-local",
+  },
   lmstudio: {
     name: "LM Studio · 本机",
     baseUrl: "http://localhost:1234/v1",
@@ -340,6 +474,27 @@ export const PROVIDERS = {
     suggest: ["local-model"],
     hint: "LM Studio 本地服务；同一路由下用局域网 IP 访问手机外的电脑。",
     console: "https://lmstudio.ai",
+  },
+  /* OpenDesign Cloud（open-design.ai）：订阅制模型网关，**不是本机服务**。
+     两个平面别混：
+       amr-link.open-design.ai/v1  推理：/models、/chat/completions、/responses  → runtimeKey `sk-amr-…`
+       amr-api.open-design.ai      账户：钱包、套餐、5h/7d 额度窗口          → controlKey `vela_ctrl_…`
+     这里只接推理平面。凭据是网页「API 密钥」页签发的真 Key，Go/Plus/Pro/Max
+     套餐才可用，Free 不支持；所以绝不能标 local 或塞占位符 —— 那会让界面
+     显示「无需 Key」，用户拿着一把假 Key 去请求，只会得到 401。
+     模型不写死：套餐不同可用模型不同，一律由 GET /v1/models 实时探测。 */
+  opendesign: {
+    name: "OpenDesign · Cloud API",
+    baseUrl: "https://amr-link.open-design.ai/v1",
+    format: "openai",
+    endpoints: [
+      { label: "Chat Completions", baseUrl: "https://amr-link.open-design.ai/v1", format: "openai" },
+      { label: "Messages", baseUrl: "https://amr-link.open-design.ai", format: "anthropic" },
+    ],
+    defaultCtx: 200000,
+    suggest: [],
+    hint: "订阅制模型网关（Go / Plus / Pro / Max 套餐，Free 不可用）。在网页「API 密钥」页创建 sk-amr- 开头的 Key，填入后自动探测套餐可用模型。默认走 Chat Completions；单次请求体上限 50 MiB。网关多为 1M 上下文且输入输出共用预算，这里默认按 200K 保守裁剪，可在模型参数里调大。",
+    console: "https://open-design.ai/cloud/dashboard",
   },
   custom: {
     name: "自定义 / 兼容网关",
@@ -350,6 +505,81 @@ export const PROVIDERS = {
     console: "",
   },
 };
+
+/**
+ * OpenDesign Cloud 的 Design Plan 模型目录（Go 套餐 12 个）。
+ * 一手来源：dsh-opendesign-go 的 src/catalog.ts（GO_DESIGN_PLAN_MODELS）。
+ * 用途只有两个：把 /v1/models 返回的显示名反查成真实 ID；探测结果不全时
+ * 在「常用模型」里给出可直接点的参考 ID。
+ * 不冒充实时列表 —— 可用模型仍以账户 GET /v1/models 为准。
+ */
+export const OPEN_DESIGN_MODELS = [
+  { id: "deepseek-v4.1-flash", label: "DeepSeek V4.1 Flash", ctx: 1000000 },
+  { id: "deepseek-v4-flash", label: "DeepSeek V4 Flash", ctx: 1000000 },
+  { id: "deepseek-v4-flash-vision-exp", label: "DeepSeek V4 Flash Vision Exp", ctx: 1000000 },
+  { id: "deepseek-v4-pro", label: "DeepSeek V4 Pro", ctx: 1000000 },
+  { id: "claude-haiku-5.5", label: "Claude Haiku 5.5", ctx: 1000000 },
+  { id: "gpt-6-luna", label: "GPT-6 Luna", ctx: 1050000 },
+  { id: "glm-5.3-flash", label: "GLM-5.3 Flash", ctx: 1000000 },
+  { id: "glm-5.3-flashx", label: "GLM-5.3 Flash-X", ctx: 1000000 },
+  { id: "kimi-k2.7-code", label: "Kimi K2.7 Code", ctx: 262144 },
+  { id: "mimo-v2.6-flash", label: "MiMo V2.6 Flash", ctx: 1000000 },
+  { id: "mimo-v2.6-pro", label: "MiMo V2.6 Pro", ctx: 1000000 },
+  { id: "hy4-preview", label: "Hunyuan H4 Preview", ctx: 1000000 },
+];
+
+const foldModelName = (v) => String(v || "").toLowerCase().replace(/[\s_.\-]+/g, "");
+const OPEN_DESIGN_FOLD = new Map(
+  OPEN_DESIGN_MODELS.flatMap((m) => [
+    [foldModelName(m.id), m.id],
+    [foldModelName(m.label), m.id],
+  ])
+);
+
+/** 把「deepSeek V4.1 Flash」这类显示名纠正回可发送的 ID；已是 ID 则原样返回。 */
+export function normalizeOpendesignModelId(raw) {
+  const v = String(raw || "").trim();
+  return v ? OPEN_DESIGN_FOLD.get(foldModelName(v)) || v : "";
+}
+
+/**
+ * 探测结果收口：OpenDesign 做显示名反查并丢掉仍不像 ID 的条目，
+ * 其它供应商只做有效性过滤。放在 fetchModelList 里统一调用，
+ * UI 拿到的就一定可以直接写进请求体。
+ */
+export function resolveDiscoveredModels(providerKey, items) {
+  const list = Array.isArray(items) ? items : [];
+  const isOpenDesign = String(providerKey || "") === "opendesign";
+  // Agnes 的 /v1/models 会把视频、图像模型一起列出来。它们同样挂在
+  // /v1/chat/completions 下，但用途完全不同 —— 加进聊天模型列表后
+  // 用户一点就报 400/404，还以为 Key 有问题。
+  const isAgnes = String(providerKey || "") === "agnes";
+  const out = [];
+  const seen = new Set();
+  for (const it of list) {
+    if (!it) continue;
+    let id = String(it.id || "").trim();
+    const label = String(it.label || "").trim();
+    if (isOpenDesign && !id && label) id = normalizeOpendesignModelId(label);
+    if (isOpenDesign && id) id = normalizeOpendesignModelId(id);
+    if (isAgnes && /-(?:video|image)(?:-|$)/i.test(id)) continue;
+    if (!id || !MODEL_ID_RE.test(id) || seen.has(id)) continue;
+    seen.add(id);
+    out.push({
+      id,
+      label: label && label !== id ? label : "",
+      ctx: Number(it.ctx) || 0,
+    });
+  }
+  // 这里不再二次排序：上游（或解析层）给的顺序就照原样交给 UI，
+  // 有些网关按推荐度排好了，再排一次反而把常用的挤到后面。
+  return out;
+}
+
+// 「常用模型」给 OpenDesign 一份核实过的参考 ID：/v1/models 探测失败或只返回
+// 部分模型时，用户仍可直接点一个正确 ID，不用照着显示名手抄。
+// 这里不冒充实时列表，实际可用模型仍以账户 /v1/models 为准。
+PROVIDERS.opendesign.suggest = OPEN_DESIGN_MODELS.map((m) => ({ id: m.id, ctx: m.ctx }));
 
 export const PROVIDER_COUNT = Object.keys(PROVIDERS).length;
 
@@ -396,6 +626,8 @@ const VISION_HINTS = [
   /yi-vision/i,
   /internvl/i,
   /kimi[\w.-]*vl/i,
+  // Agnes 2.5 / 3.0 都接受 messages[].content 里的 image_url（公开可访问 URL）
+  /agnes-(?:2\.5|3\.0)/i,
 ];
 
 /** 该模型是否大概率支持图片输入（仅作默认值，用户可在模型参数里覆盖）。 */
@@ -436,13 +668,14 @@ function seedPlugins() {
     {
       id: "office",
       name: "DSH Office",
-      desc: "把 Markdown / CSV 导出为 Word、Excel，产物可直接用 WPS / Office 打开。",
-      version: "1.8.0",
+      desc: "把 Markdown 导出为 Word、PPT、PDF，把 CSV 导出为 Excel；也能读 PDF 正文。产物可直接用 WPS / Office 打开。",
+      version: "2.0.0",
       author: "dsh",
       official: true,
       enabled: true,
       preinstalled: true,
-      tools: ["office_export"],
+      removable: false,
+      tools: ["office_export", "pdf_create", "pdf_read"],
       scopes: ["workspace"],
     },
     {
@@ -454,6 +687,7 @@ function seedPlugins() {
       official: false,
       enabled: true,
       preinstalled: true,
+      removable: false,
       tools: [],
       scopes: ["approval", "workspace"],
     },
@@ -466,6 +700,7 @@ function seedPlugins() {
       official: false,
       enabled: true,
       preinstalled: true,
+      removable: false,
       license: "MIT",
       source: "github.com/Microqian2th/dsh-codex-effort-slider",
       tools: [],
@@ -480,6 +715,7 @@ function seedPlugins() {
       official: false,
       enabled: true,
       preinstalled: true,
+      removable: false,
       tools: ["ops_status", "ops_cleanup"],
       scopes: ["runtime", "workspace"],
     },
@@ -490,6 +726,8 @@ function seedPlugins() {
       version: "1.4.2",
       author: "dsh",
       official: true,
+      preinstalled: true,
+      removable: false,
       enabled: true,
       tools: ["shell"],
       scopes: ["workspace"],
@@ -501,6 +739,8 @@ function seedPlugins() {
       version: "1.1.0",
       author: "dsh",
       official: true,
+      preinstalled: true,
+      removable: false,
       enabled: true,
       tools: ["web_search"],
       scopes: ["network"],
@@ -513,6 +753,8 @@ function seedPlugins() {
       author: "dsh",
       official: true,
       experimental: true,
+      preinstalled: true,
+      removable: false,
       enabled: true,
       tools: ["spawn_subagent"],
       scopes: ["delegate"],
@@ -524,6 +766,8 @@ function seedPlugins() {
       version: "1.0.6",
       author: "dsh",
       official: true,
+      preinstalled: true,
+      removable: false,
       enabled: true,
       tools: ["task_schedule"],
       scopes: ["background"],
@@ -535,6 +779,8 @@ function seedPlugins() {
       version: "0.6.1",
       author: "dsh",
       official: true,
+      preinstalled: true,
+      removable: false,
       experimental: true,
       enabled: true,
       tools: [],
@@ -543,11 +789,13 @@ function seedPlugins() {
     {
       id: "teams",
       name: "智能体团队",
-      desc: "团队协作、成员列表与共享任务看板。",
+      desc: "把一个目标拆成多条任务并行派出，结果汇在团队任务板。",
       version: "0.4.0",
       author: "dsh",
       official: true,
       experimental: true,
+      preinstalled: true,
+      removable: false,
       enabled: false,
       tools: ["agent_team"],
       scopes: ["delegate", "shared-state"],
@@ -555,26 +803,16 @@ function seedPlugins() {
     {
       id: "review",
       name: "自动授权审查",
-      desc: "对高风险工具调用做二次模型复核，再决定是否放行。",
+      desc: "执行前复核越界路径、整目录删除与远程脚本直通，命中即拦下。",
       version: "0.3.2",
       author: "dsh",
       official: true,
       experimental: true,
+      preinstalled: true,
+      removable: false,
       enabled: false,
       tools: [],
       scopes: ["approval"],
-    },
-    {
-      id: "pomodoro",
-      name: "番茄钟",
-      desc: "会话内悬浮计时器，25 分钟专注 / 5 分钟休息。",
-      version: "0.1.0",
-      author: "you",
-      official: false,
-      enabled: false,
-      tools: [],
-      scopes: ["ui.slot"],
-      installedAt: now() - DAY,
     },
   ];
 }
@@ -609,7 +847,12 @@ const DEFAULT_STATE = () => ({
     mode: "standard",
     permission: "workspace",
     approval: "ask",
-    maxSteps: 24,
+    /**
+     * 按会话隔离工作区：开启后每个会话的文件存在 sessions/<id>/ 下，
+     * 别的会话看不见也覆盖不到。关掉则回到 0.71.0 及以前的全局共用。
+     * 资料库不受这个开关影响，始终跨会话可用。
+     */
+    isolateWorkspace: true,
     theme: "dark",
     motion: true,
     searchEndpoint: "",
@@ -618,6 +861,8 @@ const DEFAULT_STATE = () => ({
     fontScale: 1,
     density: "comfortable",
     notifyOnDone: true,
+    /** 键盘截的图是否直接发出去（默认只加为附件） */
+    imeAutoSend: false,
     haptics: true,
     requestTimeout: 60,
     hudEnabled: false,
@@ -647,6 +892,28 @@ const DEFAULT_STATE = () => ({
   fsBackend: "",
   fsRoot: "",
   plugins: seedPlugins(),
+  /**
+   * 已安装的技能包（SKILL.md 形态）。
+   *
+   * 只存元数据（id / name / description / 文件数），正文在工作区
+   * skills/<id>/ 里 —— 一份 SKILL.md 动辄二十几 KB，塞进 localStorage
+   * 会和插件代码抢那 5 MB 配额。
+   */
+  skills: [],
+  /**
+   * 智能体团队的最近几次任务板。
+   *
+   * 只留最近 5 次 —— 它是给人看的过程记录，不是账本。
+   * 任务正文由子 Agent 产出，单条已截断到 600 字符，不会撑爆 localStorage。
+   */
+  team: { runs: [] },
+  /**
+   * 自动授权审查的计数：扫了多少次、拦下多少次。
+   *
+   * 只落两个整数。用户要的是「它到底有没有在工作」，
+   * 不是把每次判断的理由都存一遍。
+   */
+  review: { scans: 0, blocked: 0 },
   /**
    * Node 插件清单（从 Node 运行时读来的）。
    *
@@ -734,6 +1001,38 @@ function load() {
         m.label = String(m.name || m.apiModel || m.id || "未命名模型");
       }
 
+      // ============ 老条目补协议 ============
+      //
+      // 0.66 之前整站只认 OpenAI 一种协议，所有条目都没有 format。
+      // 这里补成 "openai" 而不是留空：UI 判断、批量添加去重、缓存 key
+      // 都直接读它，到处写 `|| "openai"` 迟早漏一个。
+      // 插件模型（source: "node-llm"）不走 HTTP，协议对它没意义，跳过。
+      for (const m of parsed.settings.customModels) {
+        if (!m || typeof m !== "object") continue;
+        if (m.source === "node-llm" || String(m.provider || "").startsWith("node__")) continue;
+        if (FORMAT_IDS.indexOf(String(m.format || "")) < 0) m.format = "openai";
+      }
+
+      // ============ OpenDesign：显示名 → 真实 ID ============
+      // 0.67.0 的探测把 /v1/models 里的 name 当成了 id（例如
+      // 「deepSeek V4.1 Flash」），发出去网关找不到模型，直接 404。
+      // 升级时按官方目录就地纠正，并把可读名挪去 label，用户不用手改。
+      for (const m of parsed.settings.customModels) {
+        if (!m || typeof m !== "object") continue;
+        const isOd =
+          m.providerKey === "opendesign" ||
+          /amr-link\.open-design\.ai/i.test(String(m.baseUrl || ""));
+        if (!isOd) continue;
+        const fixed = normalizeOpendesignModelId(m.apiModel);
+        if (fixed && fixed !== m.apiModel) {
+          const row = OPEN_DESIGN_MODELS.find((x) => x.id === fixed);
+          m.apiModel = fixed;
+          if (row) m.label = row.label;
+          // 旧的「连接失败 · HTTP 404」是坏 ID 造成的，别让它继续挂在模型上
+          if (parsed.settings.modelStatus) delete parsed.settings.modelStatus[m.id];
+        }
+      }
+
       const picked =
         parsed.settings.customModels.find((m) => m && m.id === parsed.settings.model) || null;
       if (!parsed.settings.contextWindow) parsed.settings.contextWindow = picked?.ctx || 128000;
@@ -762,31 +1061,70 @@ function load() {
       // 迁移后不再保留旧字段，避免同一把 Key 在导出里出现两次
       if (parsed.settings.apiKey !== undefined) parsed.settings.apiKey = "";
       if (parsed.settings.requestTimeout === undefined) parsed.settings.requestTimeout = 60;
-      // 默认步数 8 → 24：老配置一次性提升，之后仍可在设置里手动调低
-      if (parsed.settings.stepsBoosted !== true) {
-        parsed.settings.maxSteps = Math.max(24, Number(parsed.settings.maxSteps) || 0);
-        parsed.settings.stepsBoosted = true;
-      }
+      // 0.67.0 起工具调用步数不再设上限。老配置里的 maxSteps（8/24/…）
+      // 会被 runtime 当成内部限流重新变成一道硬墙，必须清掉，
+      // 否则用户升级后照样在 24 步被拦，还找不到设置项去改。
+      delete parsed.settings.maxSteps;
+      delete parsed.settings.stepsBoosted;
       if (parsed.settings.notifyOnDone === undefined) parsed.settings.notifyOnDone = true;
       if (parsed.settings.haptics === undefined) parsed.settings.haptics = true;
       if (parsed.settings.fontScale === undefined) parsed.settings.fontScale = 1;
       if (parsed.settings.density === undefined) parsed.settings.density = "comfortable";
       if (!parsed.settings.profileName) parsed.settings.profileName = "本机用户";
 
-      // 0.8 及以前只有全局 baseUrl/contextWindow。首次升级时把它们归到当前模型，
+      // 0.8 及以前只有全局 baseUrl。首次升级时把它归到当前模型，
       // 之后每个模型各自保存，切换模型不会再互相覆盖。
+      //
+      // contextWindow 不再迁移：全局默认就是 128000，一旦把它写成
+      // 某个模型的覆盖值，512K / 1M 的模型每次重启都会被砍回 128K。
+      // 这不是理论风险 —— 新用户「添加模型 → 选中 → 重启」就会命中。
       const hadOverrides = Object.keys(parsed.settings.modelOverrides).length > 0;
       if (!hadOverrides && picked) {
         const patch = {};
         const oldBase = String(parsed.settings.baseUrl || "").trim();
         if (oldBase && oldBase !== String(picked.baseUrl || "").trim()) patch.baseUrl = oldBase;
-        const oldCtx = Number(parsed.settings.contextWindow) || 0;
-        if (oldCtx && oldCtx !== Number(picked.ctx)) patch.ctx = oldCtx;
         if (Object.keys(patch).length) parsed.settings.modelOverrides[picked.id] = patch;
+      }
+
+      // 一次性清掉旧版本按上面那段逻辑写坏的 ctx 覆盖：
+      // 只认「覆盖值正好是 128000、而模型自身窗口更大」这一种形态，
+      // 清完打标记，之后用户手动把某个模型改成 128K 不会再被碰。
+      if (!parsed.settings.ctxOverrideFixed) {
+        for (const [id, ov] of Object.entries(parsed.settings.modelOverrides)) {
+          if (!ov || typeof ov !== "object") continue;
+          if (Number(ov.ctx) !== 128000) continue;
+          const model = (parsed.settings.customModels || []).find((x) => x && x.id === id);
+          if (!model || Number(model.ctx) <= 128000) continue;
+          delete ov.ctx;
+          if (!Object.keys(ov).length) delete parsed.settings.modelOverrides[id];
+          persistAfterLoad = true;
+        }
+        parsed.settings.ctxOverrideFixed = true;
+        // 标记本身也要落盘，否则下次启动又会把用户后来手动改的 128K 清掉
+        persistAfterLoad = true;
       }
     }
     const plugins = Array.isArray(parsed.plugins) ? parsed.plugins : base.plugins;
+
+    // 0.80.0 起不再预置「番茄钟」示例。
+    //
+    // 只删种子形态（没有 codePath、不是我装的真插件）——
+    // 万一用户从市场装过同名插件，那条记录要留着。
+    // 删完立刻落盘，否则每次启动都要再算一遍，且设置页的计数会来回跳。
+    const withoutPomodoro = plugins.filter(
+      (p) => !(p && p.id === "pomodoro" && !p.codePath && p.removable !== true)
+    );
+    if (withoutPomodoro.length !== plugins.length) {
+      plugins.length = 0;
+      plugins.push(...withoutPomodoro);
+      persistAfterLoad = true;
+    }
+
     // 迁移：已安装过旧版本时，补齐新内置插件（不覆盖用户开关）
+    //
+    // 内置插件现在一律 removable:false：它们是宿主能力，不是装进来的包。
+    // 以前它们可以被「卸载」，卸掉之后既没有下载地址、也不在官方清单里，
+    // 用户就再也找不回来了 —— 那正是「插件不存在也无法下载」的来源。
     base.plugins
       .filter((p) => p.preinstalled)
       .forEach((bp) => {
@@ -805,6 +1143,8 @@ function load() {
           license: bp.license,
           source: bp.source,
           preinstalled: true,
+          removable: false,
+          experimental: bp.experimental,
           tools: bp.tools,
           scopes: bp.scopes,
         };
@@ -832,6 +1172,14 @@ function load() {
       fsBackend: typeof parsed.fsBackend === "string" ? parsed.fsBackend : "",
       fsRoot: typeof parsed.fsRoot === "string" ? parsed.fsRoot : "",
       plugins,
+      team: parsed.team && Array.isArray(parsed.team.runs) ? parsed.team : base.team,
+      review:
+        parsed.review && typeof parsed.review === "object"
+          ? {
+              scans: Number(parsed.review.scans) || 0,
+              blocked: Number(parsed.review.blocked) || 0,
+            }
+          : base.review,
       automations: Array.isArray(parsed.automations) ? parsed.automations : base.automations,
       safety: parsed.safety || base.safety,
       diagnostics: parsed.diagnostics && Array.isArray(parsed.diagnostics.requests)
@@ -1039,13 +1387,22 @@ function tinySession(s) {
   };
 }
 
-export const state = load();
+/** load() 做了需要立刻落盘的修复时置 true；state 初始化后才能调 save。 */
+let persistAfterLoad = false;
 
+// 这几个是 save() 的运行状态。必须放在 state 初始化之前：
+// 加载期的一次性修复要当场落盘，而 save 会先 clearTimeout(saveTimer)。
 const listeners = new Set();
 let saveTimer = null;
 let sessionSaveTimers = new Map();
 /** 有新内容、还没落盘的会话 id */
 const dirtySessions = new Set();
+
+export const state = load();
+
+// 一次性修复必须当场写回去：只改内存的话，下次启动标记又没了，
+// 用户后来手动改成的 128K 会被反复清掉。
+if (persistAfterLoad) save(true);
 
 export function subscribe(fn) {
   listeners.add(fn);
@@ -1146,6 +1503,9 @@ export const activeSession = () =>
 
 export const currentMode = () => MODES[state.settings.mode] || MODES.standard;
 
+/** 当前会话选的工作模式（设计/代码/办公/学习）；没选返回 null。 */
+export const currentPreset = () => PRESETS[activeSession()?.preset] || null;
+
 /** 模型目录里的原始默认值（用于「恢复默认」）。 */
 export function modelDefaults(m) {
   return {
@@ -1153,6 +1513,7 @@ export function modelDefaults(m) {
     apiModel: m.apiModel || "",
     baseUrl: m.baseUrl || "",
     ctx: Number(m.ctx) || 128000,
+    format: modelFormat(m),
     temperature: null,
     maxTokens: null,
     supportsEffort: !!m.supportsEffort,
@@ -1195,11 +1556,60 @@ export const modelApiId = (model = currentModel()) => {
 /** 某个模型对应的服务槽位。 */
 export const providerKeyOf = (model = currentModel()) => model?.providerKey || "custom";
 
+/**
+ * 某个模型说哪种协议。
+ *
+ * 优先级：条目自己带的 format → 供应方预设的 format → OpenAI 兼容。
+ * 三条路都要有，因为：手填的网关没有预设；老的预设没有 format；
+ * 而用户可以把「Anthropic 官方」这个预设下的某个模型单独改成别的协议。
+ */
+export function modelFormat(model = currentModel()) {
+  if (!model) return "openai";
+  const own = String(model.format || "");
+  if (FORMAT_IDS.indexOf(own) >= 0) return own;
+  const preset = PROVIDERS[providerKeyOf(model)];
+  const fromPreset = String((preset && preset.format) || "");
+  return FORMAT_IDS.indexOf(fromPreset) >= 0 ? fromPreset : "openai";
+}
+
 /** 某个模型的 Key（按 provider 分槽，切换服务不会串 Key）。 */
 export const apiKeyFor = (model = currentModel()) => {
   const slot = providerKeyOf(model);
-  return String(state.settings.keys?.[slot] || "").trim();
+  // 归档里可能存着带空格 / Bearer 前缀 / 换行的旧值。请求发出前统一清洗，
+  // 否则一把在电脑上有效的 Key，到了移动端会变成 `Bearer Bearer sk-…`。
+  const { key } = normalizeApiKey(state.settings.keys?.[slot]);
+  if (key) return key;
+  // 本地服务（Ollama / LM Studio 一类）通常不校验 Key，
+  // 但请求头需要一个非空值，否则会被当成「未配置」拦在门口 ——
+  // 用户只能随手编一串字符，既没意义又容易被误认为真凭据。
+  const preset = PROVIDERS[slot];
+  return preset && preset.local ? String(preset.placeholderKey || "local") : "";
 };
+
+/**
+ * Key 诊断：401 时告诉用户「当前模型到底在读哪个槽、读到了什么」。
+ *
+ * 分槽保存是好事，但也带来一个真实困惑：在「账号与服务」里给 A 服务填了
+ * Key，模型却挂在 B 槽上 —— 请求带着另一把 Key（或干脆空着）发出去，
+ * 服务端回 401，界面显示「Key 无效」，用户怎么检查键都觉得没错。
+ */
+export function keyDiagnosis(model = currentModel()) {
+  const slot = providerKeyOf(model);
+  const keys = state.settings.keys || {};
+  const raw = String(keys[slot] || "");
+  const { key, notes } = normalizeApiKey(raw);
+  const filledElsewhere = Object.entries(keys)
+    .filter(([k, v]) => k !== slot && normalizeApiKey(v).key)
+    .map(([k]) => k);
+  return {
+    slot,
+    key,
+    shape: keyShape(key),
+    cleaned: notes,
+    filledElsewhere,
+    empty: !key,
+  };
+}
 export const apiKeyForCurrent = () => apiKeyFor(currentModel());
 export const hasKeyFor = (model) => {
   // 插件提供的模型没有 Key —— 它的端点在 Node 里的 adapter 上。
@@ -1283,13 +1693,29 @@ export function upsertCustomModel(model) {
 /* ---------------- 可用模型目录 ----------------
    一次获取、长期复用：模型面板不再要求用户记 ID。 */
 
-/** 记住某服务商探测到的模型清单（按 baseUrl 区分端点）。 */
-export function rememberModelCatalog(slot, baseUrl, ids) {
-  const key = slot || "custom";
+/**
+ * 记住某服务商探测到的模型清单（按 baseUrl + 协议区分）。
+ *
+ * 缓存 key 必须带协议：同一个网关可能同时开 OpenAI 兼容与 Anthropic 兼容
+ * 两个入口，返回的模型清单并不一样；只按 slot 存会串。
+ */
+export function rememberModelCatalog(slot, baseUrl, ids, options = {}) {
+  const format = normalizeFormat(options.format);
+  const key = `${slot || "custom"}|${format}`;
   const map = state.settings.modelCatalog || (state.settings.modelCatalog = {});
+  const items = (Array.isArray(options.items) ? options.items : [])
+    .map((it) => ({
+      id: String((it && it.id) || ""),
+      label: String((it && it.label) || ""),
+      ctx: Number(it && it.ctx) || 0,
+    }))
+    .filter((it) => it.id)
+    .slice(0, 1000);
   map[key] = {
     baseUrl: String(baseUrl || "").replace(/\/+$/, ""),
-    ids: Array.from(new Set((ids || []).map(String).filter(Boolean))),
+    format,
+    ids: Array.from(new Set((ids || []).map(String).filter(Boolean))).slice(0, 1000),
+    items,
     ts: Date.now(),
   };
   save(true);
@@ -1297,12 +1723,51 @@ export function rememberModelCatalog(slot, baseUrl, ids) {
 }
 
 /** 取某服务商缓存过的模型清单；endpoint 不匹配时返回空。 */
-export function catalogFor(slot, baseUrl = "") {
-  const row = (state.settings.modelCatalog || {})[slot || "custom"];
+export function catalogFor(slot, baseUrl = "", format = "openai") {
+  const map = state.settings.modelCatalog || {};
+  const fmt = normalizeFormat(format);
+  // 0.65 及以前的旧 key 是裸 slot、且只有 OpenAI 一种协议 —— 只给它回退
+  let row = map[`${slot || "custom"}|${fmt}`];
+  if (!row && fmt === "openai") row = map[slot || "custom"];
   if (!row || !Array.isArray(row.ids)) return [];
   const now = String(baseUrl || "").replace(/\/+$/, "");
   if (now && row.baseUrl && row.baseUrl !== now) return [];
   return row.ids;
+}
+
+/** 同 catalogFor，但要的是带名称/窗口的完整条目。 */
+export function catalogItemsFor(slot, baseUrl = "", format = "openai") {
+  const map = state.settings.modelCatalog || {};
+  const fmt = normalizeFormat(format);
+  let row = map[`${slot || "custom"}|${fmt}`];
+  if (!row && fmt === "openai") row = map[slot || "custom"];
+  if (!row) return [];
+  const now = String(baseUrl || "").replace(/\/+$/, "");
+  if (now && row.baseUrl && row.baseUrl !== now) return [];
+  return Array.isArray(row.items) ? row.items : [];
+}
+
+/**
+ * 批量新增模型。
+ *
+ * 探测一次可能带回来几十个模型，逐个 upsert 就是几十次 save + emit ——
+ * 每次 emit 都会触发整页重渲染，手机上肉眼可见地卡。这里合并成一次。
+ */
+export function addCustomModels(models) {
+  const list = Array.isArray(state.settings.customModels) ? [...state.settings.customModels] : [];
+  const added = [];
+  (models || []).forEach((m) => {
+    if (!m || !m.id) return;
+    if (list.some((x) => x && x.id === m.id)) return;
+    list.push(m);
+    added.push(m);
+  });
+  if (added.length) {
+    state.settings.customModels = list;
+    save(true);
+    emit({ type: "settings", patch: { customModels: list } });
+  }
+  return added;
 }
 
 /** 删除自定义模型；若正在使用，退回 DeepSeek Chat。 */
@@ -1339,13 +1804,16 @@ export const pluginTools = () => {
 
 /* ---------------- 会话 actions ---------------- */
 
-export function createSession({ mode, title = "新会话" } = {}) {
+export function createSession({ mode, preset = null, title = "新会话" } = {}) {
   const s = {
     id: uid("s"),
     title,
     createdAt: now(),
     updatedAt: now(),
     mode: mode || state.settings.mode,
+    // 工作模式跟着会话走，不跟着人走：同一个用户可能上午写代码、下午做汇报。
+    // null 表示「还没选」，此时 system prompt 不注入任何契约。
+    preset: PRESETS[preset] ? preset : null,
     model: state.settings.model,
     workspace: "默认工作区",
     messages: [],
@@ -1361,6 +1829,24 @@ export function switchSession(id) {
   state.activeSessionId = id;
   save();
   emit({ type: "session:switch", id });
+}
+
+/**
+ * 给会话设定工作模式。
+ *
+ * 传 null / 未知值 = 取消，回到「不注入」。
+ * 已经有了消息也能改：system prompt 每轮重新拼，下一句就生效。
+ */
+export function setSessionPreset(id, preset) {
+  const s = state.sessions.find((x) => x.id === id);
+  if (!s) return null;
+  const next = PRESETS[preset] ? preset : null;
+  if (s.preset === next) return s;
+  s.preset = next;
+  s.updatedAt = now();
+  save();
+  emit({ type: "session:preset", id: s.id, preset: next });
+  return s;
 }
 
 export function forkSession(id) {
@@ -1431,6 +1917,140 @@ const normalizePath = (p) =>
     .replace(/\/{2,}/g, "/")
     .trim();
 
+/* ---------------- 按会话隔离工作区 ----------------
+   真实存储路径有两种：
+     · 共享区：`parts/01.html`（0.71.0 及以前留下的文件都在这里）
+     · 会话私有区：`sessions/<sessionId>/parts/01.html`
+   工具、模型、UI 看到的永远是「逻辑路径」`parts/01.html`，
+   映射全部收口在下面这几个函数里，调用方零改动。
+
+   为什么用路径前缀而不是 FS 的 area 分桶：
+   DshFsBridge.areaDir() 把除 library / traj / deps 之外的 area 全部
+   落到同一个 <root>/workspace 目录，native 侧根本不区分 area；
+   而 IndexedDB 侧的 key 是 `${area}:${path}`，区分。
+   用 area 会让「浏览器里隔离、真机上串台」——只能用路径前缀，
+   这样两种后端语义完全一致。 */
+const WS_SESSION_DIR = "sessions/";
+
+/**
+ * 不参与隔离、始终写共享区的目录：
+ * · plugins/  —— Node 插件运行时直接扫 <root>/workspace/plugins/，且 state.plugins 是全局的；
+ *               隔离后插件会「装上了但加载不到」。plugin-install-node.js 本来就用 FS 直写共享区。
+ * · 学习库/   —— 长期记忆，设计上就是跨会话沉淀，不该跟着某个会话消失。
+ * · skills/   —— 技能包装一次就该所有会话可用。放进会话私有区的话，
+ *                在 A 会话装完切到 B，skill_read 会读不到文件，而
+ *                state.skills 是全局的 —— 列表里有、读出来是空，最难查的那种。
+ */
+const WS_SHARED_PREFIXES = ["plugins/", "学习库/", "skills/"];
+const wsIsShared = (logical) =>
+  WS_SHARED_PREFIXES.some((p) => normalizePath(logical).startsWith(p));
+
+function wsScope() {
+  if (state.settings.isolateWorkspace === false || !state.activeSessionId) return "";
+  return `${WS_SESSION_DIR}${state.activeSessionId}/`;
+}
+
+const wsIsSessionOwned = (real) => String(real || "").startsWith(WS_SESSION_DIR);
+
+/** 真实路径 → 当前会话能看到的逻辑路径；属于别的会话时返回空串。 */
+function wsLogical(real, scope = wsScope()) {
+  const p = normalizePath(real);
+  if (!p) return "";
+  if (!scope) return p; // 共用模式：全部真实路径可见（含历史会话前缀）
+  if (p.startsWith(scope)) return p.slice(scope.length);
+  if (wsIsSessionOwned(p)) return "";
+  return p; // 共享区
+}
+
+/** sessions/ 是内部保留目录：外部一律用逻辑路径，不接受带前缀的越界请求。 */
+const wsGuard = (raw) => {
+  const p = normalizePath(raw);
+  return p.startsWith(WS_SESSION_DIR) ? "" : p;
+};
+
+/** 写入一律落到当前会话私有区；白名单目录例外（跨会话共享资产）。 */
+const wsWritePath = (logical, scope = wsScope()) =>
+  wsIsShared(logical) ? normalizePath(logical) : scope + normalizePath(logical);
+
+/** 读取：白名单直读共享区；其余私有区优先、回退共享区。 */
+function wsReadPath(logical, scope = wsScope()) {
+  const p = normalizePath(logical);
+  if (wsIsShared(p)) return p;
+  const own = scope + p;
+  if (state.files[own]) return own;
+  if (state.files[p]) return p;
+  return own;
+}
+
+/** 给 UI / 测试看的隔离概况。 */
+export function sessionWorkspaceInfo() {
+  const scope = wsScope();
+  const all = Object.values(state.files || {}).map((f) => normalizePath(f.path));
+  return {
+    isolated: !!scope,
+    sessionId: state.activeSessionId,
+    scope,
+    own: scope ? all.filter((p) => p.startsWith(scope)).length : all.length,
+    shared: all.filter((p) => !wsIsSessionOwned(p)).length,
+    others: scope ? all.filter((p) => wsIsSessionOwned(p) && !p.startsWith(scope)).length : 0,
+  };
+}
+
+/** 某个会话私有区里有多少文件（删会话时用来如实告知）。 */
+export function sessionFileCount(sessionId) {
+  if (!sessionId) return 0;
+  const scope = `${WS_SESSION_DIR}${sessionId}/`;
+  return Object.values(state.files || {}).filter((f) => normalizePath(f.path).startsWith(scope)).length;
+}
+
+/**
+ * 已删除会话留下的文件：真实路径在 sessions/<id>/ 里，但 sessions[] 已经没有这个 id。
+ *
+ * 0.72.0 有意选择「删会话不删文件」，避免误删用户还想留的产物；
+ * 但那些文件此后任何会话都看不见，也没有入口回收，等于永久占着存储。
+ * 这里只统计、不自动清理，由用户明确点「清理」才删。
+ */
+export function orphanWorkspaceInfo() {
+  const live = new Set((state.sessions || []).map((s) => s.id));
+  const ids = new Set();
+  let count = 0;
+  let bytes = 0;
+  for (const f of Object.values(state.files || {})) {
+    const p = normalizePath(f.path);
+    if (!p.startsWith(WS_SESSION_DIR)) continue;
+    const sid = p.slice(WS_SESSION_DIR.length).split("/")[0];
+    if (!sid || live.has(sid)) continue;
+    ids.add(sid);
+    count += 1;
+    bytes += Number(f.size) || 0;
+  }
+  return { count, bytes, sessions: ids.size };
+}
+
+/** 清理无主文件（只动 sessions/ 下、会话已不存在的路径）。 */
+export async function purgeOrphanWorkspace() {
+  const live = new Set((state.sessions || []).map((s) => s.id));
+  const info = orphanWorkspaceInfo();
+  if (!info.count) return { ...info, removed: 0 };
+  let removed = 0;
+  for (const [key, f] of Object.entries(state.files || {})) {
+    const p = normalizePath(f.path);
+    if (!p.startsWith(WS_SESSION_DIR)) continue;
+    const sid = p.slice(WS_SESSION_DIR.length).split("/")[0];
+    if (!sid || live.has(sid)) continue;
+    try {
+      await FS.deleteDoc("workspace", p);
+      removed += 1;
+    } catch {
+      /* 已不存在：索引照样清掉 */
+    }
+    delete state.files[key];
+  }
+  save();
+  emit({ type: "fs:delete", path: "*" });
+  return { ...info, removed };
+}
+
 /** 路径指纹：忽略全/半角括号、空白、URL 编码与大小写差异。 */
 export function pathKey(p) {
   let s = String(p || "").replace(/\\/g, "/");
@@ -1472,9 +2092,11 @@ export function matchFilePath(candidates, raw, opts = {}) {
   return (up.length ? up : hits).sort((a, b) => a.length - b.length)[0];
 }
 
-/** 解析为已存在的真实路径；解析不到则返回规范化原值（用于新建文件）。 */
+/** 解析为当前视图里已存在的逻辑路径；解析不到返回规范化原值（用于新建文件）。 */
 export function resolveWorkspacePath(path) {
-  return matchFilePath(Object.keys(state.files || {}), path) || normalizePath(path);
+  const raw = wsGuard(path);
+  if (!raw) return "";
+  return matchFilePath(listFiles().map((f) => f.path), raw) || raw;
 }
 
 export let filesReady = false;
@@ -1485,7 +2107,9 @@ export async function initFiles() {
   state.fsBackend = info.backend;
   state.fsRoot = info.root || "";
 
-  // 旧版本把 content 存在 localStorage：一次性搬到真实目录
+  // 旧版本把 content 存在 localStorage：一次性搬到真实目录。
+  // 这些是「共享区」文件（不带会话前缀），升级后所有会话都能看到，
+  // 但任何写入都会落到当前会话私有区，不会污染原件。
   const legacy = Object.values(state.files || {}).filter((f) => f && typeof f.content === "string");
   if (legacy.length) {
     for (const f of legacy) {
@@ -1526,84 +2150,129 @@ export async function syncIndex(area = "workspace") {
   }
 }
 
-export const listFiles = () =>
-  Object.values(state.files || {}).sort((a, b) => a.path.localeCompare(b.path));
+export const listFiles = () => {
+  const scope = wsScope();
+  const out = new Map(); // 逻辑路径 -> 元数据；私有区文件优先于共享区同名文件
+  for (const f of Object.values(state.files || {})) {
+    const logical = wsLogical(f.path, scope);
+    if (!logical) continue;
+    const shared = !(scope && normalizePath(f.path).startsWith(scope));
+    const prev = out.get(logical);
+    if (!prev || !shared) out.set(logical, { ...f, path: logical, shared });
+  }
+  return [...out.values()].sort((a, b) => a.path.localeCompare(b.path));
+};
 
 export const listLibrary = () =>
   Object.values(state.library || {}).sort((a, b) => a.path.localeCompare(b.path));
 
-export const fileExists = (path) => !!state.files[normalizePath(path)];
+export const fileExists = (path) => listFiles().some((f) => pathKey(f.path) === pathKey(path));
 
-/** 读取工作区文件；不存在返回 null。 */
+/** 读取工作区文件；不存在返回 null。返回体里的 path 是逻辑路径。 */
 export async function readFile(path) {
-  const p = resolveWorkspacePath(path);
-  if (!p) return null;
+  const logical = resolveWorkspacePath(path);
+  if (!logical) return null;
+  const p = wsReadPath(logical);
   try {
-    return await FS.readDoc("workspace", p);
+    const doc = await FS.readDoc("workspace", p);
+    return { ...doc, path: logical };
   } catch {
     return null;
   }
 }
 
 export async function writeFile(path, content) {
-  // 写入不跨目录兜底：避免 `report.md` 误覆盖 uploads/report.md
-  const p = matchFilePath(Object.keys(state.files || {}), path, { basename: false }) || normalizePath(path);
-  if (!p) throw new Error("路径不能为空");
+  // 视图内解析（basename 不兜底，避免 `report.md` 误覆盖 uploads/report.md）
+  const raw = wsGuard(path);
+  if (!raw) throw new Error("sessions/ 是会话私有目录，请用相对路径");
+  const logical =
+    matchFilePath(listFiles().map((f) => f.path), raw, { basename: false }) || raw;
+  if (!logical) throw new Error("路径不能为空");
+  const real = wsWritePath(logical);
   let previous = null;
   try {
-    previous = (await FS.readDoc("workspace", p)).content;
+    previous = (await FS.readDoc("workspace", real)).content;
   } catch {
-    /* 新文件 */
+    /* 新文件，或共享区基底 —— 都不读共享内容，写入只会落在私有区 */
   }
-  const meta = await FS.writeDoc("workspace", p, String(content ?? ""));
-  state.files[p] = { path: p, size: meta.size || 0, updatedAt: meta.updatedAt || now() };
+  const meta = await FS.writeDoc("workspace", real, String(content ?? ""));
+  state.files[real] = { path: real, size: meta.size || 0, updatedAt: meta.updatedAt || now() };
   save();
-  emit({ type: "fs:write", path: p });
-  return { path: p, previous };
+  emit({ type: "fs:write", path: logical });
+  return { path: logical, previous };
 }
 
 export async function deleteFile(path) {
-  const p = resolveWorkspacePath(path);
-  if (!p) return;
-  await FS.deleteDoc("workspace", p);
-  delete state.files[p];
+  const logical = resolveWorkspacePath(path);
+  if (!logical) return;
+  const real = wsReadPath(logical);
+  if (!real) return;
+  // 共享区文件对所有会话可见，不能从某个会话里删掉；只删私有区副本。
+  // 白名单目录（plugins/、学习库/）例外：它们本来就是共享资产，删插件要能删掉。
+  const scope = wsScope();
+  if (scope && !real.startsWith(scope) && !wsIsShared(real)) return;
+  await FS.deleteDoc("workspace", real);
+  delete state.files[real];
   save();
-  emit({ type: "fs:delete", path: p });
+  emit({ type: "fs:delete", path: logical });
 }
 
 export async function writeBinaryFile(path, base64, mime, size) {
-  const p = normalizePath(path);
-  if (!p) throw new Error("路径不能为空");
-  const meta = await FS.writeBinaryDoc("workspace", p, String(base64 || ""), mime);
-  state.files[p] = {
-    path: p,
+  const raw = wsGuard(path);
+  if (!raw) throw new Error("sessions/ 是会话私有目录，请用相对路径");
+  const logical =
+    matchFilePath(listFiles().map((f) => f.path), raw, { basename: false }) || raw;
+  if (!logical) throw new Error("路径不能为空");
+  const real = wsWritePath(logical);
+  const meta = await FS.writeBinaryDoc("workspace", real, String(base64 || ""), mime);
+  state.files[real] = {
+    path: real,
     size: meta.size || size || 0,
     updatedAt: meta.updatedAt || now(),
     encoding: "base64",
     mime: mime || "application/octet-stream",
   };
   save();
-  emit({ type: "fs:write", path: p });
-  return { path: p, size: state.files[p].size };
+  emit({ type: "fs:write", path: logical });
+  return { path: logical, size: state.files[real].size };
 }
 
-/** 读取任意区域的文件（资料库/工作区共用）。 */
-export const readDoc = (area, path) =>
-  FS.readDoc(area === "library" ? "library" : "workspace", normalizePath(path));
+/** 读取任意区域的文件（资料库/工作区共用）；工作区路径按当前会话映射。 */
+export function readDoc(area, path) {
+  if (area === "library") return FS.readDoc("library", normalizePath(path));
+  const logical = wsGuard(path);
+  if (!logical) return Promise.reject(new Error("文件不存在"));
+  return FS.readDoc("workspace", wsReadPath(logical)).then((doc) => ({ ...doc, path: logical }));
+}
 
-/** 整份替换工作区（导入备份用）：清空后逐文件写入。 */
+/**
+ * 导入备份：只替换**当前会话视图**，不动共享区和其他会话的文件。
+ * 老版本会 clearArea("workspace") 全清 —— 隔离后那样会一次性抹掉所有会话产物。
+ */
 export async function replaceFiles(files) {
   if (!files || typeof files !== "object" || Array.isArray(files)) {
     throw new Error("不是有效的工作区文件结构");
   }
   const entries = Object.values(files).filter((f) => f && typeof f.path === "string");
-  await FS.clearArea("workspace");
+  const scope = wsScope();
+  for (const f of listFiles()) {
+    const real = wsReadPath(f.path);
+    if (!scope || real.startsWith(scope)) {
+      try {
+        await FS.deleteDoc("workspace", real);
+      } catch {
+        /* 已不存在 */
+      }
+      delete state.files[real];
+    }
+  }
   let written = 0;
   for (const f of entries) {
-    const path = normalizePath(f.path);
-    if (!path) continue;
-    if (f.encoding === "base64") await FS.writeBinaryDoc("workspace", path, f.content || "", f.mime);
-    else await FS.writeDoc("workspace", path, f.content ?? "");
+    const logical = normalizePath(f.path);
+    if (!logical) continue;
+    const real = wsWritePath(logical);
+    if (f.encoding === "base64") await FS.writeBinaryDoc("workspace", real, f.content || "", f.mime);
+    else await FS.writeDoc("workspace", real, f.content ?? "");
     written += 1;
   }
   await syncIndex("workspace");
@@ -1667,15 +2336,19 @@ export async function importToLibrary() {
  * 文件落在真实目录里，模型可以直接用 fs_read / shell 读，而不是只存在于消息里。
  */
 export async function importToWorkspace(subdir = "uploads") {
-  const added = await FS.importFromPhone("workspace", subdir);
+  const added = await FS.importFromPhone("workspace", wsScope() + subdir);
   await syncIndex("workspace");
   emit({ type: "fs:write", path: "*" });
   return added;
 }
 
 /** 把文件另存到手机（APK 走系统保存面板，浏览器走下载）。 */
-export const exportDoc = (area, path) =>
-  FS.exportToPhone(area === "library" ? "library" : "workspace", normalizePath(path));
+export function exportDoc(area, path) {
+  if (area === "library") return FS.exportToPhone("library", normalizePath(path));
+  const logical = wsGuard(path);
+  if (!logical) return Promise.reject(new Error("文件不存在"));
+  return FS.exportToPhone("workspace", wsReadPath(logical));
+}
 
 /** 两区统计（设置页 / 资料库页脚）。 */
 export function filesStats() {
@@ -1767,9 +2440,37 @@ export function stopRun(id) {
 /* ---------------- 设置 ---------------- */
 
 export function setSettings(patch) {
-  Object.assign(state.settings, patch);
+  let next = patch;
+  if (patch && Object.prototype.hasOwnProperty.call(patch, "keys")) {
+    const cleaned = {};
+    for (const [slot, raw] of Object.entries(patch.keys || {})) {
+      cleaned[slot] = normalizeApiKey(raw).key;
+    }
+    const merged = { ...(state.settings.keys || {}), ...cleaned };
+    next = { ...patch, keys: merged };
+
+    // Key 一变，之前那次连接结果就不再具备参考意义。
+    // 不清掉的话，用户改完 Key 仍会看到上一次留下的「Key 无效」，
+    // 明明已经改对了却像没生效 —— 这是「填入 Key 后显示 Key 无效」
+    // 最容易被忽略的一半原因。
+    const touched = Object.keys(cleaned).filter(
+      (slot) => cleaned[slot] !== String(state.settings.keys?.[slot] ?? "")
+    );
+    if (touched.length) {
+      const statuses = { ...(state.settings.modelStatus || {}) };
+      let removed = false;
+      for (const m of allModels()) {
+        if (touched.includes(providerKeyOf(m)) && statuses[m.id]) {
+          delete statuses[m.id];
+          removed = true;
+        }
+      }
+      if (removed) next = { ...next, modelStatus: statuses };
+    }
+  }
+  Object.assign(state.settings, next);
   save();
-  emit({ type: "settings", patch });
+  emit({ type: "settings", patch: next });
 }
 
 /**

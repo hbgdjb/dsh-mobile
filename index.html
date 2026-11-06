@@ -8,7 +8,7 @@
     />
     <title>DeepSeek Harness · Mobile</title>
     <meta name="description" content="DeepSeek Harness 的 Android 移动端宿主：Agent 循环、工具审批、插件装配与运行轨迹，为触屏重排。" />
-    <meta name="theme-color" content="#08090b" />
+    <meta name="theme-color" content="#000000" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -31,6 +31,8 @@
     <link rel="stylesheet" href="./styles/effort.css" />
     <link rel="stylesheet" href="./styles/screens.css" />
     <link rel="stylesheet" href="./styles/ui-host.css" />
+    <!-- 视觉覆盖层：纯黑 + 胶囊 + 大留白。放最后，只覆盖不改结构 -->
+    <link rel="stylesheet" href="./styles/clean.css" />
 
     <!-- 启动动画覆盖层：样式必须在应用样式之后，否则 z-index 和底色会被盖掉 -->
     <link rel="stylesheet" href="./splash/dsh-splash.css" />
@@ -82,6 +84,302 @@
 
     <!-- 启动动画：普通脚本，必须先于 module 执行 —— 保证首帧是深色动画而不是白屏 -->
     <script src="./splash/dsh-splash.js"></script>
+
+    <!--
+      启动看门狗（ES5 内联）
+      ------------------------------------------------------------
+      这块代码只在一种情况下有用：界面压根没起来。
+
+      场景是这样的 —— 2020 年前后的 Android 11 机型，出厂 WebView 停在
+      Chrome 83/84。只要有一个模块用了更高版本的语法(例如 `||=`，那是 85)，
+      浏览器就拒绝解析整个 app.js，连同它 import 进来的一切都不执行；
+      而启动动画 6 秒后照常退场，于是剩下一页纯黑，永远等不到界面，
+      也没有任何文字告诉用户发生了什么。
+
+      所以这里必须用 ES5 写。如果它也用了新语法，故障时它会和 app.js 一起挂掉，
+      那就等于没写。同理不用可选链、模板字符串、箭头函数、const，
+      也不依赖 CSS 的 inset 简写（Chrome 87 才有）。
+
+      它不做修复，只做两件事：
+        1) 收集启动阶段的错误（解析错误、资源加载失败、Promise 拒绝）
+        2) 界面没起来时，把原因和 WebView 版本写到屏幕上，并给一个「重新加载」
+    -->
+    <script>
+      (function () {
+        var KEY = "dsh.boot.fail.v1";
+        var fatal = [];
+        var shown = false;
+        var node = null;
+
+        function push(text) {
+          if (fatal.length >= 6) return;
+          fatal.push(String(text).slice(0, 300));
+        }
+
+        window.addEventListener("error", function (e) {
+          if (!e) return;
+          var t = e.target;
+          // 资源加载失败时，事件目标是那个元素本身（script / link / img）
+          if (t && t.tagName && (t.src || t.href)) {
+            push("资源加载失败：" + String(t.src || t.href).replace(location.origin, ""));
+            return;
+          }
+          var where = "";
+          if (e.filename) {
+            where = "（" + String(e.filename).replace(location.origin + "/", "") + ":" + e.lineno + "）";
+          }
+          push((e.message || "未知错误") + where);
+        }, true);
+
+        window.addEventListener("unhandledrejection", function (e) {
+          var r = e && e.reason;
+          push("未处理的 Promise 拒绝：" + ((r && r.message) || r || ""));
+        });
+
+        function env() {
+          var ua = navigator.userAgent || "";
+          var c = /Chrome\/(\d+)/.exec(ua);
+          var a = /Android (\d+(?:\.\d+)?)/.exec(ua);
+          return {
+            chrome: c ? parseInt(c[1], 10) : 0,
+            android: a ? a[1] : "?",
+            inApp: /;\s*wv\)/.test(ua)
+          };
+        }
+
+        /* 界面是否已经画出来：initUI() 会往 #tabbar 里塞导航按钮，
+           这是整个启动流程最后一步，它有了子节点就说明界面真的到了。 */
+        function booted() {
+          var tab = document.getElementById("tabbar");
+          return !!(tab && tab.children && tab.children.length > 0);
+        }
+
+        /* 界面起来了，但塌了。
+           这是另一类故障：脚本完全正常，尺寸却是错的 ——
+           用户看到标题栏和导航条都在，中间一片黑（或者只剩一条）。
+           判据用**比例**而不是绝对值：键盘弹出时视口会变矮，
+           比例不受影响，绝对值会误报。 */
+        function collapsed() {
+          try {
+            var dev = document.querySelector(".device");
+            var views = document.getElementById("views");
+            if (!dev || !views) return false;
+            var winH = window.innerHeight || document.documentElement.clientHeight;
+            if (!winH) return false;
+            var devH = dev.getBoundingClientRect().height;
+            var viewH = views.getBoundingClientRect().height;
+            // 外壳没撑满视口，或内容区没分到空间 —— 两条命中一条就算塌
+            return devH < winH * 0.8 || viewH < 120;
+          } catch (e) {
+            return false;
+          }
+        }
+
+        function copy(text, el) {
+          function done(ok) {
+            if (!el) return;
+            el.textContent = ok ? "已复制" : "复制失败";
+            setTimeout(function () { el.textContent = "复制诊断信息"; }, 1600);
+          }
+          try {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); });
+              return;
+            }
+          } catch (err) { }
+          // 老内核没有 clipboard API，退回 execCommand
+          try {
+            var ta = document.createElement("textarea");
+            ta.value = text;
+            ta.setAttribute("style", "position:fixed;top:0;left:0;opacity:0");
+            document.body.appendChild(ta);
+            ta.select();
+            var ok = document.execCommand("copy");
+            document.body.removeChild(ta);
+            done(ok);
+          } catch (e2) {
+            done(false);
+          }
+        }
+
+        function button(label, bg, fg, onClick) {
+          var b = document.createElement("button");
+          b.type = "button";
+          b.textContent = label;
+          b.setAttribute("style", [
+            "appearance:none", "-webkit-appearance:none",
+            "padding:11px 18px", "border-radius:10px", "border:1px solid #262b33",
+            "background:" + bg, "color:" + fg,
+            "font:600 14px/1.2 -apple-system,system-ui,sans-serif", "cursor:pointer"
+          ].join(";"));
+          b.addEventListener("click", onClick);
+          return b;
+        }
+
+        function render(msg, e, kind) {
+          if (shown) return;
+          shown = true;
+          try { window.DshSplash && window.DshSplash.exit && window.DshSplash.exit(); } catch (err) { }
+
+          var isLayout = kind === "layout";
+
+          node = document.createElement("div");
+          node.setAttribute("style", [
+            "position:fixed", "top:0", "right:0", "bottom:0", "left:0",
+            "z-index:2147483647", "background:#0b0c0e", "color:#e8eaed",
+            "padding:28px 20px 40px", "overflow:auto",
+            "-webkit-overflow-scrolling:touch",
+            "font:14px/1.7 -apple-system,BlinkMacSystemFont,system-ui,sans-serif"
+          ].join(";"));
+
+          var title = document.createElement("div");
+          title.setAttribute("style", "font-size:17px;font-weight:600;margin-bottom:6px;color:#f5f7fa");
+          title.textContent = isLayout ? "界面没铺满屏幕" : "界面没能启动";
+          node.appendChild(title);
+
+          var sub = document.createElement("div");
+          sub.setAttribute("style", "color:#9aa3af;font-size:13px;margin-bottom:16px");
+          sub.textContent = isLayout
+            ? "界面出来了，但中间那块高度是 0 —— 这是样式问题，不是脚本问题。"
+            : "启动动画结束了，但页面没有加载出来。原因在下面这段里。";
+          node.appendChild(sub);
+
+          var box = document.createElement("pre");
+          box.setAttribute("style", [
+            "margin:0 0 18px", "padding:14px", "border-radius:10px",
+            "background:#14171c", "border:1px solid #262b33", "color:#c8d0da",
+            "font:12px/1.6 ui-monospace,Menlo,Consolas,monospace",
+            "white-space:pre-wrap", "word-break:break-all",
+            "max-height:46vh", "overflow:auto"
+          ].join(";"));
+          box.textContent = msg;
+          node.appendChild(box);
+
+          var tips = [];
+          if (isLayout) {
+            tips.push("点亮「运行自检」会打开一个单独的诊断页，把这台机器的 WebView 版本、" +
+              "每个样式特性的支持情况、以及各容器的实测高度都列出来。");
+            tips.push("自检结果可以用「复制」按钮带走，发给开发者就能定位到具体是哪条样式失效。");
+          } else {
+            if (e.chrome && e.chrome < 87) {
+              tips.push("这台机器的 WebView 偏旧（Chrome " + e.chrome + "）。去应用商店搜「Android System WebView」" +
+                "点更新；或者打开 Chrome，在「设置 → 关于 Chrome」里更新一次，再回来重开 DSH。");
+            } else if (!e.chrome) {
+              tips.push("没能读到 WebView 版本，说明它可能被系统停用或损坏了。" +
+                "到「设置 → 应用 → Android System WebView」里点「启用」，或先更新它。");
+            }
+            tips.push("更新后仍然黑屏，点亮「运行自检」—— 那页会把原因查清楚，比截图更有用。");
+          }
+
+          for (var i = 0; i < tips.length; i++) {
+            var p = document.createElement("p");
+            p.setAttribute("style", "color:#9aa3af;margin:0 0 10px");
+            p.textContent = tips[i];
+            node.appendChild(p);
+          }
+
+          var bar = document.createElement("div");
+          bar.setAttribute("style", "display:flex;gap:10px;margin-top:20px;flex-wrap:wrap");
+          bar.appendChild(button("重新加载", "#4f9cf9", "#08131f", function () {
+            location.reload();
+          }));
+          // 自检页是独立的静态页，不依赖 app.js —— 界面挂了它也跑得起来
+          bar.appendChild(button("运行自检", "#1d6fe0", "#ffffff", function () {
+            location.href = "./diagnose.html";
+          }));
+          var copyBtn = button("复制诊断信息", "#1a1e25", "#e8eaed", function () {
+            copy("DSH 启动失败\n" + msg + "\nUA: " + navigator.userAgent, copyBtn);
+          });
+          bar.appendChild(copyBtn);
+          node.appendChild(bar);
+
+          document.body.appendChild(node);
+
+          // 自愈：慢设备上界面可能只是晚到一步。真起来了就把这块撤掉，
+          // 宁可少报一次，也不能把能用的界面挡在下面。
+          // 布局故障不自动撤 —— 那种情况界面"在了"但确实是坏的，
+          // 撤掉就等于把问题藏起来。
+          if (!isLayout) {
+            var watch = setInterval(function () {
+              if (!booted() || collapsed()) return;
+              clearInterval(watch);
+              if (node && node.parentNode) node.parentNode.removeChild(node);
+              node = null;
+              shown = false;
+            }, 400);
+          }
+        }
+
+        function report() {
+          if (shown) return;
+
+          var e = env();
+          var msg;
+          var kind;
+
+          if (booted()) {
+            // 界面起来了。只有塌了才管 —— 正常就别挡着人家用。
+            if (!collapsed()) return;
+            kind = "layout";
+            var dev = document.querySelector(".device");
+            var views = document.getElementById("views");
+            msg = "Android " + e.android + " · WebView Chrome " + (e.chrome || "未知") +
+              (e.inApp ? "（应用内）" : "") +
+              "\n\n界面已经画出来了，但高度不对：\n" +
+              "  外壳 .device " + Math.round(dev.getBoundingClientRect().height) + " px（视口 " +
+              (window.innerHeight || 0) + " px）\n" +
+              "  内容区 #views " + Math.round(views.getBoundingClientRect().height) + " px\n\n" +
+              "脚本没报错，是样式没生效 —— 多半是某个 CSS 单位或简写不被这个内核认识，整条声明被丢弃了。";
+          } else {
+            kind = "boot";
+            msg = "Android " + e.android + " · WebView Chrome " + (e.chrome || "未知") +
+              (e.inApp ? "（应用内）" : "");
+            if (fatal.length) {
+              msg += "\n\n" + fatal.join("\n");
+            } else {
+              msg += "\n\n没有任何报错 —— 脚本可能根本没开始执行（模块图被拒绝解析时就是这样）。";
+            }
+          }
+
+          try {
+            localStorage.setItem(KEY, JSON.stringify({ at: Date.now(), text: msg, ua: navigator.userAgent }));
+          } catch (err) { }
+          render(msg, e, kind);
+        }
+
+        function arm() {
+          // 先查布局：界面画出来之后 5 秒，样式和字体都该落位了。
+          // 只在**界面已经起来**时才查 —— 没起来说明还在启动（慢设备很正常），
+          // 交给下面 9 秒那次，不然会把正常的慢启动误报成黑屏。
+          setTimeout(function () {
+            if (booted()) report();
+          }, 5000);
+
+          // 再查"根本没起来"：启动动画最多撑 6 秒，给它 3 秒余量。
+          setTimeout(report, 9000);
+
+          // 已经抓到「解析失败 / 模块没加载」这类致命错误，就不用等满 9 秒。
+          // 普通运行时错误不在此列 —— 那种情况界面通常已经出来了，等满即可。
+          var fatalRe = /SyntaxError|Unexpected token|Unexpected identifier|Invalid or unexpected token|module script|Importing|Failed to fetch dynamically|Cannot use import statement/i;
+          var iv = setInterval(function () {
+            if (shown || booted()) { clearInterval(iv); return; }
+            var hit = false;
+            for (var i = 0; i < fatal.length; i++) if (fatalRe.test(fatal[i])) hit = true;
+            if (!hit) return;
+            clearInterval(iv);
+            setTimeout(report, 2500);
+          }, 500);
+        }
+
+        /* 立刻开始计时，不等 DOMContentLoaded。
+           module 脚本是 defer 的，DOMContentLoaded 要等它下载并执行完；
+           如果正是 app.js 卡住（老内核解析失败、或资源读不出来），
+           等在 DOMContentLoaded 上就等于"故障时自己也不上班"。
+           9 秒后 body 一定已经存在，report 里再取 DOM 是安全的。 */
+        arm();
+      })();
+    </script>
+
     <script type="module" src="./scripts/app.js"></script>
   </body>
 </html>

@@ -7,7 +7,7 @@
 export const IMAGE_RE = /\.(png|jpe?g|webp|gif|bmp)$/i;
 
 const MAX_EDGE = 1568; // 主流视觉模型的最佳输入长边
-const MAX_BYTES = 1_200_000; // 单张压缩后目标体积
+const MAX_BYTES = 1200000; // 单张压缩后目标体积（约 1.2 MB）
 const THUMB_EDGE = 320; // 气泡缩略图的边长
 
 export const isImagePath = (path) => IMAGE_RE.test(String(path || ""));

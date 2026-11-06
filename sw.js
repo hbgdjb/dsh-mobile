@@ -1,9 +1,13 @@
 /* Service Worker — 壳缓存，保证断网也能打开；接口请求不缓存 */
 
-const CACHE = "dsh-mobile-v6.2.1";
+const CACHE = "dsh-mobile-v0.84.0";
 const SHELL = [
   "./",
   "./index.html",
+  // 自检页：界面起不来时唯一的出口，断网时也必须能打开
+  "./diagnose.html",
+  "./layout-probe.html",
+  "./scripts/diagnose.js",
   "./manifest.webmanifest",
   // 启动动画 —— 少了它，断网打开时第一帧是空白而不是动画
   "./splash/dsh-splash.css",
@@ -19,6 +23,9 @@ const SHELL = [
   "./scripts/ui-host.js",
   "./scripts/store.js",
   "./scripts/runtime.js",
+  // 协议适配层：store.js 在启动时就要用它做格式兜底，
+  // 少这一条的话断网打开会在 import 阶段直接白屏。
+  "./scripts/formats.js",
   "./scripts/retry.js",
   "./scripts/native-http.js",
   "./scripts/hud.js",
@@ -36,6 +43,35 @@ const SHELL = [
   "./scripts/fs.js",
   "./scripts/node-runtime.js",
   "./scripts/image.js",
+  "./scripts/ime.js",
+  // 办公导出与 PDF 的依赖链：tools.js 静态 import 它们，
+  // 断网首启时少一个模块就是白屏。字体也一起缓存 —— 否则第一次
+  // 在飞机上生成 PDF 会卡在「字体加载失败」。
+  "./scripts/office.js",
+  "./scripts/pptx.js",
+  "./scripts/zip.js",
+  "./scripts/pdf.js",
+  "./scripts/pdf-write.js",
+  "./scripts/apikeys.js",
+  "./scripts/crash-guard.js",
+  "./scripts/keep-alive.js",
+  "./scripts/llm-bridge.js",
+  "./scripts/mcp-local.js",
+  "./scripts/node-plugins.js",
+  "./scripts/npm-deps.js",
+  "./scripts/plugin-caps.js",
+  "./scripts/plugin-catalog.js",
+  "./scripts/plugin-host.js",
+  "./scripts/plugin-install.js",
+  "./scripts/plugin-install-node.js",
+  "./scripts/plugin-manifest.js",
+  "./scripts/safety.js",
+  "./scripts/semver-lite.js",
+  "./scripts/toolargs.js",
+  "./scripts/traj.js",
+  "./scripts/voice.js",
+  "./scripts/fonts/noto-sans-sc.ttf",
+  "./scripts/fonts/dejavu-symbols.ttf",
   "./icons/icon-192.png",
   "./icons/icon-512.png",
   "./icons/maskable-512.png",

@@ -67,6 +67,8 @@ export function nativeStream({  url,
   method = "POST",
   signal,
   timeoutSec = 120,
+  firstByteSec = 0,
+  connectSec = 0,
   onStatus,
   onChunk,
   onEnd,
@@ -116,7 +118,11 @@ export function nativeStream({  url,
       JSON.stringify(headers || {}),
       JSON.stringify(body || {}),
       Math.max(15, Math.min(600, Number(timeoutSec) || 120)),
-      method || "POST"
+      method || "POST",
+      // 0 表示沿用原生侧的默认值（首字节 45s / 连接 8s）。
+      // 慢服务（如 Agnes）会把首字节放宽，别在它思考时把连接掐了。
+      Math.max(0, Math.min(600, Number(firstByteSec) || 0)),
+      Math.max(0, Math.min(60, Number(connectSec) || 0))
     );
   } catch (err) {
     fail(err);
@@ -220,6 +226,12 @@ export function humanizeNetworkError(raw) {
   if (/Read timed out|SocketTimeout|timed out|timeout/i.test(text)) {
     const h = hostOf(text);
     return h ? `${h} 响应超时` : "服务器响应超时";
+  }
+  if (/Software caused connection abort|ECONNABORTED|Connection aborted/i.test(text)) {
+    // Android 上这是 ECONNABORTED 的原文，只出现在「连接已经建立、
+    // 之后被对端或中间网络掐断」时 —— 和「连不上」不是一回事，
+    // 原样抛给用户只是一串英文。
+    return "连接已建立后被中断（对端或中间网络关闭了它）";
   }
   if (/Network is unreachable|network unreachable/i.test(text)) return "网络不可达";
 

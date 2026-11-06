@@ -224,7 +224,9 @@ await test("动画在转屏后能按新尺寸重排", async () => {
   await page.waitForTimeout(500);
 
   const st = await page.evaluate(() => {
-    const c = document.querySelector("canvas");
+    // 指定启动页自己的画布：首页中间那颗小球也是 canvas，
+    // 用 querySelector("canvas") 会随机选中它（宽 115，永远不及格）。
+    const c = document.querySelector(".dsh-splash__canvas");
     if (!c) return { ok: false };
     const r = c.getBoundingClientRect();
     return { ok: true, w: Math.round(r.width), h: Math.round(r.height) };

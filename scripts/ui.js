@@ -8,6 +8,7 @@ import {
   save,
   emit,
   createSession,
+  setSessionPreset,
   switchSession,
   deleteSession,
   forkSession,
@@ -26,20 +27,27 @@ import {
   currentMode,
   currentModel,
   upsertCustomModel,
+  addCustomModels,
+  modelFormat,
   removeCustomModel,
   upsertMcpServer,
   removeMcpServer,
   saveSessionNow,
   flushSessionNow,
   replaceFiles,
+  sessionFileCount,
+  orphanWorkspaceInfo,
+  purgeOrphanWorkspace,
   resetAll,
   MODES,
+  PRESETS,
   PROVIDERS,
   PROVIDER_COUNT,
   knownModelCtx,
   knownModelVision,
   rememberModelCatalog,
   catalogFor,
+  catalogItemsFor,
   hasModels,
   allModels,
   apiKeyForCurrent,
@@ -72,10 +80,11 @@ import {
   filesStats,
 } from "./store.js";
 import { icon } from "./icons.js";
+import { normalizeApiKey } from "./apikeys.js";
 import { isTextPath } from "./fs.js";
 import { isImagePath, imageMime, prepareThumb, prepareImage } from "./image.js";
 import { renderMarkdown, plainText } from "./markdown.js";
-import { availableToolNames } from "./tools.js";
+import { availableToolNames, forgetShellCwd } from "./tools.js";
 import { searchOfficialPlugins } from "./plugin-manifest.js";
 import {
   inspectPlugin,
@@ -91,9 +100,11 @@ import {
 } from "./effort-slider.js";
 import { fmtContext } from "./context.js";
 import { runAgent, testConnection, testProvider, testModel, fetchModelList, spawnSubagentOnce, promptStats } from "./runtime.js";
+import { FORMAT_IDS, FORMAT_LABELS, FORMAT_SHORT, FORMAT_HINTS, FORMATS, normalizeFormat } from "./formats.js";
 import { mcpDiscoverWithRetry } from "./mcp.js";
 import { downloadBase64 } from "./office.js";
 import { hudRender, hudPermissionGranted, nativeHudAvailable } from "./hud.js";
+import { DshBall } from "./dsh-ball.js";
 import {
   keepAliveStart,
   keepAliveStop,
@@ -161,6 +172,13 @@ import {
   pluginIdOf,
   formatAgo,
 } from "./plugin-catalog.js";
+import {
+  openImeSettings,
+  switchIme,
+  savePhrase,
+  deletePhrase,
+  clearClipboard,
+} from "./ime.js";
 import { syncIndex } from "./store.js";
 import {
   startVoice,
@@ -298,6 +316,12 @@ export function initUI() {
   initNativeBack();
   startHudLoop();
   installLifecycleHooks();
+
+  // IME 主机接线：给 scripts/ime.js 提供两个页面级钩子。
+  // 之所以走钩子而不是直接 import，是为了不让 ime.js 依赖 ui.js 的内部实现 ——
+  // ui.js 有 7000 多行，内部函数随时会重构，钩子层更稳。
+  window.__dshAddAttachment = (item) => receiveImeAttachment(item);
+  window.__dshSendImeShot = () => sendMessage("请看这张截图。");
   wireUiHost();
   wirePluginWatch();
   startNodeRuntime();
@@ -715,53 +739,70 @@ export function renderAll() {
 function renderAppbar() {
   const s = activeSession();
   const mode = currentMode();
-  let kicker = "DSH MOBILE · 0.1.0";
+  const running = state.runs.some((r) => r.status === "running");
+
   let title = "新会话";
+  let tag = "";            // 胶囊右侧的小字：模式名
+  let leftIcon = "menu";
+  let leftAct = "open-drawer";
+  let leftLabel = "会话列表";
   let actions = "";
 
   if (ui.view === "chat") {
     title = s?.title || "新会话";
-    kicker = "";
+    // 选了工作模式就显示模式名，否则退回推理档位 —— 这一枚小字是
+    // 全屏唯一能说明"你现在处在什么上下文里"的地方，得留。
+    tag = (s?.preset && PRESETS[s.preset]?.name) || mode?.name || "";
     actions = `<button class="icon-btn" data-act="session-menu" aria-label="会话操作">${icon("more")}</button>`;
   } else if (ui.view === "workspace") {
     const lib = ui.workspaceTab === "library";
     title = lib ? "资料库" : "工作区";
-    kicker = "";
     actions = lib
       ? `<button class="icon-btn" data-act="import-library" aria-label="导入文件">${icon("download")}</button>`
       : `<button class="icon-btn" data-act="new-file" aria-label="新建文件">${icon("plus")}</button>`;
   } else if (ui.view === "plugins") {
     title = "插件";
-    kicker = "";
     actions = `<button class="icon-btn" data-act="plugin-search" aria-label="安装插件">${icon("download")}</button>`;
   } else if (ui.view === "tasks") {
     title = "任务";
-    kicker = "";
     actions = `<button class="icon-btn" data-act="new-automation" aria-label="新建定时任务">${icon("plus")}</button>`;
   } else if (ui.view === "settings") {
     const cat = ui.settingsCat ? SETTINGS_CAT_MAP[ui.settingsCat] : null;
     title = cat ? cat.title : "设置";
-    kicker = cat ? "设置" : "";
-    actions = "";
+    tag = cat ? "设置" : "";
+    if (ui.settingsCat) {
+      leftIcon = "arrowLeft";
+      leftAct = "settings-home";
+      leftLabel = "返回";
+    } else {
+      leftIcon = "arrowLeft";
+      leftAct = "back";
+      leftLabel = "返回对话";
+    }
   }
 
+  // 三栏：圆钮 / 状态胶囊 / 圆钮。中间用 grid 居中而不是 flex，
+  // 这样右侧按钮多一个少一个，胶囊都不会左右漂。
   els.appbar.innerHTML = `
-    ${
-      ui.view === "chat"
-        ? `<button class="icon-btn" data-act="open-drawer" aria-label="会话列表">
-             ${icon("menu")}${state.runs.some((r) => r.status === "running") ? '<span class="badge-dot"></span>' : ""}
-           </button>`
-        : `<button class="icon-btn" data-act="${
-             ui.view === "settings" ? (ui.settingsCat ? "settings-home" : "back") : "open-drawer"
-           }" aria-label="${ui.view === "settings" ? "返回" : "会话列表"}">
-             ${ui.view === "settings" ? icon("arrowLeft") : icon("menu")}
-           </button>`
-    }
-    <div class="appbar__titles">
-      <h1 class="appbar__title">${esc(title)}</h1>
-      ${kicker ? `<span class="appbar__kicker">${esc(kicker)}</span>` : ""}
+    <button class="icon-btn" data-act="${leftAct}" aria-label="${leftLabel}">
+      ${icon(leftIcon)}${running && ui.view === "chat" ? '<span class="badge-dot badge-dot--live"></span>' : ""}
+    </button>
+    <div class="appbar__mid">
+      ${
+        ui.view === "chat"
+          ? `<button class="appbar__pill" data-act="open-mode" aria-label="切换推理档位">
+               <span class="dot${running ? " dot--live" : ""}" aria-hidden="true"></span>
+               <b>${esc(title)}</b>
+               ${tag ? `<span class="sep" aria-hidden="true"></span><em>${esc(tag)}</em>` : ""}
+             </button>`
+          : `<span class="appbar__pill">
+               <span class="dot${running ? " dot--live" : ""}" aria-hidden="true"></span>
+               <b>${esc(title)}</b>
+               ${tag ? `<span class="sep" aria-hidden="true"></span><em>${esc(tag)}</em>` : ""}
+             </span>`
+      }
     </div>
-    <div class="appbar__actions">${actions}</div>`;
+    <div class="appbar__end">${actions}</div>`;
 }
 
 function renderTabbar() {
@@ -799,6 +840,10 @@ function renderMain(force = false) {
 
   const target = views[ui.view];
   if (!target) return;
+
+  // 离开对话页：视图只是被隐藏，画布仍在文档里，rAF 不会自己停。
+  // 回到对话页时 updateMessages 会把它重新启动。
+  if (ui.view !== "chat") stopHomeBall();
 
   // 打开会话 / 重建对话页：一律停在最新消息（底部）
   if (ui.view === "chat") {
@@ -859,10 +904,27 @@ function navigate(view) {
 /* ---------------- 对话界面 ---------------- */
 
 function renderChat(root, anchor = "bottom") {
-  // 重建对话页之前，先把输入框里的未发送草稿收回来，避免输入到一半的字被重置
+  // ============ 输入框跨重绘复用同一个 <textarea> ============
+  // 旧做法：root.innerHTML 整块重建，再 restoreDraft() 用 `el.value = ui.draft`
+  // 把文字填回去。在 Android WebView 上这有两个硬伤：
+  //   1. 焦点没了 —— 软键盘还开着，字却进不来，必须「点一下」输入框重新聚焦；
+  //   2. JS 直接赋值 value 会让 WebView 的 InputConnection(Editable) 与 DOM
+  //      值失步，光标被推到末尾，之后在句中打字全部延到句末。
+  // 现在重建前把旧节点从旧树摘出来，重建后放回新树：value / selection /
+  // 组合输入状态 / 输入法连接都留在同一个节点上，一个字节都不用重写。
+  // 先前的 `!ui.run` 限制也去掉 —— 运行中补引导指令时同样不能丢草稿。
   const prevInput = root.querySelector("#composer-input") || document.getElementById("composer-input");
-  if (prevInput && typeof prevInput.value === "string" && !ui.run) {
+  let stash = null;
+  if (prevInput && typeof prevInput.value === "string") {
+    stash = {
+      node: prevInput,
+      focused: document.activeElement === prevInput,
+      start: prevInput.selectionStart,
+      end: prevInput.selectionEnd,
+      scrollTop: prevInput.scrollTop,
+    };
     ui.draft = prevInput.value;
+    prevInput.remove(); // 先摘出，否则下面的 innerHTML 会把它连同整棵树销毁
   }
   const s = activeSession();
   root.innerHTML = `
@@ -882,6 +944,30 @@ function renderChat(root, anchor = "bottom") {
       <div class="ui-slot ui-slot--overlay" data-ui-slot="shell.overlay" hidden></div>
       ${renderComposer(s)}
     </div>`;
+
+  if (stash) {
+    const fresh = $("#composer-input");
+    if (fresh) {
+      // 用旧节点顶掉刚生成的新节点。textarea 本身没被销毁，
+      // 输入法正在进行的组合、光标、滚动位置都原封不动。
+      fresh.replaceWith(stash.node);
+      if (stash.focused) {
+        // 节点被搬过一次，浏览器会按「移除」处理焦点，显式还回去。
+        // preventScroll 避免在软键盘弹起时把页面顶一下。
+        stash.node.focus({ preventScroll: true });
+        try {
+          const max = stash.node.value.length;
+          stash.node.setSelectionRange(
+            Math.min(stash.start ?? max, max),
+            Math.min(stash.end ?? max, max)
+          );
+        } catch {
+          /* 某些输入类型不支持 setSelectionRange */
+        }
+      }
+      stash.node.scrollTop = stash.scrollTop;
+    }
+  }
 
   ui.msgNodes = new Map(); // DOM 是全新的，旧的节点引用作废
   voiceResync(); // composer 是新建的节点，录音条与麦克风按钮要重新贴状态
@@ -914,7 +1000,10 @@ function renderChat(root, anchor = "bottom") {
   }
 
   updateMessages();
-  restoreDraft();
+  // 复用节点时值本来就在，绝不再写 `el.value = …`（那正是 WebView 里
+  // InputConnection 与 DOM 失步、光标跳句末的来源）。只有首次创建
+  // 才需要从镜像缓存把草稿填进去。
+  if (!stash) restoreDraft();
   lastSendKind = ""; // DOM 是新的，强制刷新一次发送键状态
   updateSendState();
 }
@@ -1121,6 +1210,7 @@ function diagnosticsSheet() {
           </div>
           <div class="diag-row__sub">${esc(hostOf(e.endpoint))} · ${fmtRelative(e.ts)} · ${e.tokens || 0} tok</div>
           ${e.error ? `<p class="diag-row__err">${esc(e.error)}</p>` : ""}
+          ${e.hint ? `<details style="margin-top:6px"><summary class="field__hint" style="cursor:pointer;color:var(--accent)">排查建议</summary><pre style="white-space:pre-wrap;word-break:break-word;margin:8px 0 0;padding:9px 10px;background:var(--soft);border-radius:7px;font:11px/1.65 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)">${esc(e.hint)}</pre></details>` : ""}
         </div>`
           )
           .join("")
@@ -1134,7 +1224,8 @@ function diagnosticsSheet() {
   });
 }
 
-function modelConnection(id) {
+/** 供诊断页与回归测试复用：连接状态的纯函数结论。 */
+export function modelConnection(id) {
   const model = allModels().find((m) => m.id === id) || currentModel();
   if (!model) {
     return {
@@ -1168,16 +1259,25 @@ function modelConnection(id) {
     key: "fail",
     tone: "err",
     label:
-      st.status === 429
+      st.phase === "stream"
+        ? "响应中断"
+        : st.status === 429
         ? "限流 · 稍后再试"
-        : st.status === 401 || st.status === 403
-        ? "Key 无效"
+        : st.status === 401
+        ? "Key 未被接受 · 401"
+        : st.status === 403
+        ? "无权限 · 403"
         : st.status === 402
         ? "余额不足"
         : st.status
         ? `连接失败 · ${st.status}`
         : "连接失败",
-    detail: st.error || "请求没有成功，点开查看诊断日志。",
+    detail:
+      st.phase === "stream"
+        ? `已经连上（HTTP ${st.httpStatus || 200}），但响应流中途断开：${
+            st.error || "连接被中断"
+          }。这通常是网络切换、代理或网关重置长连接，不是 Key 或地址的问题，重试一般就能恢复。`
+        : [st.error, st.hint].filter(Boolean).join("\n\n") || "请求没有成功，点开查看诊断日志。",
   };
 }
 
@@ -1192,21 +1292,25 @@ function renderConnectionBanner() {
   const model = currentModel();
   const c = modelConnection(model?.id);
   if (c.key === "ok") return "";
-  const actions = model
+
+  // 这一行只放结论，不放整解释 —— detail 往往两三句，塞进胶囊会被截成
+  // 「没有填 API Key，无法对话。到「…」，读起来像报错。完整原因挂在 title 上，
+  // 点整行进详情。
+  const text = model ? c.label : "还没添加模型";
+  const act = model
     ? c.key === "nokey"
-      ? `<button class="btn btn--primary btn--sm" data-act="connect-model">${icon("key", "icon--xs")} 连接模型</button>`
-      : `<button class="btn btn--ghost btn--sm" data-act="test-current-model">${icon("bolt", "icon--xs")} 测试连接</button>
-         <button class="btn btn--ghost btn--sm" data-act="edit-model" data-id="${model.id}">${icon("gear", "icon--xs")} 参数</button>`
-    : `<button class="btn btn--primary btn--sm" data-act="new-custom-model">${icon("plus", "icon--xs")} 添加模型</button>
-       <button class="btn btn--ghost btn--sm" data-act="open-models">${icon("folder", "icon--xs")} 模型管理</button>`;
+      ? { label: "连接", act: "connect-model" }
+      : { label: "测一下", act: "test-current-model" }
+    : { label: "添加", act: "new-custom-model" };
+  const open = model ? "edit-model" : "open-models";
+
   return `
-    <div class="conn-banner conn-banner--${c.tone}">
-      <span class="conn-banner__icon">${icon(model ? (c.key === "nokey" ? "key" : c.key === "fail" ? "alert" : "info") : "puzzle", "icon--sm")}</span>
-      <div class="conn-banner__main">
-        <b>${model ? `${esc(model.label)} · ${esc(c.label)}` : esc(c.label)}</b>
-        <p>${esc(c.detail)}</p>
-      </div>
-      <div class="conn-banner__actions">${actions}</div>
+    <div class="conn-note conn-note--${c.tone}">
+      <button class="conn-note__main" data-act="${open}" ${model ? `data-id="${esc(model.id)}"` : ""} title="${esc(c.detail)}">
+        <span class="conn-note__dot" aria-hidden="true"></span>
+        <span class="conn-note__text">${esc(text)}</span>
+      </button>
+      <button class="conn-note__go" data-act="${act.act}">${esc(act.label)}</button>
     </div>`;
 }
 
@@ -1223,6 +1327,14 @@ function renderContextBar(s) {
   const mode = currentMode();
   const model = currentModel();
   const conn = modelConnection(model?.id);
+
+  // 这一排只在「只读权限」时出现 —— 那是真正需要在每条消息旁边提醒的状态。
+  // 模型缺失 / 连接失败交给上面那行 conn-note，同一件事不说两遍；
+  // 模式和模型入口则收进顶栏胶囊（点一下改档位）与会话菜单。
+  const empty = !s || !s.messages.length;
+  const readonly = state.settings.permission === "readonly";
+  if (empty || !readonly) return `<div class="chat__meta" hidden></div>`;
+
   const modelChip = model
     ? `<button class="chip" data-act="open-model" title="${esc(conn.detail)}">
         <span class="chip__dot ${conn.key === "ok" ? "chip__dot--ok" : conn.key === "nokey" || conn.key === "fail" ? "chip__dot--warn" : ""}"></span>
@@ -1239,7 +1351,7 @@ function renderContextBar(s) {
   return `
   <div class="chat__meta">
     <button class="chip chip--accent" data-act="open-mode">
-      ${icon("bolt", "icon--xs")} ${esc(mode.name)}模式
+      ${icon("bolt", "icon--xs")} ${esc(mode.name)}
     </button>
     ${modelChip}
     <button class="chip chip--status" data-act="${conn.key === "nokey" ? "connect-model" : "test-current-model"}" aria-label="${esc(conn.label)}：${esc(conn.detail)}">
@@ -1251,12 +1363,17 @@ function renderContextBar(s) {
 }
 
 function renderComposer(s) {
-  const tools = availableToolNames().length;
   const mode = currentMode();
   return `
   <div class="composer-wrap">
     <!-- 插件界面挂载点：输入框上方。空的时候整块收起来，不留缝 -->
     <div class="ui-slot ui-slot--composer" data-ui-slot="composer.toolbar" hidden></div>
+    <!-- 别的会话在跑：给一条可点的横条，切回来就能继续引导/停止 -->
+    <button class="run-away" id="run-away" data-act="goto-run" ${ui.run && !runHere() ? "" : "hidden"}>
+      <span class="run-away__dot" aria-hidden="true"></span>
+      <span class="run-away__text"></span>
+      <span class="run-away__go">查看</span>
+    </button>
     <div class="composer">
       <div class="composer__files" id="composer-files" ${ui.attachments.length ? "" : "hidden"}>${attachmentChips()}</div>
       <div class="voice-strip" id="voice-strip" ${voiceState() === "idle" ? "hidden" : ""} aria-live="polite">
@@ -1270,13 +1387,13 @@ function renderComposer(s) {
         <button class="voice-strip__btn" data-act="voice-cancel" aria-label="取消语音输入">${icon("x", "icon--sm")}</button>
         <button class="voice-strip__btn voice-strip__btn--go" data-act="voice-stop" aria-label="结束并写入">${icon("check", "icon--sm")}</button>
       </div>
+      <button class="icon-btn icon-btn--sm" data-act="attach" aria-label="添加文件">${icon("plus")}</button>
       <textarea class="composer__input" id="composer-input" rows="1" enterkeyhint="send"
-        placeholder="${s && s.messages.length ? "接着说要改什么，或 / 调指令" : "描述目标，@ 引用文件，/ 调指令"}"></textarea>
+        placeholder="${s && s.messages.length ? "接着说，或 / 调指令" : "描述目标，@ 引用文件"}"></textarea>
       <div class="composer__foot">
-        <div class="composer__tools">
-          <button class="icon-btn icon-btn--sm" data-act="attach" aria-label="添加文件">${icon("plus")}</button>
-          ${state.plugins.find((p) => p.id === "voice" && p.enabled) ? `<button class="icon-btn icon-btn--sm" data-act="voice" id="voice-btn" aria-label="语音输入" aria-pressed="false">${icon("mic", "icon--sm")}</button>` : ""}
-        </div>
+        ${state.plugins.find((p) => p.id === "voice" && p.enabled) ? `<button class="icon-btn icon-btn--sm" data-act="voice" id="voice-btn" aria-label="语音输入" aria-pressed="false">${icon("mic", "icon--sm")}</button>` : ""}
+        <!-- 运行中主按钮会让位给「引导」，停止入口独立常驻，避免想停却发出一条消息 -->
+        <button class="icon-btn icon-btn--sm icon-btn--stop" id="stop-live-btn" data-act="stop-live" aria-label="停止运行" ${runHere() ? "" : "hidden"}>${icon("stop", "icon--sm")}</button>
         <button class="send" id="send-btn" data-act="send" aria-label="发送">${icon("arrowUp", "icon--sm")}</button>
       </div>
     </div>
@@ -1331,6 +1448,23 @@ function addAttachment(item) {
   return true;
 }
 
+/**
+ * 接住 DSH 键盘截回来的图。
+ *
+ * 键盘（IME）在别的应用里也能用，所以它截的图会从原生回到这里。
+ * 默认只加为附件，不自动发 —— 用户在微信里截了图回到 DSH，
+ * 看到它躺在附件区自己决定要不要发，比"截完自动弹一条消息"安静得多。
+ */
+export function receiveImeAttachment(item, { send = false } = {}) {
+  if (!item?.path) return false;
+  if (!addAttachment(item)) return false;
+  if (send) {
+    // 让 DOM 先刷新出附件条，再发
+    requestAnimationFrame(() => sendMessage("请看这张截图。"));
+  }
+  return true;
+}
+
 /* ---------------- 消息增量渲染 ----------------
    流式输出每帧重建整个 #messages 会带来两个问题：
    1) 增长中的正文每帧重跑一遍 Markdown，长回答接近 O(n²)，越写越卡；
@@ -1359,7 +1493,9 @@ function attachmentChipHtml(a) {
 
 function userMsgHtml(m) {
   const files = m.attachments || [];
-  return `<div class="msg msg--user" data-msg="${m.id}"><div class="msg__bubble">${esc(m.content)}${
+  // 运行中补的指令要能在记录里认出来：它不是一轮新提问，而是中途改口
+  const tag = m.steer ? `<span class="msg__steer">引导</span>` : "";
+  return `<div class="msg msg--user${m.steer ? " msg--steer" : ""}" data-msg="${m.id}"><div class="msg__bubble">${tag}${esc(m.content)}${
     files.length ? `<div class="msg__files">${files.map(attachmentChipHtml).join("")}</div>` : ""
   }</div></div>`;
 }
@@ -1435,9 +1571,12 @@ function assistantShell(m) {
   return `<div class="msg msg--assistant" data-msg="${m.id}">
     <div class="msg__head"></div>
     <div class="msg__extra"></div>
-    <div class="reasoning-slot"></div>
-    <div class="tools-slot"></div>
-    <div class="body-slot"><div class="msg__body"></div><span class="stream-caret" hidden></span></div>
+    <div class="msg__flow" hidden></div>
+    <div class="msg__legacy">
+      <div class="reasoning-slot"></div>
+      <div class="tools-slot"></div>
+      <div class="body-slot"><div class="msg__body"></div><span class="stream-caret" hidden></span></div>
+    </div>
     <div class="tail-slot"></div>
   </div>`;
 }
@@ -1501,6 +1640,7 @@ function reasoningShell(m, open) {
     <button class="reasoning__toggle" data-act="toggle-reason" data-id="${m.id}">
       ${icon("chevron", "icon--xs reasoning__chev")}
       <span class="reasoning__label"></span>
+      <span class="reasoning__hint"></span>
     </button>
     <div class="reasoning__text"></div>
   </div>`;
@@ -1512,7 +1652,7 @@ function reasoningShell(m, open) {
    反之若整棵子树被重建，动画会随新节点一起从头播放，
    深度思考流式输出时每个 delta 重建一次 —— 视觉上就是持续频闪。 */
 function patchReasoning(el, m, running, open) {
-  const slot = el.querySelector(":scope > .reasoning-slot");
+  const slot = el.querySelector(".reasoning-slot");
   if (!slot) return;
 
   const show = !!(m.reasoning && (state.settings.showReasoning || running));
@@ -1559,12 +1699,81 @@ function patchReasoning(el, m, running, open) {
 }
 
 function bodyHtml(m, running) {
-  if (m.content) return renderMarkdown(m.content);
-  if (running) return `${icon("loader", "icon--sm icon--loader")} 正在准备…`;
+  // 正文不再在运行时裁掉首尾空白（那会让时间线的段偏移错位），
+  // 缩进交给渲染这一层处理
+  const text = String(m.content || "").trim();
+  if (text) return renderMarkdown(text);
+  if (running) {
+    const wait = {
+      connecting: "正在连接模型服务…",
+      waiting: "已连接，等待模型响应…",
+      thinking: "模型正在思考…",
+      streaming: "正在生成回答…",
+      acting: "正在执行工具…",
+    }[m.phase] || "正在准备…";
+    return `${icon("loader", "icon--sm icon--loader")} ${wait}`;
+  }
   return "";
 }
 
 function tailHtml(m, done, tools) {
+  // 正在运行：一枚会动的状态标 + 计时。
+  //
+  // ============ 为什么需要它 ============
+  //
+  // 运行中原来只有「STEP 2」「正在思考…」这类**静态**文字。工具跑起来之后
+  // 屏幕可能十几秒没有任何变化 —— 用户分不清"它在干活"还是"卡住了"。
+  // 四格跳动的成本极低，但它回答的是最容易让人退出应用的那个问题：
+  // 现在到底有没有在动。
+  //
+  // 秒数由 paintRunBadges 单独刷新，不参与 tail 的签名 ——
+  // 否则每 0.2 秒重建一次 DOM，跳动的动画会跟着从头播，看着像在抽搐。
+  const phaseLabel =
+    {
+      connecting: "正在连接…",
+      waiting: "已连接 · 等待模型",
+      thinking: "正在思考",
+      streaming: "正在输出",
+      acting: "执行工具中",
+    }[m.phase] || "工作中";
+  // 引导状态挂在运行状态标上：用户补完指令后能立刻看到「待生效」变成「已按 N 条调整」，
+  // 否则输入完没有任何回执，又会以为消息没发出去。
+  const steerNote =
+    m.steerPending > 0
+      ? ` · ${m.steerPending} 条引导待生效`
+      : m.steerCount > 0
+        ? ` · 已按 ${m.steerCount} 条引导调整`
+        : "";
+  const runBadge =
+    m.status === "running"
+      ? `<div class="runbadge" data-phase="${esc(m.phase || "")}" data-start="${m.startedAt || m.ts || Date.now()}" aria-label="DSH 正在工作">
+           <span class="runbadge__bars" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+           <span class="runbadge__label">${esc(phaseLabel + steerNote)}</span>
+           <span class="runbadge__time">0.0 秒</span>
+         </div>`
+      : "";
+
+  // ============ 空思维链占位 ============
+  //
+  // 深度思考模型在服务端想 60~90 秒时，m.reasoning / m.content 都还是空的，
+  // 思考区（要求 reasoning 非空）和正文都不渲染 —— 屏幕上只剩一枚"工作中"。
+  // 上一轮刚经历过连接失败的用户，很自然会把这 90 秒当成又断线了。
+  //
+  // 这里补一张明确说"连接正常、模型在想、可能要一分钟"的卡，
+  // 并且由 paintRunBadges 按等待秒数升级文案。思维链或正文一到就撤掉。
+  const pending =
+    m.status === "running" && !m.reasoning && !m.content && !tools.length
+      ? `<div class="thinking-pending" aria-live="polite">
+           <div class="thinking-pending__top">
+             <span class="thinking-pending__pulse" aria-hidden="true"></span>
+             <b>正在思考</b>
+             <span class="thinking-pending__tag">尚未收到思维链</span>
+           </div>
+           <div class="thinking-pending__bars" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+           <div class="thinking-pending__hint" data-start="${m.startedAt || m.ts || Date.now()}"></div>
+         </div>`
+      : "";
+
   // 正在自动重试：说清楚"不是你点错了，是连接断了，我在重来"。
   // 不给按钮 —— 这时除了等，用户没有别的动作可做。
   const retry =
@@ -1611,7 +1820,81 @@ function tailHtml(m, done, tools) {
            <span class="runmeta__item" style="color:var(--accent-bright)">轨迹 ${icon("chevron", "icon--xs")}</span>
          </button>`
       : "";
-  return retry + err + meta;
+  return retry + err + pending + runBadge + meta;
+}
+
+/* ---------------- 运行计时（0.62.0） ----------------
+ *
+ * 只改 .runbadge__time 的文字，不重建结构。
+ * 四格跳动是 CSS 动画，一旦 DOM 被换掉就会从第 0 帧重播 ——
+ * 秒数每 0.2 秒变一次，若跟着重建，看起来就是一直在抽搐而不是在呼吸。
+ *
+ * 计时器只在页面上真的有运行时标时才存在，没有就自己停掉；
+ * 应用切到后台也停，回来由 ensureRunClock 再拉起来。
+ */
+let runClockTimer = null;
+
+/** 等待越久，话要说得越明确 —— 核心是让用户别把"在思考"误判成"没连上"。 */
+function pendingHint(sec) {
+  if (sec < 15) return "连接正常，模型正在组织思路…";
+  if (sec < 45) return "模型正在深度思考，首个字通常较慢，请稍候。";
+  if (sec < 90) return `已等待 ${Math.floor(sec)} 秒 · 连接正常，深度思考模型可能要 1 分钟以上才输出内容。`;
+  return `仍在等待模型响应（${Math.floor(sec)} 秒）· 连接正常。若长时间无响应，可停止后重试或查看连接状态。`;
+}
+
+function paintRunBadges() {
+  // 后台不跑：200ms 一次的定时器在后台没有任何意义，还白耗电
+  if (document.hidden) {
+    if (runClockTimer) {
+      clearInterval(runClockTimer);
+      runClockTimer = null;
+    }
+    return;
+  }
+  const nodes = document.querySelectorAll(".runbadge[data-start]");
+  const hints = document.querySelectorAll(".thinking-pending__hint[data-start]");
+  if (!nodes.length && !hints.length) {
+    if (runClockTimer) {
+      clearInterval(runClockTimer);
+      runClockTimer = null;
+    }
+    return;
+  }
+  const now = Date.now();
+  hints.forEach((el) => {
+    const sec = Math.max(0, (now - Number(el.dataset.start)) / 1000);
+    const text = pendingHint(sec);
+    if (el.textContent !== text) el.textContent = text;
+  });
+  nodes.forEach((el) => {
+    const sec = Math.max(0, (now - Number(el.dataset.start)) / 1000);
+    const text =
+      sec < 60
+        ? `${sec.toFixed(1)} 秒`
+        : `${Math.floor(sec / 60)}:${String(Math.floor(sec % 60)).padStart(2, "0")}`;
+    const box = el.querySelector(".runbadge__time");
+    if (box && box.textContent !== text) box.textContent = text;
+  });
+}
+
+function ensureRunClock() {
+  if (!document.querySelector(".runbadge[data-start]")) return;
+  paintRunBadges();
+  if (!runClockTimer) runClockTimer = setInterval(paintRunBadges, 200);
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) ensureRunClock();
+});
+
+/** 一条消息里第几个子任务 —— 卡片标题上的序号，按工具发生顺序数。 */
+function subagentSeq(tools) {
+  const map = new Map();
+  let n = 0;
+  (tools || []).forEach((t) => {
+    if (t.name === "spawn_subagent") map.set(t.id, ++n);
+  });
+  return map;
 }
 
 /** 工具卡片只在状态/输出长度等真正变化时重建，避免 spinner 反复从头转。 */
@@ -1640,20 +1923,22 @@ function patchTools(box, tools) {
   }
   const existing = new Map([...list.children].map((c) => [c.dataset.toolId, c]));
   const alive = new Set();
+  const subSeq = subagentSeq(tools);
   tools.forEach((t, idx) => {
     alive.add(t.id);
     const sig = toolSig(t);
     let card = existing.get(t.id);
+    const ctx = { subSeq: subSeq.get(t.id) };
     if (!card) {
       const tmp = document.createElement("div");
-      tmp.innerHTML = renderTool(t);
+      tmp.innerHTML = renderTool(t, ctx);
       card = tmp.firstElementChild;
       card.dataset.toolId = t.id;
       card.dataset.sig = sig;
       existing.set(t.id, card);
     } else if (card.dataset.sig !== sig) {
       const tmp = document.createElement("div");
-      tmp.innerHTML = renderTool(t);
+      tmp.innerHTML = renderTool(t, ctx);
       const fresh = tmp.firstElementChild;
       fresh.dataset.toolId = t.id;
       fresh.dataset.sig = sig;
@@ -1672,9 +1957,303 @@ function patchTools(box, tools) {
   });
 }
 
+/* ---------------- 时间线渲染 ---------------- */
+
+/**
+ * 按发生顺序铺开一条助手消息。
+ *
+ * 旧布局把「思考 / 工具 / 正文」各放一个固定槽位，顺序是写死的。
+ * 可 Agent 实际的节奏是「想 → 调工具 → 看结果 → 再想」，
+ * 三桶一平铺，中间那些「因为 A 失败所以改用 B」推理就全被抽走了，
+ * 剩下一坨思考、一堆工具、一段结论，像三份互不相干的附录。
+ *
+ * 这里按 m.timeline 逐段铺开。段本身复用原来的类名
+ * （.reasoning / .tool / .msg__body），样式一行都不用重写。
+ * 没有 timeline 的旧消息仍走三桶布局 —— 历史会话不会变样。
+ */
+
+/** 段的稳定标识：位置由类别 + 起始偏移决定，刷新不会错位。 */
+function segKey(seg) {
+  if (seg.type === "tool") return `t:${seg.id}`;
+  return `${seg.type === "reasoning" ? "r" : "x"}:${seg.from}`;
+}
+
+/** 取出该段覆盖的文本。to 为空表示还在增长，一直到末尾。 */
+function segText(m, seg) {
+  const src = String((seg.type === "reasoning" ? m.reasoning : m.content) || "");
+  const to = seg.to === null || seg.to === undefined ? src.length : seg.to;
+  return src.slice(seg.from, to);
+}
+
+/**
+ * 思考段的折叠标题只写「深度思考」，四段排下来就是四个一样的标签，
+ * 等于没写。这里取首句当摘要，折叠状态也能看出这一步在琢磨什么。
+ */
+function reasonSummary(text) {
+  const s = String(text || "").replace(/\s+/g, " ").trim();
+  if (!s) return "";
+  const m = s.match(/^(.{4,}?)[。！？!?；;，,]/);
+  const head = m ? m[1] : s.slice(0, 16);
+  return head.length > 16 ? `${head.slice(0, 16)}…` : head;
+}
+
+/* ---------------- 「N 步进程」折叠组 ----------------
+ *
+ * 一轮跑十几步时，思考与工具卡片平铺会把消息拉得老长，用户要滑很久才看到结论。
+ * 收进一个组里：运行中自动展开（否则看不出它是不是卡住了），结束后自动收起。
+ *
+ * 两条硬规矩：
+ *   1. 有等待审批的调用时强制展开 —— 折进去用户就找不到该点哪里了。
+ *   2. 用户手动开合过就一直听用户的（强制展开的情况除外）。
+ */
+const flowOpen = new Map();
+
+/**
+ * 一次回复跑完就把思考链与「N 步进程」组收起来。
+ *
+ * 运行中它们默认展开（否则看不出模型是不是卡住了），用户也可能为了
+ * 追进度手动点开。但结束后那几屏思考文字留在原地，会把结论和输入框
+ * 一起顶到很远，想接着打字得先滑半天 —— 完成时自动收起最省事。
+ *
+ * 只收一次：收完之后用户再手动展开回看，不该被下一次 updateMessages
+ * 又强行合上。重跑（status 回到 running）时把标记撤掉，允许再收一次。
+ */
+const collapsedOnFinish = new Set();
+
+function collapseFinishedReasoning(s) {
+  for (const m of s.messages || []) {
+    if (m.status === "running" || m.status === "pending") {
+      collapsedOnFinish.delete(m.id);
+      continue;
+    }
+    if (collapsedOnFinish.has(m.id)) continue;
+    collapsedOnFinish.add(m.id);
+    flowOpen.delete(m.id);
+    // 思考段在时间线里各有独立开关，键是 `消息id#起始偏移`
+    for (const k of Array.from(ui.reasoningOpen)) {
+      if (k === m.id || k.indexOf(`${m.id}#`) === 0) ui.reasoningOpen.delete(k);
+    }
+  }
+}
+
+function ensureRunGroup(box) {
+  let g = box.querySelector(":scope > .run-group");
+  if (!g) {
+    g = document.createElement("div");
+    g.className = "run-group";
+    g.dataset.open = "true";
+    g.innerHTML = `<button class="run-group__head" data-act="toggle-flow" data-id="">
+      <span class="run-group__ic"></span>
+      <span class="run-group__title">进程</span>
+      <span class="run-group__meta"></span>
+      <span class="run-group__chev">${icon("chevron", "icon--xs")}</span>
+    </button>
+    <div class="run-group__body"></div>`;
+  }
+  // 组永远是第一个孩子：正文段的插入位置按「组之后」算，挪了就错位
+  if (box.firstElementChild !== g) box.insertBefore(g, box.firstElementChild || null);
+  return g;
+}
+
+function paintRunGroup(group, m, steps, running) {
+  const waiting = (m.tools || []).some((t) => t.status === "waiting");
+  const open = waiting ? true : flowOpen.has(m.id) ? flowOpen.get(m.id) : running;
+  const set = (el, key, val) => {
+    if (el.dataset[key] !== String(val)) el.dataset[key] = String(val);
+  };
+  set(group, "open", open);
+  set(group, "wait", waiting);
+
+  const head = group.querySelector(".run-group__head");
+  if (head.dataset.id !== m.id) head.dataset.id = m.id;
+
+  const spin = running && !waiting;
+  const ic = group.querySelector(".run-group__ic");
+  const icKey = spin ? "loader" : waiting ? "shield" : "layers";
+  if (ic.dataset.k !== icKey) {
+    ic.dataset.k = icKey;
+    ic.className = `run-group__ic${spin ? " run-group__ic--spin" : ""}`;
+    ic.innerHTML = icon(icKey, "icon--xs");
+  }
+
+  const title = group.querySelector(".run-group__title");
+  const tt = waiting ? `待处理 · ${steps} 步` : `${steps} 步进程`;
+  if (title.textContent !== tt) title.textContent = tt;
+
+  const total = (m.tools || []).length;
+  const meta = group.querySelector(".run-group__meta");
+  const mt = running ? "进行中" : total ? `${total} 次工具调用` : "";
+  if (meta.textContent !== mt) meta.textContent = mt;
+}
+
+function patchFlow(box, m) {
+  const segs = m.timeline || [];
+  const running = m.status === "running";
+  // 现有节点可能挂在折叠组里：组外的直接子元素 + 组内的步骤，两边都要收
+  const existing = new Map();
+  const oldGroup = box.querySelector(":scope > .run-group");
+  if (oldGroup) {
+    oldGroup.querySelectorAll(":scope > .run-group__body > *").forEach((c) => {
+      if (c.dataset.k) existing.set(c.dataset.k, c);
+    });
+  }
+  [...box.children].forEach((c) => {
+    if (c === oldGroup || !c.dataset.k) return;
+    existing.set(c.dataset.k, c);
+  });
+  const alive = new Set();
+  const subSeq = subagentSeq(m.tools);
+
+  // 只有最后一个思考段可能还在增长，标题也只由它决定
+  let lastReason = -1;
+  for (let i = 0; i < segs.length; i++) if (segs[i].type === "reasoning") lastReason = i;
+
+  // 两条游标：步骤进折叠组、正文留在组外。
+  // 不用 segs 下标 —— 关掉「显示思考过程」后思考段会被整段跳过，下标就和实际节点错开了。
+  let stepIdx = 0;
+  let textIdx = 0;
+  const group = ensureRunGroup(box);
+  const groupBody = group.querySelector(":scope > .run-group__body");
+
+  segs.forEach((seg, idx) => {
+    const key = segKey(seg);
+    let node = existing.get(key);
+
+    if (seg.type === "tool") {
+      const t = (m.tools || []).find((x) => x.id === seg.id);
+      if (!t) return; // 卡片还没落库，下一帧再画
+      alive.add(key);
+      const sig = toolSig(t);
+      const ctx = { subSeq: subSeq.get(t.id) };
+      if (!node) {
+        const tmp = document.createElement("div");
+        tmp.innerHTML = renderTool(t, ctx);
+        node = tmp.firstElementChild;
+        node.dataset.k = key;
+        node.dataset.sig = sig;
+        existing.set(key, node);
+      } else if (node.dataset.sig !== sig) {
+        const tmp = document.createElement("div");
+        tmp.innerHTML = renderTool(t, ctx);
+        const fresh = tmp.firstElementChild;
+        fresh.dataset.k = key;
+        fresh.dataset.sig = sig;
+        node.replaceWith(fresh);
+        existing.set(key, fresh);
+        node = fresh;
+      } else {
+        const openNow = String(ui.toolOpen.has(t.id));
+        if (node.dataset.open !== openNow) node.dataset.open = openNow;
+      }
+    } else if (seg.type === "reasoning") {
+      const text = segText(m, seg);
+      // 关掉「显示思考过程」后，历史段整块撤掉；运行中的末段仍然要露面，
+      // 否则深度思考模型会有好几秒什么都不显示。
+      const show = !!text && (state.settings.showReasoning || running);
+      if (!show) {
+        if (node) node.remove();
+        existing.delete(key);
+        return;
+      }
+      alive.add(key);
+      const segId = `${m.id}#${seg.from}`;
+      const open = ui.reasoningOpen.has(segId);
+      if (!node) {
+        const tmp = document.createElement("div");
+        tmp.innerHTML = reasoningShell(m, open);
+        node = tmp.firstElementChild;
+        node.dataset.k = key;
+        node.querySelector(".reasoning__toggle").setAttribute("data-id", segId);
+        existing.set(key, node);
+      } else {
+        const openStr = open ? "true" : "false";
+        if (node.dataset.open !== openStr) node.dataset.open = openStr;
+      }
+      const label = node.querySelector(".reasoning__label");
+      const thinking = running && idx === lastReason && seg.to === null;
+      const want = thinking ? "正在思考…" : "深度思考";
+      if (label.textContent !== want) label.textContent = want;
+
+      // 摘要只在停下来之后给：流式时首句还在长，每帧改一次反而晃眼睛
+      const hint = node.querySelector(".reasoning__hint");
+      if (hint) {
+        const sum = thinking ? "" : reasonSummary(text);
+        if (hint.textContent !== sum) hint.textContent = sum;
+      }
+
+      // 只对末段做追加：历史段内容已经固定，重写只会让浏览器白排一次版
+      const textEl = node.querySelector(".reasoning__text");
+      let tn = textEl._reasonNode;
+      if (!tn || tn.parentNode !== textEl) {
+        textEl.textContent = "";
+        tn = document.createTextNode("");
+        textEl.appendChild(tn);
+        textEl._reasonNode = tn;
+      }
+      const shown = tn.nodeValue || "";
+      if (text.length > shown.length && text.indexOf(shown) === 0) tn.appendData(text.slice(shown.length));
+      else if (text !== shown) tn.nodeValue = text;
+    } else {
+      alive.add(key);
+      if (!node) {
+        node = document.createElement("div");
+        node.className = "msg__body msg__body--seg";
+        node.dataset.k = key;
+        existing.set(key, node);
+      }
+      // 段尾可能留着工具回合后的空行，渲染前掐掉，否则会多出一块留白
+      const text = segText(m, seg).trim();
+      const sig = `${text.length}|${running}`;
+      if (node.dataset.sig !== sig) {
+        node.className = `msg__body msg__body--seg${text ? " md" : " dim"}`;
+        node.innerHTML = text
+          ? renderMarkdown(text)
+          : running
+            ? `${icon("loader", "icon--sm icon--loader")} 正在准备…`
+            : "";
+        node.dataset.sig = sig;
+      }
+    }
+
+    // 步骤进组、正文留在组外：组永远在最上面，读起来是「过程 → 结论」。
+    // 组内/组外各一条游标，互不干扰。
+    if (seg.type === "tool" || seg.type === "reasoning") {
+      if (groupBody.children[stepIdx] !== node) groupBody.insertBefore(node, groupBody.children[stepIdx] || null);
+      stepIdx += 1;
+    } else {
+      // 组固定占 box 的第 0 位，正文从第 1 位往后排
+      if (box.children[textIdx + 1] !== node) box.insertBefore(node, box.children[textIdx + 1] || null);
+      textIdx += 1;
+    }
+  });
+
+  // 死节点：组外的直接子元素 + 组内的步骤，两处都要扫
+  [...box.children].forEach((c) => {
+    if (c === group) return;
+    if (!alive.has(c.dataset.k)) c.remove();
+  });
+  [...groupBody.children].forEach((c) => {
+    if (!alive.has(c.dataset.k)) c.remove();
+  });
+
+  // 没有步骤就别留一个空壳
+  if (!stepIdx) {
+    group.remove();
+    return;
+  }
+  paintRunGroup(group, m, stepIdx, running);
+}
+
 function patchAssistant(el, m) {
   const running = m.status === "running";
   const open = ui.reasoningOpen.has(m.id);
+
+  // 时间线里每段思考各有自己的开关（键是 `消息id#起始偏移`），
+  // 只拿整条消息的 id 去数，点开某一段时 quick 不变，界面就不会重绘。
+  let openCount = 0;
+  ui.reasoningOpen.forEach((k) => {
+    if (k === m.id || k.indexOf(`${m.id}#`) === 0) openCount += 1;
+  });
 
   // 便宜的整体签名：状态、正文/推理长度、工具状态、展开态。
   // 完全没变就不往下走，避免每帧为一屋子消息拼 HTML。
@@ -1682,6 +2261,7 @@ function patchAssistant(el, m) {
     m.status,
     m.content.length,
     m.reasoning.length,
+    (m.timeline || []).length,
     (m.tools || [])
       .map((t) => `${t.id}:${t.status}:${(t.output || "").length}:${t.ms || 0}:${ui.toolOpen.has(t.id) ? 1 : 0}`)
       .join(","),
@@ -1689,7 +2269,13 @@ function patchAssistant(el, m) {
     m.contextPack?.compacted || 0,
     m.media?.sent || 0,
     m.media?.images || 0,
-    open ? 1 : 0,
+    m.phase || "",
+    // 引导计数变化时必须重绘：否则发完引导、其它字段都没动，
+    // patchAssistant 会在下面的 quick 早退，状态标迟迟不显示「待生效」。
+    m.steerPending || 0,
+    m.steerCount || 0,
+    openCount,
+    flowOpen.has(m.id) ? String(flowOpen.get(m.id)) : "",
   ].join("|");
   if (el.dataset.quick === quick) return;
 
@@ -1705,34 +2291,48 @@ function patchAssistant(el, m) {
     el.dataset.sigExtra = extra;
   }
 
-  patchReasoning(el, m, running, open);
-  patchTools(el.querySelector(":scope > .tools-slot"), m.tools || []);
+  // 有 timeline 走时间线；没有的旧消息保持原来的三桶布局，
+  // 历史会话翻回去看不会突然变样
+  const flow = Array.isArray(m.timeline) && m.timeline.length > 0;
+  const flowEl = el.querySelector(":scope > .msg__flow");
+  const legacyEl = el.querySelector(":scope > .msg__legacy");
+  if (flowEl) flowEl.hidden = !flow;
+  if (legacyEl) legacyEl.hidden = flow;
 
-  // 正文是流式里变化最频繁的部分：按时间片节流，避免每个 token 都重排 Markdown
-  const bodySig = `${m.content.length}|${running}|${m.status}`;
-  if (el.dataset.sigBody !== bodySig) {
-    const now = performance.now();
-    const last = Number(el.dataset.bodyAt || 0);
-    // 文本越长，Markdown 重排越贵：间隔跟着放宽，短消息保持跟手
-    const gap = m.content.length > 6000 ? 180 : m.content.length > 2000 ? 110 : BODY_FRAME_MS;
-    if (running && now - last < gap) {
-      if (!el._bodyTimer) {
-        el._bodyTimer = setTimeout(() => {
-          el._bodyTimer = null;
-          if (el.isConnected) updateMessages();
-        }, gap);
+  // 正文签名在两条路径下都要用，放在分流外面
+  const bodySig = `${m.content.length}|${running}|${m.status}|${m.phase || ""}`;
+
+  if (flow) {
+    patchFlow(flowEl, m);
+  } else {
+    patchReasoning(el, m, running, open);
+    patchTools(el.querySelector(".tools-slot"), m.tools || []);
+
+    // 正文是流式里变化最频繁的部分：按时间片节流，避免每个 token 都重排 Markdown
+    if (el.dataset.sigBody !== bodySig) {
+      const now = performance.now();
+      const last = Number(el.dataset.bodyAt || 0);
+      // 文本越长，Markdown 重排越贵：间隔跟着放宽，短消息保持跟手
+      const gap = m.content.length > 6000 ? 180 : m.content.length > 2000 ? 110 : BODY_FRAME_MS;
+      if (running && now - last < gap) {
+        if (!el._bodyTimer) {
+          el._bodyTimer = setTimeout(() => {
+            el._bodyTimer = null;
+            if (el.isConnected) updateMessages();
+          }, gap);
+        }
+      } else {
+        el.dataset.bodyAt = String(now);
+        const bodyBox = el.querySelector(".body-slot");
+        const bodyEl = bodyBox.querySelector(".msg__body");
+        const caret = bodyBox.querySelector(".stream-caret");
+        bodyEl.className = `msg__body${m.content ? " md" : " dim"}`;
+        bodyEl.style.fontSize = m.content ? "" : "12px";
+        bodyEl.innerHTML = bodyHtml(m, running);
+        // 光标常驻 DOM，只切显隐：流式时不会每帧重播 blink 动画
+        if (caret) caret.hidden = !(running && m.content);
+        el.dataset.sigBody = bodySig;
       }
-    } else {
-      el.dataset.bodyAt = String(now);
-      const bodyBox = el.querySelector(":scope > .body-slot");
-      const bodyEl = bodyBox.querySelector(".msg__body");
-      const caret = bodyBox.querySelector(".stream-caret");
-      bodyEl.className = `msg__body${m.content ? " md" : " dim"}`;
-      bodyEl.style.fontSize = m.content ? "" : "12px";
-      bodyEl.innerHTML = bodyHtml(m, running);
-      // 光标常驻 DOM，只切显隐：流式时不会每帧重播 blink 动画
-      if (caret) caret.hidden = !(running && m.content);
-      el.dataset.sigBody = bodySig;
     }
   }
 
@@ -1741,25 +2341,91 @@ function patchAssistant(el, m) {
     el.querySelector(":scope > .tail-slot").innerHTML = tail;
     el.dataset.sigTail = tail;
   }
+  // 运行中：把秒数时钟拉起来（已在跑就什么都不做）
+  if (running) ensureRunClock();
 
-  // 正文真正落地后才认这份 quick；否则保持旧值，等节流定时器补一次
-  if (el.dataset.sigBody === bodySig) el.dataset.quick = quick;
+  // 正文真正落地后才认这份 quick；否则保持旧值，等节流定时器补一次。
+  // 时间线模式下正文由 patchFlow 自己增量维护，不存在「等节流」这回事。
+  if (flow || el.dataset.sigBody === bodySig) el.dataset.quick = quick;
+}
+
+/* ---------------- 首页小球 ----------------
+ *
+ * 首页中间那颗球和悬浮窗是**同一颗**（dsh-ball.js）：同一个状态机、
+ * 同一套眼神跟随，只是这里大一号（side 60 → 画布 96）。
+ *
+ * 为什么分两步：首页是一段字符串拼出来的，canvas 得先挂到 DOM 上
+ * 才拿得到 2D 上下文。所以 renderHome 只负责给画布，挂载后由
+ * mountHomeBall 绑球 —— 它可以被反复调用，已经绑过就复用。
+ */
+let homeBall = null;
+
+function mountHomeBall() {
+  const canvas = $("#home-ball");
+  if (!canvas) {
+    stopHomeBall();
+    return;
+  }
+  // 系统「减少动效」或设置里关掉动效：只画静态一帧。
+  // 这颗球一直在呼吸、眨眼，是持续的小幅刺激，不该当那个偏好不存在。
+  const calm =
+    !state.settings.motion ||
+    !!window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
+
+  // DOM 没换、动效档位也没变（只是首页又渲染了一次）：接着用原来那颗。
+  // 即使整块重绘换了画布节点，也只重绑，不新建 —— 新建会从 logo 变形的
+  // 第 0 帧开始，用户看到的是「点一下模式，中间的球抖了一下」。
+  if (homeBall && homeBall.calm === calm) {
+    if (homeBall.canvas !== canvas) homeBall.rebind(canvas);
+    else if (!homeBall.running) homeBall.start();
+    return;
+  }
+  stopHomeBall();
+  homeBall = new DshBall(canvas, { side: 72, calm });
+  homeBall.start();
+}
+
+function stopHomeBall() {
+  if (!homeBall) return;
+  homeBall.stop();
+  homeBall = null;
 }
 
 function updateMessages() {
   const s = activeSession();
+  if (s) collapseFinishedReasoning(s);
   const box = $("#messages");
-  if (!s || !box) return;
+  // 冷启动还没有会话：首页照样画出来了，球也得挂上去。
+  // 少了这一句，首次打开时中间是块空白画布 —— 只有先发一句话再切回来才有球。
+  if (!s) {
+    mountHomeBall();
+    return;
+  }
+  if (!box) return;
 
   if (!s.messages.length) {
     // 空会话：渲染首页空态。
     // 注意容器必须是 .messages（带 padding/gap 的消息布局），
     // 否则一旦有消息进来，容器的布局规则会与首页空态对不上。
     box.className = "messages messages--empty";
-    box.innerHTML = renderHome();
-    ui.msgNodes = new Map();
+    // 内容没变就不重写 DOM。updateMessages 在流式输出时每帧都会调，
+    // 空态下每帧重写一次的话，小球画布会被换掉，动画跟着一直重开。
+    const home = renderHome();
+    if (box.dataset.homeSig !== home) {
+      box.innerHTML = home;
+      box.dataset.homeSig = home;
+      ui.msgNodes = new Map();
+      // 首页空态是整块重建的，.reveal 默认 opacity:0，只靠 navigate() 里那一次补 is-in。
+      // 少了这一句，任何重绘（比如切换工作模式）都会把标题弄消失。
+      box.querySelectorAll(".reveal").forEach((el) => el.classList.add("is-in"));
+    }
+    mountHomeBall();
     return;
   }
+
+  // 有消息了：首页空态连同它的画布一起被移除，小球要停下 ——
+  // 留着 rAF 在跑等于白白耗电，canvas 也已经不在文档里了。
+  stopHomeBall();
 
   // 有消息了：把首页空态整块移除。
   // 之前只是往容器里"追加"消息节点，首页空态（.home）会残留在消息列表下方，
@@ -1767,6 +2433,9 @@ function updateMessages() {
   if (box.classList.contains("messages--empty")) {
     box.className = "messages";
     box.innerHTML = "";
+    // 首页的签名要一起清掉：留着的话，切回空会话时签名相同会跳过重绘，
+    // 可 DOM 已经被清空，首页就再也回不来了。
+    delete box.dataset.homeSig;
     ui.msgNodes = new Map();
   }
 
@@ -1774,7 +2443,9 @@ function updateMessages() {
   const prevScroll = $("#chat-scroll")?.scrollTop || 0;
 
   // 日期头只建一次
-  const dateText = `${new Date(s.createdAt).toLocaleDateString("zh-CN")} · ${MODES[s.mode]?.name || "标准"}模式`;
+  // 日期头只放日期：模式已经写在顶栏胶囊里，这里再说一遍是重复。
+  // 翻旧会话要判断"当时按什么规矩做的"，看顶栏就行。
+  const dateText = new Date(s.createdAt).toLocaleDateString("zh-CN");
   let head = box.querySelector(":scope > .chat__date");
   if (!head) {
     head = document.createElement("div");
@@ -1785,7 +2456,10 @@ function updateMessages() {
     head.textContent = dateText;
   }
 
-  const nodes = (ui.msgNodes ||= new Map());
+  // 不用 `||=`：那是 ES2021（Chrome 85+），而 2020 年前后的 Android 11 机型
+  // 出厂 WebView 常在 83/84，整个 ui.js 会因这一行解析失败，应用直接黑屏。
+  if (!ui.msgNodes) ui.msgNodes = new Map();
+  const nodes = ui.msgNodes;
   const seen = new Set();
   let prev = head;
 
@@ -1865,8 +2539,7 @@ function scheduleMessages() {
   });
 }
 
-function renderTool(t) {
-  const open = ui.toolOpen.has(t.id);
+function toolStatusMeta(t) {
   const map = {
     running: { tag: "运行中", cls: "tool__tag--warn", ic: "loader", spin: true },
     waiting: { tag: "待批准", cls: "tool__tag--warn", ic: "shield", spin: false },
@@ -1879,7 +2552,62 @@ function renderTool(t) {
     needs_user: { tag: "需处理", cls: "tool__tag--warn", ic: "alert", spin: false },
   };
   // 未知状态不再默认成「运行中」—— 那会让一个已经失败的调用一直转圈。
-  const st = map[t.status] || map.error;
+  return map[t.status] || map.error;
+}
+
+/**
+ * 子任务卡：spawn_subagent 不该长得像一条 shell 命令。
+ *
+ * 「子任务 2 · 探索模型管理…」+ 耗时/字数，展开是它带回来的结论。
+ * 参数里的 task 全文放正文里，不放 JSON —— 用户要看的是"派了什么活"，
+ * 不是"这个工具的入参 schema 长什么样"。
+ */
+function renderSubagentCard(t, st, ctx = {}) {
+  const open = ui.toolOpen.has(t.id);
+  const n = Number(ctx.subSeq) || 1;
+  const task = String((t.args && t.args.task) || t.argLabel || "").trim();
+  const brief = task.length > 22 ? `${task.slice(0, 22)}…` : task || "未命名任务";
+  const out = String(t.output || "");
+  const tail =
+    t.status === "done"
+      ? `<span class="tag">${t.ms ? fmtClock(t.ms) : ""}</span>${out ? `<span class="tag">${out.length} 字</span>` : ""}${
+          t.suspended ? `<span class="tool__tag tool__tag--warn" title="客户端曾被系统挂起">含挂起</span>` : ""
+        }`
+      : `<span class="tool__tag ${st.cls}">${st.tag}</span>`;
+  const color =
+    t.status === "done" ? "var(--ok)" : t.status === "running" || t.status === "waiting" ? "var(--warn)" : "var(--danger)";
+
+  return `
+  <div class="tool tool--task" data-status="${t.status}" data-open="${open}">
+    <button class="tool__head" data-act="toggle-tool" data-id="${t.id}">
+      <span class="tool__state ${st.spin ? "tool__state--spin" : ""}" style="color:${color}">
+        ${icon(st.spin ? "loader" : "layers", "icon--xs")}
+      </span>
+      <span class="tool__name tool__name--task">子任务 ${n}</span>
+      <span class="tool__arg">${esc(brief)}</span>
+      ${tail}
+      ${icon("chevron", "icon--xs tool__chev")}
+    </button>
+    <div class="tool__body">
+      ${task ? `<p class="tool__label">任务</p><p class="tool__ask">${esc(task)}</p>` : ""}
+      ${
+        out
+          ? `<p class="tool__label">结论</p><div class="msg__body md tool__result">${renderMarkdown(out)}</div>`
+          : t.status === "running"
+            ? `<p class="tool__hint">${icon("loader", "icon--sm icon--loader")} 子 Agent 正在它自己的上下文里分析，不占用主对话的窗口。</p>`
+            : t.status === "waiting"
+              ? `<div class="tool__statusline">${icon("shield", "icon--xs")} 等待你在下方审批</div>`
+              : `<p class="tool__hint">这次调用没有带回结论（${esc(st.tag)}）。</p>`
+      }
+      ${t.suspended ? `<div class="tool__notice tool__notice--warn">${icon("alert", "icon--xs")} 这次调用耗时 ${fmtClock(t.ms)}，DSH 当时可能被系统挂起在后台。</div>` : ""}
+    </div>
+  </div>`;
+}
+
+function renderTool(t, ctx = {}) {
+  const st = toolStatusMeta(t);
+  if (t.name === "spawn_subagent") return renderSubagentCard(t, st, ctx);
+  const open = ui.toolOpen.has(t.id);
 
   const argsText = (() => {
     if (t.name === "fs_write" || t.name === "fs_read") return t.args?.path || t.argLabel;
@@ -1935,16 +2663,60 @@ function setComposerValue(value) {
   ui.draft = value;
   const el = $("#composer-input");
   if (el) {
-    el.value = value;
+    const focused = document.activeElement === el;
+    const start = el.selectionStart;
+    const end = el.selectionEnd;
+    // 值没变就一个字节都不碰：无谓的 `value=` 赋值会让 WebView 的
+    // InputConnection 重新同步一次，组合输入期间尤其容易把候选打断。
+    if (el.value !== value) el.value = value;
+    if (focused) {
+      const max = el.value.length;
+      try {
+        el.setSelectionRange(Math.min(start ?? max, max), Math.min(end ?? max, max));
+      } catch {
+        /* 某些输入类型不支持 setSelectionRange */
+      }
+    }
     autoGrow();
   }
+  updateSendState();
+}
+
+/**
+ * 在当前光标处插入文字（而不是无脑追加到句末）。
+ *
+ * 语音识别、@ 引用文件、剪贴板短语这些「程序写入」以前都是
+ * `cur + text`，于是用户把光标挪到句中也只会被迫接在句尾。
+ * setRangeText 是浏览器原生的选区替换：WebView 的 Editable 会同步，
+ * 光标落在插入内容之后，不会破坏正在进行的组合输入。
+ */
+function insertComposerText(text, { space = true } = {}) {
+  const t = String(text || "");
+  const el = $("#composer-input");
+  if (!el || !t) return;
+  el.focus({ preventScroll: true });
+  const cur = el.value;
+  const start = el.selectionStart ?? cur.length;
+  const end = el.selectionEnd ?? start;
+  const before = cur.slice(0, start);
+  const needSpace =
+    space && !!before && !/\s$/.test(before) && /[A-Za-z0-9]$/.test(before) && /^[A-Za-z0-9]/.test(t);
+  const ins = `${needSpace ? " " : ""}${t}`;
+  try {
+    el.setRangeText(ins, start, end, "end");
+  } catch {
+    setComposerValue(cur + ins);
+    return;
+  }
+  ui.draft = el.value;
+  autoGrow();
   updateSendState();
 }
 
 function restoreDraft() {
   const input = $("#composer-input");
   if (!input) return;
-  input.value = ui.draft;
+  if (input.value !== ui.draft) input.value = ui.draft;
   autoGrow();
 }
 
@@ -2079,14 +2851,83 @@ function orphanRunning() {
   return m || null;
 }
 
+/** 当前正在跑的，是不是「屏幕上这个」会话。 */
+function runHere() {
+  return !!ui.run && ui.run.sessionId === state.activeSessionId;
+}
+
+/** 运行中的会话（可能不是当前打开的）。 */
+function runningSession() {
+  return ui.run ? state.sessions.find((s) => s.id === ui.run.sessionId) || null : null;
+}
+
+/**
+ * 别的会话在跑时，输入区上方给一条可点的横条。
+ * 没有这条提示，用户切到新会话后看到发送键变回普通样式，
+ * 会以为「刚才那个任务已经停了」——其实还在后台跑。
+ */
+function updateRunAway() {
+  const el = $("#run-away");
+  if (!el) return;
+  const away = !!ui.run && !runHere();
+  const wantHidden = !away;
+  if (el.hidden !== wantHidden) el.hidden = wantHidden;
+  if (!away) return;
+  const s = runningSession();
+  const text = el.querySelector(".run-away__text");
+  if (text) {
+    const next = `「${s?.title || "另一个会话"}」正在运行`;
+    if (text.textContent !== next) text.textContent = next;
+  }
+}
+
 function updateSendState() {
   const btn = $("#send-btn");
   if (!btn) return;
+  updateRunAway();
+  // 只有「正看着运行中的会话」才有引导/停止语义。
+  // 只看 ui.run 会让别的会话的输入也变成引导，点下去 steerRun 又因
+  // sessionId 不匹配直接返回 —— 表现就是「打字发送没反应」。
+  const here = runHere();
+  const stop = $("#stop-live-btn");
+  if (stop) stop.hidden = !here;
+  const input = $("#composer-input");
+  if (input) {
+    const s = activeSession();
+    const ph = here
+      ? "运行中可补充指令，发送即引导"
+      : s && s.messages.length
+        ? "接着说，或 / 调指令"
+        : "描述目标，@ 引用文件";
+    // 每 400ms 的轮询都会走到这里。无条件写 placeholder 等于每 400ms
+    // 改一次输入框属性，组合输入中的 WebView 会因此反复重连输入法。
+    if (input.placeholder !== ph) input.placeholder = ph;
+  }
   // 以输入框实时内容判断，避免镜像缓存与 DOM 脱节导致按钮永远禁用
   const orphan = orphanRunning();
-  const kind = ui.run || orphan ? "stop" : composerValue().trim() || ui.attachments.length ? "send" : "off";
+  const txt = composerValue().trim();
+  // 引导只带文字；运行中挂着附件时不把按钮伪装成可发送引导
+  const hasText = here ? !!txt : !!txt || ui.attachments.length > 0;
+  const kind = here ? (hasText ? "steer" : "stop") : orphan ? "stop" : hasText ? "send" : "off";
+
+  // 语音键与发送键共用右侧同一个位置：没字时是麦克风，有字时是发送。
+  // 两个按钮常驻会让胶囊右侧挤成一小排图标，这里只留一个。
+  const mic = $("#voice-btn");
+  if (mic) {
+    const hidden = kind !== "off";
+    if (mic.hidden !== hidden) mic.hidden = hidden;
+  }
+
   if (kind === lastSendKind) return; // 每次按键不重建按钮 DOM
   lastSendKind = kind;
+  btn.classList.toggle("send--steer", kind === "steer");
+  if (kind === "steer") {
+    btn.dataset.stop = "false";
+    btn.innerHTML = icon("arrowUp", "icon--sm");
+    btn.setAttribute("aria-label", "把补充指令作为引导发送");
+    btn.disabled = false;
+    return;
+  }
   if (kind === "stop") {
     btn.dataset.stop = "true";
     btn.innerHTML = icon("stop", "icon--sm");
@@ -2125,7 +2966,11 @@ async function sendMessage(text) {
   if (attachments.some((a) => /\.(png|jpe?g|webp|gif|bmp)$/i.test(a.path))) {
     const active = currentModel();
     const vision = active ? active.vision !== false : false;
-    if (!vision) toast("当前模型未开启「图片输入」，图片不会发送", "err");
+    if (active && modelFormat(active) !== "openai") {
+      toast(`当前模型是 ${FORMAT_SHORT[modelFormat(active)]} 格式，图片会换成一行文字说明`, "err");
+    } else if (!vision) {
+      toast("当前模型未开启「图片输入」，图片不会发送", "err");
+    }
   }
 
   let s = activeSession();
@@ -2179,8 +3024,11 @@ async function sendMessage(text) {
   renderAppbar();
 
   const controller = new AbortController();
-  ui.run = { controller, sessionId: s.id, msgId: msg.id };
+  // steerQueue：运行中用户追加的指令。runtime 在工具循环边界来取，
+  // 不打断正在进行的请求；这里不能用普通消息发送（那会直接被 ui.run 挡掉）。
+  ui.run = { controller, sessionId: s.id, msgId: msg.id, steerQueue: [] };
   updateSendState();
+  if (ui.drawer) renderDrawer(); // 会话列表里的「运行中」圆点
   hudSync();
   hudCue("start"); // 小球跳一下，表示开工
   // 任务期间拉起前台服务：用户切到别的应用时系统不会随手回收我们的进程，
@@ -2204,13 +3052,16 @@ async function sendMessage(text) {
       },
       requestApproval,
       spawnSubagent: (task) => spawnSubagentOnce(task, controller.signal),
+      pollSteer: () => (ui.run?.steerQueue ? ui.run.steerQueue.splice(0) : []),
     });
   } catch (err) {
     msg.status = "error";
     msg.error = err.message || "运行失败";
   } finally {
+    const missed = ui.run?.steerQueue?.length || 0;
     ui.run = null;
     updateSendState();
+    if (ui.drawer) renderDrawer();
     keepAliveStop();
     saveSessionNow(s.id);
     save(true);
@@ -2233,9 +3084,55 @@ async function sendMessage(text) {
     renderAppbar();
     hudSync();
     if (msg.status === "error") toast(msg.error || "运行失败", "err");
+    if (missed) toast(`${missed} 条引导没赶上本轮，可重新发送`, "err");
     const away = document.visibilityState !== "visible" || ui.view !== "chat" || state.activeSessionId !== s.id;
     if (state.settings.notifyOnDone && away && msg.status === "done") notifyDone(s);
   }
+}
+
+/**
+ * 运行中的输入引导：不打断当前请求，把用户追加的指令排进队列。
+ *
+ * runtime 在工具循环边界来取（见 liveRun 的 takeSteer），那是既不丢
+ * 当前流式输出、又能让模型读到新指令的最早时机。界面上同时落一条
+ * 带「引导」标记的用户气泡 —— 否则用户补完指令屏幕上什么都没留下，
+ * 和之前「一分半没反应」一样会让人以为消息没发出去。
+ */
+function steerRun(text) {
+  const raw = String(text || "").trim();
+  const run = ui.run;
+  if (!raw || !run || !run.steerQueue) return;
+  const s = activeSession();
+  if (!s || s.id !== run.sessionId) return;
+
+  const userMsg = {
+    id: `us_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    role: "user",
+    content: raw,
+    ts: Date.now(),
+    steer: true,
+    during: run.msgId,
+  };
+  addMessage(s.id, userMsg);
+  run.steerQueue.push(raw);
+  const msg = s.messages.find((m) => m.id === run.msgId);
+  if (msg) msg.steerPending = (msg.steerPending || 0) + 1;
+
+  setComposerValue("");
+  ui.pinned = true;
+  const box = $("#messages");
+  if (ui.lastBuilt === s.id && box && !box.querySelector(".home")) {
+    ui.renderFrom = Math.max(0, s.messages.length - RENDER_WINDOW);
+    updateMessages();
+    const sc = $("#chat-scroll");
+    if (sc) sc.scrollTop = sc.scrollHeight;
+  } else {
+    renderChat($("#view-chat"), "bottom");
+    ui.lastBuilt = s.id;
+  }
+  saveSessionNow(s.id);
+  updateSendState();
+  toast("已加入引导，模型在下一步读取", "ok");
 }
 
 function stopRunAction() {
@@ -2294,9 +3191,28 @@ function resolveApproval(allow, remember = false) {
 /* ---------------- 面板 ---------------- */
 
 function openSheet(type, data = {}, opts = {}) {
+  clearTimeout(ui.sheetTimer); // 别让上一次关闭的延时清理落到新面板上
   ui.sheet = { type, data, dismissible: opts.dismissible !== false };
   renderSheet();
   pushLayer();
+}
+
+/**
+ * 从一个面板直接换到另一个面板。
+ *
+ * 不能写成 closeSheet() + openSheet()：
+ * closeSheet 会 dropLayer() → history.back()，而 back 的 popstate 是异步到达的。
+ * 等它到达时，新面板已经 push 了 layer，于是 popstate 看见 ui.layer === true，
+ * 当成用户按了返回键，把刚打开的面板关掉 —— 表现为「点进去闪一下又没了」。
+ *
+ * 面板之间互相跳时，历史栈本来就只有一层，原地换掉内容才是对的。
+ */
+function replaceSheet(type, data = {}, opts = {}) {
+  const had = !!ui.sheet;
+  clearTimeout(ui.sheetTimer);
+  ui.sheet = { type, data, dismissible: opts.dismissible !== false };
+  renderSheet();
+  if (!had) pushLayer();
 }
 
 function closeSheet(force = false, fromHistory = false) {
@@ -2412,9 +3328,11 @@ function destroySheetControls() {
 function mountSheetControls(type) {
   destroySheetControls();
   if (type === "custom-model") {
-    // 打开面板即自动探测端点提供的模型（无 Key / 无端点时静默给出提示）
+    // 打开面板：先把「实际请求地址」「哪些开关可用」画出来，再静默探一次。
+    renderEndpointPreview();
+    syncFormatGates();
     setTimeout(() => {
-      if (ui.sheet?.type === "custom-model" && $("#cm-base")?.value.trim()) runFormModelFetch();
+      if (ui.sheet?.type === "custom-model" && $("#cm-base")?.value.trim()) scheduleProbe({});
     }, 350);
     return;
   }
@@ -2545,13 +3463,22 @@ function approvalSheet(info) {
 
 function modeSheet() {
   const s = state.settings;
+  const m = currentModel();
+  // 模型入口收到这里：顶栏不要为了它多长一颗按钮。
+  // 一行「模型 + 当前模型名」，点进去还是原来那张模型面板。
+  const modelLabel = m ? m.label || m.name || m.apiModel || m.id : "未添加模型";
   return sheetFrame({
     title: "运行模式",
     desc: "模式决定当前会话装配哪些工具与提示词。",
-    body: Object.values(MODES)
-      .map(
-        (m) => `
-      <button class="card card--interactive" data-act="set-mode" data-value="${m.id}" style="margin-bottom:8px;${m.id === s.mode ? "border-color:var(--accent-line);background:var(--accent-soft)" : ""}">
+    body: `
+      <button class="menu__item sheet__model" data-act="${m ? "open-model" : "open-models"}" style="width:100%">
+        ${icon("bolt", "icon--sm")}<span>模型</span><small>${esc(modelLabel)}</small>
+      </button>
+      <div style="height:8px"></div>
+      ${Object.values(MODES)
+        .map(
+          (m) => `
+      <button class="card card--interactive mode-opt${m.id === s.mode ? " mode-opt--on" : ""}" data-act="set-mode" data-value="${m.id}">
         <div class="card__row">
           <span class="avatar ${m.id === s.mode ? "avatar--accent" : ""}">${icon({ standard: "bolt", ptc: "code", minimal: "terminal", creator: "sparkles" }[m.id] || "bolt", "icon--sm")}</span>
           <div style="flex:1;min-width:0">
@@ -2561,9 +3488,9 @@ function modeSheet() {
           ${m.id === s.mode ? icon("check", "icon--sm") : ""}
         </div>
       </button>`
-      )
-      .join("") +
-      `<p class="field__hint">极简模式只保留终端与文件编辑器；PTC 模式额外提供 <code>run_code</code>；创造模式可检查并创建插件。</p>`,
+        )
+        .join("")}
+      <p class="field__hint">极简模式只保留终端与文件编辑器；PTC 模式额外提供 <code>run_code</code>；创造模式可检查并创建插件。</p>`,
   });
 }
 
@@ -2628,34 +3555,43 @@ function modelListSheet() {
   const groups = groupModelsByProvider(allModels());
   const active = state.settings.model;
 
-  const row = (m) => `
-      <button class="card card--interactive" data-act="set-model" data-value="${m.id}" style="margin-bottom:7px;${m.id === active ? "border-color:var(--accent-line);background:var(--accent-soft)" : ""}">
+  const row = (m) => {
+    const fmt = normalizeFormat(m.format);
+    // 只有当「这个模型的协议」和「它所属厂牌的默认协议」不一致时才打标：
+    // 一致的场合说一遍就够，重复的徽标只会把标题挤窄。
+    const preset = normalizeFormat(PROVIDER_META[m.providerKey || "custom"]?.format);
+    const badge = fmt === preset ? "" : `<span class="tag">${esc(FORMAT_SHORT[fmt] || fmt)}</span>`;
+    return `
+      <button class="card card--interactive" data-act="set-model" data-value="${m.id}" data-msearch="${esc(`${m.label} ${modelApiId(m)} ${m.provider}`.toLowerCase())}" style="margin-bottom:7px;${m.id === active ? "border-color:var(--accent-line);background:var(--accent-soft)" : ""}">
         <div class="card__row">
           <span class="avatar ${m.id === active ? "avatar--accent" : ""}" style="font-size:9px">${esc(PROVIDER_META[m.providerKey || "custom"]?.short || "CUS")}</span>
           <div style="flex:1;min-width:0">
-            <div class="card__title">${esc(m.label)} ${m.tag ? `<span class="tag">${m.tag}</span>` : ""}</div>
+            <div class="card__title">${esc(m.label)} ${badge} ${m.tag ? `<span class="tag">${m.tag}</span>` : ""}</div>
             <div class="card__sub">${esc(m.provider)} · ${fmtContext(m.ctx)} · ${esc(hostOf(modelBaseUrl(m)))}</div>
             <div style="margin-top:4px">${statusPill(m.id, { compact: true })}</div>
           </div>
           ${m.id === active ? icon("check", "icon--sm") : icon("chevron", "icon--sm")}
         </div>
       </button>`;
+  };
 
   return sheetFrame({
     title: "选择模型",
     desc: "按厂牌分组，顺序与设置里一致；切换后回到上一页，每行的状态来自最近一次请求或测试。",
-    body: groups
-      .map(
-        (g) => `
-      <div class="model-group">
+    body: `
+      <input class="input" id="model-pick-search" placeholder="搜索名称、模型 ID 或厂牌…" autocomplete="off" spellcheck="false" style="margin-bottom:10px">
+      <div id="model-pick-list">${groups
+        .map(
+          (g) => `
+      <div class="model-group" data-mgroup>
         <div class="model-group__head">
           <span class="eyebrow">${esc(g.meta.name)}</span>
           <span class="eyebrow">${g.models.length} 个</span>
         </div>
         ${g.models.map(row).join("")}
       </div>`
-      )
-      .join(""),
+        )
+        .join("")}</div>`,
   });
 }
 
@@ -2693,8 +3629,10 @@ function applyModelSelection(value) {
 
 const SHORT = {
   deepseek: "DEE", glm: "GLM", qwen: "QWN", doubao: "DBY", moonshot: "MOO",
-  minimax: "MMX", xiaomi: "MIMO", spark: "SPK", siliconflow: "SIL",
+  minimax: "MMX", xiaomi: "MIMO", spark: "SPK", siliconflow: "SIL", agnes: "AGN",
   openai: "OPE", groq: "GRQ", openrouter: "OR", ollama: "OLL", lmstudio: "LMS",
+  opendesign: "OPD",
+  anth: "ANT", anthropic: "ANT", google: "GEM", gemini: "GEM", ollamaNative: "OLN",
   custom: "CUS",
 };
 const PROVIDER_META = Object.fromEntries(
@@ -2710,6 +3648,12 @@ const PROVIDER_META = Object.fromEntries(
       endpoints: p.endpoints || [],
       suggest: p.suggest,
       defaultCtx: p.defaultCtx,
+      // 本地服务（Ollama / LM Studio 一类）不校验 Key，
+      // 界面上不该显示成「未配置 Key」——那看起来像缺了东西。
+      local: !!p.local,
+      placeholderKey: p.placeholderKey || "",
+      // 预设协议：新建模型时用它预选下拉，也是 modelFormat 的第二级兜底
+      format: p.format || "openai",
     },
   ])
 );
@@ -2757,7 +3701,7 @@ function fmtDate(ms) {
 }
 
 function keyOf(slot) {
-  return String(state.settings.keys?.[slot] || "").trim();
+  return normalizeApiKey(state.settings.keys?.[slot]).key;
 }
 
 function providerRow(slot) {
@@ -2765,6 +3709,11 @@ function providerRow(slot) {
   const key = keyOf(slot);
   const active = providerKeyOf() === slot;
   const count = allModels().filter((m) => (m.providerKey || "custom") === slot).length;
+  const sub = key
+    ? `Key ····${esc(key.slice(-4))}`
+    : meta.local
+      ? "本地服务 · 无需 Key"
+      : "未配置 Key";
   return `
     <button class="provider-row" data-act="open-provider" data-slot="${slot}">
       <span class="avatar ${active ? "avatar--accent" : ""}">${esc(meta.short)}</span>
@@ -2773,7 +3722,7 @@ function providerRow(slot) {
           <span class="provider-row__name">${esc(meta.name)}</span>
           ${active ? '<span class="tag tag--on">当前</span>' : ""}
         </span>
-        <span class="provider-row__sub">${key ? `Key ····${esc(key.slice(-4))}` : "未配置 Key"} · ${count} 个模型</span>
+        <span class="provider-row__sub">${sub} · ${count} 个模型</span>
       </span>
       ${icon("chevron", "icon--sm")}
     </button>`;
@@ -2832,7 +3781,11 @@ function providerSheet(data = {}) {
             data-provider-key="${slot}" placeholder="sk-…" autocomplete="off" spellcheck="false">
           <button class="icon-btn" data-act="toggle-provider-key" aria-label="显示或隐藏 Key">${icon("eye", "icon--sm")}</button>
         </div>
-        <p class="field__hint">以明文保存在本机 localStorage；清除后会从所有请求中移除。</p>
+        <p class="field__hint">${
+          meta.local
+            ? "本地代理不校验 Key，留空即可；只有代理单独设了 token 时才需要填。"
+            : "只粘贴密钥本身，不要带 <code>Bearer </code> 前缀、引号或换行（本版会自动清理）。Key 按服务分槽保存，切换模型时自动取对应的那一把。"
+        }</p>
       </div>
       <div class="kv"><span>默认端点</span><b>${esc(meta.host)}</b></div>
       <div class="kv"><span>服务内模型</span><b>${allModels().filter((m) => (m.providerKey || "custom") === slot).length} 个</b></div>
@@ -2869,12 +3822,16 @@ function modelManageRow(m) {
   const active = m.id === state.settings.model;
   const isCustomEntry = m.custom && m.id !== "custom";
   const conn = modelConnection(m.id);
+  // 协议和厂牌默认值不一致时点出来 —— 改过格式的模型最容易「看着像 OpenAI，其实不是」
+  const fmt = normalizeFormat(m.format);
+  const preset = normalizeFormat(PROVIDER_META[m.providerKey || "custom"]?.format);
+  const fmtTag = fmt === preset ? "" : `<span class="tag">${esc(FORMAT_SHORT[fmt] || fmt)}</span>`;
   return `
     <div class="model-manage" data-active="${active}">
       <button class="model-manage__main" data-act="set-model" data-value="${m.id}">
         <span class="avatar ${active ? "avatar--accent" : ""}">${esc(PROVIDER_META[m.providerKey]?.short || "CUS")}</span>
         <span class="model-manage__text">
-          <span class="model-manage__name">${esc(m.label)} ${active ? '<span class="tag tag--on">当前</span>' : ""}${m.overridden ? '<span class="tag">已改参数</span>' : ""}</span>
+          <span class="model-manage__name">${esc(m.label)} ${fmtTag} ${active ? '<span class="tag tag--on">当前</span>' : ""}${m.overridden ? '<span class="tag">已改参数</span>' : ""}</span>
           <span class="model-manage__sub">${esc(m.apiModel || "未填模型 ID")} · ${fmtContext(m.ctx)} · ${esc(hostOf(modelBaseUrl(m)))}</span>
           <span class="model-manage__status conn-pill conn-pill--${conn.tone}"><span class="conn-pill__dot"></span>${esc(conn.label)}</span>
         </span>
@@ -2939,7 +3896,7 @@ function modelsSheet() {
     body: `
       ${html}
       <button class="btn btn--primary btn--block" style="margin-top:12px" data-act="new-custom-model">${icon("plus", "icon--xs")} 添加模型</button>
-      <p class="field__hint" style="margin-top:10px;line-height:1.7">只支持 OpenAI 兼容协议；每个模型可单独改上下文、端点与采样参数，点闪电测试连接。</p>`,
+      <p class="field__hint" style="margin-top:10px;line-height:1.7">支持 OpenAI 兼容、Anthropic Messages、Google Gemini、Ollama 原生四种接口格式，添加时自动探测端点提供了哪些模型；每个模型可单独改上下文、端点与采样参数，点闪电测试连接。</p>`,
   });
 }
 
@@ -2955,6 +3912,7 @@ function modelParamsSheet(data = {}) {
   const maxTokens = Number(existing?.maxTokens) > 0 ? existing.maxTokens : "";
   const slot = existing?.providerKey || "deepseek";
   const providerMeta = PROVIDER_META[slot] || PROVIDER_META.custom;
+  const fmt = normalizeFormat(existing?.format || providerMeta.format);
   const suggest = providerMeta.suggest || [];
   const suggestChip = (m) => {
     const id = typeof m === "string" ? m : m.id;
@@ -2982,16 +3940,28 @@ function modelParamsSheet(data = {}) {
           (providerMeta.endpoints || []).length
             ? `<div class="cm-scenes" id="cm-scenes">
                  <span class="eyebrow">端点场景</span>
-                 ${providerMeta.endpoints.map((e) => `<button class="chip" data-act="pick-scene" data-url="${esc(e.baseUrl)}">${esc(e.label)}</button>`).join("")}
+                 ${providerMeta.endpoints.map((e) => `<button class="chip" data-act="pick-scene" data-url="${esc(e.baseUrl)}"${e.format ? ` data-format="${esc(e.format)}"` : ""}>${esc(e.label)}</button>`).join("")}
                </div>`
             : ""
         }
       </div>
 
       <div class="field">
+        <label class="field__label" for="cm-format">接口格式</label>
+        <select class="input select" id="cm-format">
+          ${FORMAT_IDS.map((id) => `<option value="${id}" ${id === fmt ? "selected" : ""}>${esc(FORMAT_LABELS[id])}</option>`).join("")}
+        </select>
+        <p class="field__hint" id="cm-format-hint">${esc(FORMAT_HINTS[fmt])}</p>
+      </div>
+
+      <div class="field">
         <label class="field__label" for="cm-key">API Key</label>
-        <input class="input mono" id="cm-key" type="password" value="${esc(keyOf(slot))}" placeholder="粘贴 Key，自动保存并拉取可用模型" autocomplete="off" spellcheck="false">
-        <p class="field__hint">只保存在本机。同一服务的模型共用一个 Key，填一次就够。</p>
+        <input class="input mono" id="cm-key" type="password" value="${esc(keyOf(slot))}" placeholder="${providerMeta.local ? "本地代理，可留空" : "粘贴 Key，自动保存并拉取可用模型"}" autocomplete="off" spellcheck="false">
+        <p class="field__hint">${
+          providerMeta.local
+            ? "本地代理不校验 Key，留空即可；代理单独设了 token 才需要填。"
+            : "只保存在本机。同一服务的模型共用一个 Key，填一次就够。"
+        }</p>
       </div>
 
       <div class="cm-suggest" id="cm-suggest">
@@ -3005,13 +3975,20 @@ function modelParamsSheet(data = {}) {
       <div class="field">
         <label class="field__label" for="cm-model">模型 ID</label>
         <input class="input mono" id="cm-model" value="${esc(existing?.apiModel || "")}" placeholder="${esc(typeof suggest[0] === "string" ? suggest[0] : suggest[0]?.id || "从下方列表点一个")}" spellcheck="false">
-        <p class="field__hint">不用记 ID：填好 Key 会自动列出可用模型，点一下就填好并切换。</p>
-        <div id="cm-models" class="cm-models"><p class="field__hint">填入 Key 后自动获取；也可以直接点上方「常用模型」。</p></div>
+        <p class="field__hint">${
+          providerMeta.local
+            ? "不用记 ID：本地代理会直接列出它有哪些模型；ID 要和它路由表里的名字对得上。"
+            : "不用记 ID：填好 Key 会自动列出可用模型，点一下就填好并切换。"
+        }</p>
+        <div id="cm-models" class="cm-models" data-mode="${isNew ? "new" : "edit"}"></div>
       </div>
       <div class="field">
-        <label class="field__label" for="cm-base">Base URL</label>
+        <div class="field__head">
+          <label class="field__label" for="cm-base">Base URL</label>
+          <button class="btn btn--ghost btn--sm" data-act="fetch-models">${icon("refresh", "icon--xs")} 获取模型列表</button>
+        </div>
         <input class="input mono" id="cm-base" value="${esc(existing?.baseUrl || providerMeta.baseUrl || "")}" placeholder="https://gateway.example.com/v1" spellcheck="false">
-        <p class="field__hint">选供应方会预填官方端点，可改；填到 <code>/v1</code> 即可，应用自动补 <code>/chat/completions</code>。</p>
+        <p class="field__hint" id="cm-endpoint-preview"></p>
       </div>
       <div class="field">
         <label class="field__label" for="cm-ctx">上下文窗口</label>
@@ -3036,14 +4013,14 @@ function modelParamsSheet(data = {}) {
             value="${maxTokens}" placeholder="不限制">
         </div>
       </div>
-      <div class="settings__row" style="padding:4px 0 10px">
+      <div class="settings__row" style="padding:4px 0 10px" data-gate="effort">
         <div class="settings__row-main">
           <div class="settings__row-title">透传推理强度</div>
           <div class="settings__row-sub">默认开启；端点拒绝 reasoning_effort 时会自动关闭</div>
         </div>
         <button class="switch" role="switch" aria-checked="${existing ? existing.supportsEffort !== false : true}" aria-label="透传推理强度" data-act="toggle-cm-effort" data-toggle="cm-effort"></button>
       </div>
-      <div class="settings__row" style="padding:0 0 10px">
+      <div class="settings__row" style="padding:0 0 10px" data-gate="vision">
         <div class="settings__row-main">
           <div class="settings__row-title">图片输入（视觉）</div>
           <div class="settings__row-sub">开启后，聊天里的图片按 image_url 发给模型；长边压到 1568px 再发送</div>
@@ -3870,10 +4847,54 @@ function pluginSheet(data) {
       ${
         p.id === "office"
           ? `<div class="section-label">能力</div>
-             <p class="field__hint" style="line-height:1.8">Markdown → Word（.docx，保留标题、列表、表格）<br>CSV → Excel（.xlsx，保留表头与列宽）<br>产物写入 <code>exports/</code>，在工作区下载。</p>`
+             <p class="field__hint" style="line-height:1.8">Markdown → Word（.docx，保留标题、列表、表格）<br>Markdown → PowerPoint（.pptx，封面 / 要点 / 表格三种版式，16:9）<br>CSV → Excel（.xlsx，保留表头与列宽）<br>Markdown / 排版原语 → PDF（.pdf，中文字体按需子集嵌入）<br>读 PDF 正文（按页提取；扫描件会明确说读不出）<br>产物写入 <code>exports/</code>，在工作区下载。</p>`
           : ""
       }
-      <p class="field__hint" style="margin-top:12px">关闭开关会从当前上下文中卸载该插件，已经挂载的界面槽位会在下一次渲染时移除。</p>`,
+      ${
+        p.id === "teams"
+          ? (() => {
+              const board = (state.team?.runs || [])[0];
+              if (!board) {
+                return `<div class="section-label">团队任务板</div>
+                  <p class="field__hint" style="line-height:1.8">还没有团队任务。在对话里把目标拆开说，例如「分三路查一下 A、B、C，再汇总」，模型会调用 <code>agent_team</code>。</p>`;
+              }
+              const rows = (board.items || [])
+                .map(
+                  (it, i) =>
+                    `<div class="kv"><span>${it.status === "done" ? "✓" : it.status === "error" ? "✗" : "…"} 成员 ${i + 1}</span><b>${
+                      it.title ? esc(it.title) : "（未命名）"
+                    }</b></div>`
+                )
+                .join("");
+              const last = (board.items || []).find((it) => it.output) || {};
+              return `<div class="section-label">团队任务板 · 最近一次</div>
+                <div class="kv"><span>目标</span><b>${esc(board.goal || "（未命名）")}</b></div>
+                <div class="kv"><span>时间</span><b>${fmtRelative(board.at)}</b></div>
+                ${rows}
+                ${
+                  last.output
+                    ? `<p class="field__hint" style="line-height:1.8">成员 1 的结论：${esc(String(last.output).slice(0, 160))}</p>`
+                    : ""
+                }`;
+            })()
+          : ""
+      }
+      ${
+        p.id === "review"
+          ? `<div class="section-label">复核记录</div>
+             <div class="stat-row" style="margin-bottom:10px">
+               <div class="stat"><div class="stat__val">${Number(state.review?.scans) || 0}</div><div class="stat__key">已复核</div></div>
+               <div class="stat"><div class="stat__val">${Number(state.review?.blocked) || 0}</div><div class="stat__key">已拦下</div></div>
+               <div class="stat"><div class="stat__val">${p.enabled ? "ON" : "OFF"}</div><div class="stat__key">状态</div></div>
+             </div>
+             <p class="field__hint" style="line-height:1.8">每次敏感调用进入审批前先复核一次：路径越界、通配删除、递归删根目录、<code>find -delete</code>、远程脚本直通 shell，命中就拦下。<br>它只会否决，不会替你点「允许」；自动放行仍由审批策略决定。</p>`
+          : ""
+      }
+      <p class="field__hint" style="margin-top:12px">${
+        p.preinstalled
+          ? "内置插件随内核提供，不需要下载；关掉只是停用，随时能再打开。"
+          : "关闭开关会从当前上下文中卸载该插件，已经挂载的界面槽位会在下一次渲染时移除。"
+      }</p>`,
     foot:
       p.preinstalled
         ? `<button class="btn btn--ghost btn--block" data-act="close-sheet">完成</button>`
@@ -4102,7 +5123,7 @@ function renameSheet() {
 /* ---------------- 抽屉 ---------------- */
 
 function renderDrawer() {
-  els.drawer.innerHTML = renderDrawerHTML(ui.search || "");
+  els.drawer.innerHTML = renderDrawerHTML(ui.search || "", ui.run?.sessionId || "");
   // 抽屉整块重写 —— 底部的插件界面要重新贴
   uiAttach(els.drawer);
 }
@@ -4181,7 +5202,11 @@ function bindEvents() {
     //   2. 刷输入框高度（同上，任何输入路径漏了都能兜住）
     composerPoll = setInterval(() => {
       updateSendState();
-      growIfChanged();
+      // 组合输入期间不要再动高度。autoGrow 会先把 height 设成 auto 再读
+      // scrollHeight，那是一次破坏性重排；400ms 来一次足以让部分输入法
+      // 的候选反复重连，表现就是「字要点一下才上屏」。
+      // compositionupdate 事件里已经在跟高度，不会漏掉「第二行看不见」。
+      if (!isComposingNow()) growIfChanged();
     }, 400);
   });
   els.app.addEventListener("focusout", (e) => {
@@ -4200,6 +5225,31 @@ function bindEvents() {
 
     if (t.id === "cm-model-filter") {
       filterFormModels(t.value);
+      return;
+    }
+
+    // 「选择模型」搜索：只切可见性，不重绘，避免输入时失焦
+    if (t.id === "model-pick-search") {
+      const q = t.value.trim().toLowerCase();
+      const list = $("#model-pick-list");
+      if (!list) return;
+      list.querySelectorAll("[data-mgroup]").forEach((group) => {
+        let shown = 0;
+        group.querySelectorAll("[data-msearch]").forEach((card) => {
+          const hit = !q || String(card.dataset.msearch || "").includes(q);
+          card.style.display = hit ? "" : "none";
+          if (hit) shown++;
+        });
+        group.style.display = shown ? "" : "none";
+      });
+      return;
+    }
+
+    // 改端点：先把「实际请求会打到哪」画出来（即时反馈、不用等网络），
+    // 再等手停下来 600ms 才探测 —— 边打边发请求既费配额也没意义。
+    if (t.id === "cm-base") {
+      renderEndpointPreview();
+      scheduleProbe({ delay: 600 });
       return;
     }
 
@@ -4297,11 +5347,28 @@ function bindEvents() {
       return;
     }
 
-    // 表单内直接填 Key：存下并立刻拉取可用模型
+    // 表单内直接填 Key：存下并立刻探测模型（显式动作，跳过缓存）
     if (t.id === "cm-key") {
       const slot = $("#cm-provider")?.value || "custom";
-      setSettings({ keys: { ...state.settings.keys, [slot]: t.value.trim() } });
-      if (t.value.trim()) runFormModelFetch({ force: true });
+      const { key, notes } = normalizeApiKey(t.value);
+      setSettings({ keys: { ...state.settings.keys, [slot]: key } });
+      if (notes.length) toast(`已自动清理 Key：${notes.join("、")}`, "ok");
+      if (key) scheduleProbe({ force: true });
+      else renderProbe();
+      return;
+    }
+
+    // 换接口格式：图片 / 推理强度两个开关要跟着灰，探测也要按新协议重来
+    if (t.id === "cm-format") {
+      syncFormatGates();
+      renderEndpointPreview();
+      scheduleProbe({ force: true });
+      return;
+    }
+
+    // 探测结果里的多选
+    if (t.matches?.("input[data-cm-pick]")) {
+      toggleProbePick(t.value, t.checked);
       return;
     }
 
@@ -4319,6 +5386,11 @@ function bindEvents() {
       if (base && meta.baseUrl) base.value = meta.baseUrl;
       const ctx = $("#cm-ctx");
       if (ctx && meta.defaultCtx) ctx.value = String(Math.round(meta.defaultCtx / 1000));
+      // 换供应方 = 换协议：把预设格式写回下拉，再按新格式决定开关能不能用
+      const fmtSel = $("#cm-format");
+      if (fmtSel && meta.format) fmtSel.value = normalizeFormat(meta.format);
+      syncFormatGates();
+      renderEndpointPreview();
       const hint = $("#cm-provider")?.closest(".field")?.querySelector(".field__hint");
       if (hint) hint.textContent = meta.desc;
       const sg = $("#cm-suggest");
@@ -4333,19 +5405,38 @@ function bindEvents() {
       const scenes = $("#cm-scenes");
       if (scenes) {
         scenes.innerHTML = `${(meta.endpoints || []).length ? '<span class="eyebrow">端点场景</span>' : ""}${(meta.endpoints || [])
-          .map((e) => `<button class="chip" data-act="pick-scene" data-url="${esc(e.baseUrl)}">${esc(e.label)}</button>`)
+          .map((e) => `<button class="chip" data-act="pick-scene" data-url="${esc(e.baseUrl)}"${e.format ? ` data-format="${esc(e.format)}"` : ""}>${esc(e.label)}</button>`)
           .join("")}`;
       }
       const nextKey = keyOf(t.value);
       const keyInput = $("#cm-key");
-      if (keyInput) keyInput.value = nextKey;
+      if (keyInput) {
+        keyInput.value = nextKey;
+        // 切到本地代理时，Key 这一栏的语气要跟着变：
+        // 还写着「粘贴 Key」会让人以为不填就不给用。
+        keyInput.placeholder = meta.local ? "本地代理，可留空" : "粘贴 Key，自动保存并拉取可用模型";
+        const kh = keyInput.closest(".field")?.querySelector(".field__hint");
+        if (kh) {
+          kh.textContent = meta.local
+            ? "本地代理不校验 Key，留空即可；代理单独设了 token 才需要填。"
+            : "只保存在本机。同一服务的模型共用一个 Key，填一次就够。";
+        }
+      }
       if (nextKey) {
         setTimeout(() => {
-          if (ui.sheet?.type === "custom-model") runFormModelFetch({ force: true });
+          if (ui.sheet?.type === "custom-model") scheduleProbe({ force: true });
+        }, 80);
+      } else if (meta.local) {
+        // 本地代理选中即问一句「你有哪些模型」，不用等用户填 Key。
+        setTimeout(() => {
+          if (ui.sheet?.type === "custom-model") scheduleProbe({ force: true });
         }, 80);
       } else {
-        const box = $("#cm-models");
-        if (box) box.innerHTML = `<p class="field__hint">填上这个服务的 API Key，就会自动列出可用模型。</p>`;
+        // 没 Key：状态机自己会渲染成「填上 Key 就会列出来」
+        cmProbe.status = "needkey";
+        cmProbe.items = [];
+        cmProbe.selected.clear();
+        renderProbe();
       }
       const modelInput = $("#cm-model");
       if (modelInput && meta.suggest?.length) {
@@ -4356,6 +5447,10 @@ function bindEvents() {
 
     if (t.dataset.keyField || t.dataset.providerKey) {
       const slot = t.dataset.providerKey || providerKeyOf();
+      // 粘贴进来的 Key 常带空格 / Bearer 前缀 / 换行。存的时候已经洗净，
+      // 这里给一句明确反馈，免得用户以为「我填的和刚才不一样了」。
+      const { notes } = normalizeApiKey(t.value);
+      if (notes.length) toast(`已自动清理 Key：${notes.join("、")}`, "ok");
       allModels()
         .filter((m) => providerKeyOf(m) === slot)
         .forEach((m) => setModelStatus(m.id, null));
@@ -4394,7 +5489,16 @@ function bindEvents() {
     if (e.target.id === "composer-input" && e.key === "Enter" && !e.shiftKey && !isComposing) {
       // 组合中的回车留给输入法确认候选；只有真正提交后的回车才发送
       e.preventDefault();
-      if (ui.run) return;
+      if (ui.run && !runHere()) {
+        const other = runningSession();
+        toast(`「${other?.title || "另一个会话"}」正在运行，等它结束或点上方横条查看`, "err");
+        return;
+      }
+      if (runHere()) {
+        const value = composerValue().trim();
+        if (value) steerRun(value);
+        return;
+      }
       const value = composerValue().trim();
       if (value || ui.attachments.length) sendMessage(value);
     }
@@ -4460,7 +5564,20 @@ function readModelForm() {
   const supportsEffort =
     $("#sheet-layer [data-toggle='cm-effort']")?.getAttribute("aria-checked") === "true";
   const vision = $("#sheet-layer [data-toggle='cm-vision']")?.getAttribute("aria-checked") === "true";
-  return { label, apiModel, baseUrl, ctx: Math.round(ctxK * 1000), temperature, maxTokens, supportsEffort, vision };
+  const format = normalizeFormat($("#cm-format")?.value);
+  // 非 OpenAI 格式这两项本来就用不上，哪怕 aria 残留 true 也不写进去
+  const gate = format === "openai";
+  return {
+    label,
+    apiModel,
+    baseUrl,
+    ctx: Math.round(ctxK * 1000),
+    temperature,
+    maxTokens,
+    format,
+    supportsEffort: gate && supportsEffort,
+    vision: gate && vision,
+  };
 }
 
 function modelFromForm(id) {
@@ -4492,16 +5609,26 @@ async function runModelTest(id, candidate, boxSelector) {
     if (!model) throw new Error("找不到这个模型");
     const r = await testModel(model);
     if (box) {
+      // 换过站要把结果说出来：不然用户只看到「成功」，不知道自己填的地址
+      // 已经被改掉了，下次换设备又会对不上。
+      const note = r.siteNote
+        ? `<p style="margin-top:6px;color:var(--warn,#a86400)">${esc(r.siteNote)}</p>`
+        : "";
       box.innerHTML = `<div class="model-test model-test--ok">${icon("check", "icon--sm")}
-        <div><b>连接成功 · ${fmtClock(r.ms)}</b><p>${esc(r.model)} · ${esc(hostOf(r.endpoint))} · HTTP ${r.status}</p></div>
+        <div><b>连接成功 · ${fmtClock(r.ms)}</b><p>${esc(r.model)} · ${esc(hostOf(r.endpoint))} · HTTP ${r.status}</p>${note}</div>
       </div>`;
     }
-    toast(`连接成功 · ${fmtClock(r.ms)}`, "ok");
+    toast(r.siteSwitched ? "已切换到另一个站点并连接成功" : `连接成功 · ${fmtClock(r.ms)}`, "ok");
     return r;
   } catch (err) {
     if (box) {
+      // 401 / 403 的诊断是多行的：服务端原文、读的 Key 槽位、脱敏形态、
+      // 自查清单。塞进 toast 会被截掉，这里单独铺开。
+      const hint = err.hint
+        ? `<pre style="white-space:pre-wrap;word-break:break-word;margin:9px 0 0;padding:9px 10px;background:var(--soft);border-radius:7px;font:11.5px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)">${esc(err.hint)}</pre>`
+        : "";
       box.innerHTML = `<div class="model-test model-test--err">${icon("alert", "icon--sm")}
-        <div><b>连接失败</b><p>${esc(err.message || "未知错误")}</p></div>
+        <div><b>连接失败</b><p>${esc(err.message || "未知错误")}</p>${hint}</div>
       </div>`;
     }
     toast(`连接失败：${err.message || "未知错误"}`, "err");
@@ -4558,6 +5685,7 @@ function saveModelParams(id) {
     provider: meta.name,
     providerKey: slot,
     custom: true,
+    format: f.format,
     temperature: f.temperature ?? undefined,
     maxTokens: f.maxTokens ?? undefined,
     supportsEffort: f.supportsEffort || undefined,
@@ -4580,9 +5708,10 @@ function saveModelParams(id) {
 function addModelFromCatalog(apiModel, { slot, baseUrl, activate = true } = {}) {
   const s = slot || $("#cm-provider")?.value || ui.sheet?.data?.slot || "custom";
   const meta = PROVIDER_META[s] || PROVIDER_META.custom;
+  const fmt = normalizeFormat(meta.format);
   const base = String(baseUrl || $("#cm-base")?.value.trim() || meta.baseUrl || "").replace(/\/+$/, "");
   const exists = allModels().find(
-    (m) => modelApiId(m) === apiModel && (m.providerKey || "custom") === s
+    (m) => modelApiId(m) === apiModel && (m.providerKey || "custom") === s && normalizeFormat(m.format) === fmt
   );
   const model =
     exists ||
@@ -4595,8 +5724,9 @@ function addModelFromCatalog(apiModel, { slot, baseUrl, activate = true } = {}) 
       provider: meta.name,
       providerKey: s,
       custom: true,
-      supportsEffort: true,
-      vision: true,
+      format: fmt,
+      supportsEffort: fmt === "openai",
+      vision: fmt === "openai",
     });
   if (activate) {
     setSettings({ model: model.id });
@@ -4609,73 +5739,400 @@ function addModelFromCatalog(apiModel, { slot, baseUrl, activate = true } = {}) 
   return model;
 }
 
-/* 端点可用模型探测与选择（同一端点 10 分钟内复用缓存，避免触发限流） */
+/* ============================================================
+   端点探测：一个状态机 + 一份多选
+
+   ============ 为什么不是一个函数跑到底 ============
+   探测有三种失败：没填、Key 错、网关不提供列表。旧实现把它们
+   都塞进同一句"没有取到模型列表"，用户分不清是自己填错还是
+   端点不支持。现在状态分开，每种给一句能动手的话。
+
+   竞态也要管：用户改一次 Base URL 就发一次请求，先发后到的
+   旧结果会把新结果盖掉。序号 + AbortController 双保险。
+   ============================================================ */
+
 const MODEL_LIST_TTL = 10 * 60 * 1000;
 const modelListCache = new Map();
 
-async function runFormModelFetch({ force = false } = {}) {
+const cmProbe = {
+  seq: 0,
+  timer: 0,
+  ctrl: null,
+  status: "idle", // idle | needkey | loading | ok | empty | error
+  items: [],
+  selected: new Set(),
+  endpoint: "",
+  error: "",
+  fromCache: false,
+};
+
+const probeSlot = () => $("#cm-provider")?.value || "custom";
+const probeFormat = () => normalizeFormat($("#cm-format")?.value || (PROVIDER_META[probeSlot()] || {}).format);
+const probeBase = () => String($("#cm-base")?.value || "").trim();
+const probeMeta = () => PROVIDER_META[probeSlot()] || PROVIDER_META.custom;
+const probeKey = () => {
+  const slot = probeSlot();
+  const meta = probeMeta();
+  // 本地服务（Ollama 原生、LM Studio 一类）不校验 Key，但请求头要有东西占位
+  return keyOf(slot) || (meta.local ? meta.placeholderKey || "local" : "");
+};
+
+/** 判重用的四元组：换协议、换端点都算不同模型。 */
+function modelIdentity(m) {
+  return [
+    m.providerKey || "custom",
+    normalizeFormat(m.format),
+    String(modelBaseUrl(m) || "").replace(/\/+$/, ""),
+    modelApiId(m),
+  ].join("|");
+}
+
+function renderEndpointPreview() {
+  const el = $("#cm-endpoint-preview");
+  if (!el) return;
+  const base = probeBase();
+  const adapter = FORMATS[probeFormat()] || FORMATS.openai;
+  if (!base) {
+    el.textContent = "选供应方会预填官方端点，可改；填好 Key 后会自动探测模型。";
+    return;
+  }
+  const model = String($("#cm-model")?.value || "").trim() || "{model}";
+  el.innerHTML = `实际请求 <code>${esc(adapter.chatEndpoint(base, model))}</code>`;
+}
+
+/** 非 OpenAI 格式下，图片与推理强度这两行没有意义，直接置灰说清楚。 */
+function syncFormatGates() {
+  const openai = probeFormat() === "openai";
+  const pairs = [
+    ["effort", "默认开启；端点拒绝 reasoning_effort 时会自动关闭", "仅 OpenAI 格式支持 reasoning_effort"],
+    ["vision", "开启后，聊天里的图片按 image_url 发给模型；长边压到 1568px 再发送", "仅 OpenAI 格式支持图片；当前格式会把图片换成一行提示文字"],
+  ];
+  pairs.forEach(([key, on, off]) => {
+    const row = els.sheet?.querySelector(`[data-gate="${key}"]`);
+    if (!row) return;
+    row.classList.toggle("is-disabled", !openai);
+    const sw = row.querySelector(".switch");
+    if (sw) {
+      sw.disabled = !openai;
+      if (!openai) sw.setAttribute("aria-checked", "false");
+    }
+    const sub = row.querySelector(".settings__row-sub");
+    if (sub) sub.textContent = openai ? on : off;
+  });
+  const hint = $("#cm-format-hint");
+  if (hint) hint.textContent = FORMAT_HINTS[probeFormat()];
+}
+
+function scheduleProbe({ force = false, delay = 0 } = {}) {
+  if (cmProbe.timer) {
+    clearTimeout(cmProbe.timer);
+    cmProbe.timer = 0;
+  }
+  if (delay > 0) {
+    cmProbe.timer = setTimeout(() => {
+      cmProbe.timer = 0;
+      probeNow({ force });
+    }, delay);
+    return;
+  }
+  probeNow({ force });
+}
+
+async function probeNow({ force = false } = {}) {
   const box = $("#cm-models");
   if (!box) return;
-  const baseUrl = $("#cm-base")?.value.trim();
-  const slot = $("#cm-provider")?.value || "custom";
-  const key = keyOf(slot);
+
+  const baseUrl = probeBase();
+  const format = probeFormat();
+  const slot = probeSlot();
+  const key = probeKey();
+
+  if (!baseUrl) {
+    cmProbe.status = "idle";
+    cmProbe.items = [];
+    cmProbe.selected.clear();
+    renderProbe();
+    return;
+  }
   if (!key) {
+    cmProbe.status = "needkey";
+    cmProbe.items = [];
+    cmProbe.selected.clear();
+    renderProbe();
+    return;
+  }
+
+  const cacheKey = `${slot}|${format}|${baseUrl}|${key.slice(-6)}`;
+  const cached = modelListCache.get(cacheKey);
+  if (!force && cached && Date.now() - cached.ts < MODEL_LIST_TTL) {
+    cmProbe.items = cached.items;
+    cmProbe.endpoint = cached.endpoint || "";
+    cmProbe.fromCache = true;
+    cmProbe.status = cached.items.length ? "ok" : "empty";
+    renderProbe();
+    return;
+  }
+
+  if (cmProbe.ctrl) {
+    try {
+      cmProbe.ctrl.abort();
+    } catch {
+      /* 已经结束 */
+    }
+  }
+  const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  cmProbe.ctrl = ctrl;
+  const seq = ++cmProbe.seq;
+
+  cmProbe.status = "loading";
+  cmProbe.error = "";
+  cmProbe.endpoint = (FORMATS[format] || FORMATS.openai).listEndpoint(baseUrl);
+  renderProbe();
+
+  try {
+    const listed = await fetchModelList({
+      format,
+      baseUrl,
+      apiKey: key,
+      providerKey: slot,
+      signal: ctrl ? ctrl.signal : undefined,
+    });
+    if (seq !== cmProbe.seq) return; // 已经有更新的请求了
+    // 换了站才列出来：把地址改到表单里，保存时就不会又存回错的。
+    if (listed.switchedTo) {
+      const input = $("#cm-base");
+      if (input && input.value.trim().replace(/\/+$/, "") !== listed.switchedTo) {
+        input.value = listed.switchedTo;
+        toast("这个 Key 属于另一个 Agnes 站点，地址已自动改好", "ok");
+      }
+    }
+    const items = (listed.items || []).filter((it) => it && it.id);
+    modelListCache.set(cacheKey, { items, endpoint: listed.endpoint, ts: Date.now() });
+    rememberModelCatalog(slot, baseUrl, items.map((it) => it.id), { format, items });
+    cmProbe.items = items;
+    cmProbe.endpoint = listed.endpoint || cmProbe.endpoint;
+    cmProbe.fromCache = false;
+    cmProbe.status = items.length ? "ok" : "empty";
+    // 上一轮的勾选只保留仍然存在的
+    const alive = new Set(items.map((it) => it.id));
+    Array.from(cmProbe.selected).forEach((id) => {
+      if (!alive.has(id)) cmProbe.selected.delete(id);
+    });
+    renderProbe();
+  } catch (err) {
+    if (seq !== cmProbe.seq) return;
+    if (err && err.name === "AbortError") return;
+    modelListCache.delete(cacheKey);
+    cmProbe.items = [];
+    cmProbe.status = "error";
+    cmProbe.error = (err && err.message) || "未知错误";
+    renderProbe();
+  }
+}
+
+function renderProbe() {
+  const box = $("#cm-models");
+  if (!box) return;
+  const mode = box.dataset.mode || "new";
+  const format = probeFormat();
+
+  if (cmProbe.status === "idle") {
+    box.innerHTML = `<p class="field__hint">填好 Base URL 和 Key 后会自动探测；也可以点上方「获取模型列表」。</p>`;
+    return;
+  }
+  if (cmProbe.status === "needkey") {
     box.innerHTML = `<p class="field__hint">填上这个服务的 API Key，就会自动列出可用模型。</p>`;
     return;
   }
-  const cacheKey = `${slot}|${baseUrl}`;
-  const cached = modelListCache.get(cacheKey);
-  if (!force && cached && Date.now() - cached.ts < MODEL_LIST_TTL) {
-    renderFormModels(cached.ids, { fromCache: true });
+  if (cmProbe.status === "loading") {
+    box.innerHTML = `<p class="field__hint cm-probe__loading">${icon("loader", "icon--sm icon--loader")} 正在探测 ${esc(FORMAT_LABELS[format])} · ${esc(cmProbe.endpoint)}…</p>`;
     return;
   }
-  box.innerHTML = `<p class="field__hint" style="display:flex;align-items:center;gap:6px">${icon("loader", "icon--sm icon--loader")} 正在获取模型列表…</p>`;
-  try {
-    const ids = await fetchModelList({ baseUrl, apiKey: key });
-    modelListCache.set(cacheKey, { ids, ts: Date.now() });
-    rememberModelCatalog(slot, baseUrl, ids);
-    renderFormModels(ids);
-    box.dataset.models = JSON.stringify(ids);
-  } catch (err) {
-    modelListCache.delete(cacheKey);
+  if (cmProbe.status === "error") {
     box.innerHTML = `<div class="model-test model-test--err">${icon("alert", "icon--sm")}
-      <div><b>没有取到模型列表</b><p>${esc(err.message || "未知错误")}</p></div></div>
-      <button class="btn btn--ghost btn--sm" style="margin-top:8px" data-act="fetch-models">${icon("refresh", "icon--xs")} 重试</button>
-      <p class="field__hint" style="margin-top:8px">不影响使用：直接点上方「常用模型」，或手动填一个 ID。</p>`;
+        <div><b>没有取到模型列表</b><p>${esc(cmProbe.error)}</p></div></div>
+      <div class="cm-probe__tools">
+        <button class="btn btn--ghost btn--sm" data-act="fetch-models">${icon("refresh", "icon--xs")} 重试</button>
+      </div>
+      <p class="field__hint">不影响使用：可以点上方「常用模型」，或直接手填模型 ID。</p>`;
+    return;
   }
-}
+  if (cmProbe.status === "empty") {
+    box.innerHTML = `<p class="field__hint">端点通了，但没有返回任何模型（${esc(cmProbe.endpoint)}）。${
+      format === "gemini" ? "Gemini 只列支持 generateContent 的模型。" : "可以手填一个 ID 试试。"
+    }</p>`;
+    return;
+  }
 
-function renderFormModels(ids, { fromCache = false } = {}) {
-  const box = $("#cm-models");
-  if (!box) return;
-  const count = $("#cm-models-count");
-  if (count) count.textContent = `${ids.length} 个可用${fromCache ? " · 已缓存" : ""}`;
-  box.innerHTML = `
-    <input class="input" id="cm-model-filter" placeholder="筛选模型…" autocomplete="off" spellcheck="false" style="margin:6px 0 8px">
-    <div class="cm-model-list">
-      ${ids
-        .map((m) => {
-          const kc = knownModelCtx(m);
-          return `<button class="chip" data-act="pick-detected-model" data-value="${esc(m)}"${kc ? ` data-ctx="${kc}"` : ""}>${esc(m)}</button>`;
-        })
-        .join("")}
+  const added = addedIdentities();
+  const total = cmProbe.items.length;
+  const addedCount = cmProbe.items.filter((it) => added.has(identityOf(it, format))).length;
+  const visible = filteredItems();
+  const picked = cmProbe.selected.size;
+
+  const status = `<div class="cm-probe">
+      <span class="cm-probe__ok">${icon("check", "icon--xs")} ${total} 个模型</span>
+      <span class="cm-probe__meta">${esc(cmProbe.endpoint)}${cmProbe.fromCache ? " · 已缓存" : ""}</span>
+      ${addedCount ? `<span class="cm-probe__added">${addedCount} 已添加</span>` : ""}
+      <button class="btn btn--ghost btn--sm cm-probe__refresh" data-act="fetch-models" aria-label="重新探测">${icon("refresh", "icon--xs")}</button>
     </div>`;
-  const current = $("#cm-model")?.value.trim();
-  if (current) {
-    box.querySelectorAll(".cm-model-list .chip").forEach((chip) => {
-      if (chip.dataset.value === current) chip.classList.add("chip--accent");
-    });
+
+  if (mode === "edit") {
+    // 编辑已有模型时是"选一个填进 ID"，不需要批量
+    box.innerHTML =
+      status +
+      `<input class="input" id="cm-model-filter" placeholder="筛选模型…" autocomplete="off" spellcheck="false" style="margin:8px 0">
+       <div class="cm-model-list">${visible
+         .map(
+           (it) =>
+             `<button class="chip" data-act="pick-detected-model" data-value="${esc(it.id)}"${
+               it.ctx ? ` data-ctx="${it.ctx}"` : ""
+             }>${esc(it.id)}</button>`
+         )
+         .join("")}</div>`;
+    return;
   }
+
+  box.innerHTML =
+    status +
+    `<div class="cm-probe__tools">
+       <input class="input" id="cm-model-filter" placeholder="筛选模型…" autocomplete="off" spellcheck="false">
+       <button class="btn btn--ghost btn--sm" data-act="select-all-models">全选</button>
+       <button class="btn btn--primary btn--sm" data-act="add-selected-models" ${picked ? "" : "disabled"}>加入所选${picked ? `（${picked}）` : ""}</button>
+     </div>
+     <div class="cm-model-list cm-model-list--rows">${visible
+       .map((it) => {
+         const isAdded = added.has(identityOf(it, format));
+         const checked = cmProbe.selected.has(it.id);
+         const meta = [it.label, it.ctx ? fmtContext(it.ctx) : ""].filter(Boolean).join(" · ");
+         return `<label class="cm-model-row${isAdded ? " is-added" : ""}">
+             <input type="checkbox" data-cm-pick value="${esc(it.id)}" ${checked ? "checked" : ""} ${isAdded ? "disabled" : ""}>
+             <span class="cm-model-row__id mono">${esc(it.id)}</span>
+             ${isAdded ? `<span class="cm-model-row__badge">已添加</span>` : meta ? `<span class="cm-model-row__meta">${esc(meta)}</span>` : ""}
+           </label>`;
+       })
+       .join("")}</div>`;
 }
 
+/** 已经加进模型表的四元组集合。 */
+function addedIdentities() {
+  const set = new Set();
+  allModels().forEach((m) => set.add(modelIdentity(m)));
+  return set;
+}
+
+function identityOf(item, format) {
+  return [probeSlot(), format, probeBase().replace(/\/+$/, ""), item.id].join("|");
+}
+
+function filteredItems() {
+  const q = String($("#cm-model-filter")?.value || "").trim().toLowerCase();
+  if (!q) return cmProbe.items;
+  return cmProbe.items.filter(
+    (it) => it.id.toLowerCase().indexOf(q) >= 0 || String(it.label || "").toLowerCase().indexOf(q) >= 0
+  );
+}
+
+/** 筛选只切可见性，不重建列表（否则输入框每敲一个字就失焦）。 */
 function filterFormModels(keyword) {
   const box = $("#cm-models");
   if (!box) return;
   const q = String(keyword || "").trim().toLowerCase();
+  box.querySelectorAll(".cm-model-row").forEach((row) => {
+    const input = row.querySelector("[data-cm-pick]");
+    const id = String((input && input.value) || "").toLowerCase();
+    row.style.display = !q || id.indexOf(q) >= 0 ? "" : "none";
+  });
   box.querySelectorAll(".cm-model-list .chip").forEach((chip) => {
-    chip.style.display = !q || chip.dataset.value.toLowerCase().includes(q) ? "" : "none";
+    const v = String(chip.dataset.value || "").toLowerCase();
+    chip.style.display = !q || v.indexOf(q) >= 0 ? "" : "none";
   });
 }
+
+/** 勾选变化后只更新按钮与计数，不重排列表。 */
+function syncProbeSelection() {
+  const box = $("#cm-models");
+  if (!box) return;
+  const btn = box.querySelector('[data-act="add-selected-models"]');
+  if (!btn) return;
+  const n = cmProbe.selected.size;
+  btn.disabled = n === 0;
+  btn.textContent = n ? `加入所选（${n}）` : "加入所选";
+}
+
+function toggleProbePick(id, on) {
+  if (!id) return;
+  if (on) cmProbe.selected.add(id);
+  else cmProbe.selected.delete(id);
+  syncProbeSelection();
+}
+
+function selectAllProbe() {
+  const added = addedIdentities();
+  const format = probeFormat();
+  const rows = Array.from(document.querySelectorAll("#cm-models .cm-model-row"));
+  const candidates = rows
+    .filter((r) => r.style.display !== "none")
+    .map((r) => {
+      const input = r.querySelector("[data-cm-pick]");
+      return input ? { id: input.value, disabled: input.disabled, el: input } : null;
+    })
+    .filter((x) => x && !x.disabled);
+
+  const allPicked = candidates.length > 0 && candidates.every((c) => cmProbe.selected.has(c.id));
+  candidates.forEach((c) => {
+    if (allPicked) cmProbe.selected.delete(c.id);
+    else cmProbe.selected.add(c.id);
+    if (c.el) c.el.checked = !allPicked;
+  });
+  syncProbeSelection();
+}
+
+/** 把勾中的模型一次写进模型表。 */
+function addSelectedProbeModels() {
+  const ids = Array.from(cmProbe.selected);
+  if (!ids.length) return;
+  const format = probeFormat();
+  const slot = probeSlot();
+  const meta = probeMeta();
+  const baseUrl = probeBase();
+  const added = addedIdentities();
+  const picked = cmProbe.items.filter((it) => ids.indexOf(it.id) >= 0 && !added.has(identityOf(it, format)));
+  if (!picked.length) {
+    toast("这些模型都已经添加过了");
+    cmProbe.selected.clear();
+    renderProbe();
+    return;
+  }
+  const stamp = Date.now().toString(36);
+  const list = picked.map((it, i) => ({
+    id: `cm_${stamp}_${i}_${Math.random().toString(36).slice(2, 6)}`,
+    label: it.label || it.id,
+    apiModel: it.id,
+    baseUrl,
+    ctx: Number(it.ctx) || knownModelCtx(it.id) || meta.defaultCtx || 128000,
+    provider: meta.name,
+    providerKey: slot,
+    format,
+    custom: true,
+    // 非 OpenAI 格式没有图片与 reasoning_effort，先记成关闭，
+    // 免得以后切格式时被当成"用户主动开启过"。
+    vision: format === "openai",
+    supportsEffort: format === "openai",
+  }));
+  const result = addCustomModels(list);
+  if (result.length) {
+    if (!currentModel()) {
+      setSettings({ model: result[0].id });
+      verifyModel(result[0].id);
+    }
+    renderAppbar();
+    toast(`已加入 ${result.length} 个模型`, "ok");
+  }
+  cmProbe.selected.clear();
+  renderProbe();
+}
+
 
 function applyCurrentModelFields({ silent = false } = {}) {
   const m = currentModel();
@@ -4724,6 +6181,18 @@ async function onClick(e) {
     case "tab":
       navigate(target.dataset.view);
       return;
+
+    case "set-preset": {
+      // 首页理论上一定有会话；真没有就补一个，别让按钮点了没反应
+      const cur = activeSession() || createSession({ mode: state.settings.mode });
+      // 再点一次同一个 = 取消，回到「不注入任何契约」
+      const next = cur.preset === value ? null : value;
+      setSessionPreset(cur.id, next);
+      haptic(5);
+      updateMessages();
+      if (next && PRESETS[next]) toast(`已切到${PRESETS[next].name}模式`, "ok");
+      return;
+    }
 
     case "plugins-tab": {
       const v = String(target.dataset.value || "");
@@ -4934,15 +6403,22 @@ async function onClick(e) {
     case "delete-session": {
       e.stopPropagation();
       const s = state.sessions.find((x) => x.id === id);
+      const n = sessionFileCount(id);
       openSheet("confirm", {
         title: "删除会话？",
         desc: s?.title,
-        detail: "会话及其全部消息会从本机删除，工作区文件不受影响。",
+        detail: n
+          ? `会话及其全部消息会从本机删除。该会话工作区的 ${n} 个文件会保留，可在 设置 → 工作区 清理无主文件。`
+          : "会话及其全部消息会从本机删除，工作区里没有该会话的私有文件。",
         danger: true,
         confirmText: "删除",
       });
       ui.confirmAction = () => {
+        // 删的正好是运行中的会话：先停掉，否则运行器继续往一个已经不在列表里的
+        // 会话对象写消息，界面只剩一条指向不存在的会话的运行横条，停也停不掉。
+        if (ui.run?.sessionId === id) stopRunAction();
         deleteSession(id);
+        forgetShellCwd(id);
         ui.lastBuilt = null;
         renderMain(true);
         renderDrawer();
@@ -4955,15 +6431,20 @@ async function onClick(e) {
     case "delete-session-current": {
       const s = activeSession();
       if (!s) return;
+      const n = sessionFileCount(s.id);
       openSheet("confirm", {
         title: "删除当前会话？",
         desc: s.title,
-        detail: "会话及其全部消息会从本机删除，工作区文件不受影响。",
+        detail: n
+          ? `会话及其全部消息会从本机删除。该会话工作区的 ${n} 个文件会保留，可在 设置 → 工作区 清理无主文件。`
+          : "会话及其全部消息会从本机删除，工作区里没有该会话的私有文件。",
         danger: true,
         confirmText: "删除",
       });
       ui.confirmAction = () => {
+        if (ui.run?.sessionId === s.id) stopRunAction();
         deleteSession(s.id);
+        forgetShellCwd(s.id);
         ui.lastBuilt = null;
         renderMain(true);
         renderDrawer();
@@ -5023,12 +6504,46 @@ async function onClick(e) {
       return;
 
     case "send":
-      if (ui.run) stopRunAction();
-      else if (isComposingNow()) toast("先让输入法确认候选，再点发送");
+      // 别的会话在跑：当前会话不能发新消息（运行时是全局单通道），
+      // 也不能当引导（引导只属于那个会话）。说清楚，别让点击石沉大海。
+      if (ui.run && !runHere()) {
+        const other = runningSession();
+        toast(`「${other?.title || "另一个会话"}」正在运行，等它结束或点上方横条查看`, "err");
+        return;
+      }
+      if (runHere()) {
+        if (isComposingNow()) toast("先让输入法确认候选，再点发送");
+        else {
+          const value = composerValue().trim();
+          if (value) steerRun(value);
+          else stopRunAction();
+        }
+      } else if (isComposingNow()) toast("先让输入法确认候选，再点发送");
       else {
         const value = composerValue().trim();
         if (value || ui.attachments.length) sendMessage(value);
       }
+      return;
+
+    case "goto-run": {
+      const run = ui.run;
+      if (!run) {
+        updateSendState();
+        return;
+      }
+      switchSession(run.sessionId);
+      ui.lastBuilt = null;
+      if (ui.view !== "chat") navigate("chat");
+      else {
+        renderAppbar();
+        renderMain(true);
+      }
+      toast("已回到运行中的会话", "ok");
+      return;
+    }
+
+    case "stop-live":
+      stopRunAction();
       return;
 
     case "scroll-bottom": {
@@ -5045,6 +6560,20 @@ async function onClick(e) {
       const cur = ui.renderFrom ?? Math.max(0, s.messages.length - RENDER_WINDOW);
       ui.renderFrom = Math.max(0, cur - RENDER_WINDOW);
       releaseThumbs($("#messages"));
+      updateMessages();
+      return;
+    }
+
+    case "toggle-flow": {
+      const m = (activeSession()?.messages || []).find((x) => x.id === id);
+      if (!m) return;
+      // 有调用在等审批时不给折：折进去就找不到该点哪里了
+      if ((m.tools || []).some((t) => t.status === "waiting")) {
+        toast("还有调用在等审批，先处理它");
+        return;
+      }
+      const cur = flowOpen.has(id) ? flowOpen.get(id) : m.status === "running";
+      flowOpen.set(id, !cur);
       updateMessages();
       return;
     }
@@ -5084,13 +6613,11 @@ async function onClick(e) {
       return;
 
     case "open-mode":
-      closeSheet();
-      openSheet("mode");
+      replaceSheet("mode");
       return;
 
     case "open-model":
-      closeSheet();
-      openSheet("model");
+      replaceSheet("model");
       return;
 
     case "open-account":
@@ -5162,7 +6689,15 @@ async function onClick(e) {
       return;
 
     case "fetch-models":
-      runFormModelFetch({ force: true });
+      scheduleProbe({ force: true });
+      return;
+
+    case "select-all-models":
+      selectAllProbe();
+      return;
+
+    case "add-selected-models":
+      addSelectedProbeModels();
       return;
 
     case "pick-detected-model": {
@@ -5202,9 +6737,20 @@ async function onClick(e) {
     case "pick-scene": {
       const base = $("#cm-base");
       if (base && target.dataset.url) base.value = target.dataset.url;
+      // 有些供应方一个地址配一种协议（OpenDesign 的 Chat Completions / Messages），
+      // 只换地址不换格式会打出一个 404。chip 上带 data-format 时一起切。
+      if (target.dataset.format) {
+        const fmt = $("#cm-format");
+        if (fmt && FORMAT_IDS.includes(target.dataset.format)) {
+          fmt.value = target.dataset.format;
+          syncFormatGates();
+        }
+      }
       document.querySelectorAll("#cm-scenes .chip").forEach((chip) => {
         chip.classList.toggle("chip--accent", chip === target);
       });
+      renderEndpointPreview();
+      scheduleProbe({});
       return;
     }
 
@@ -5735,7 +7281,10 @@ async function onClick(e) {
           if (box) box.innerHTML = `<p class="field__hint" style="color:var(--ok)">连接正常 · ${esc(r.model)} · ${r.ms} ms</p>`;
         })
         .catch((err) => {
-          if (box) box.innerHTML = `<p class="field__hint" style="color:var(--danger)">${esc(err.message || "测试失败")}</p>`;
+          const hint = err.hint
+            ? `<pre style="white-space:pre-wrap;word-break:break-word;margin:8px 0 0;padding:9px 10px;background:var(--soft);border-radius:7px;font:11.5px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)">${esc(err.hint)}</pre>`
+            : "";
+          if (box) box.innerHTML = `<p class="field__hint" style="color:var(--danger);white-space:pre-wrap">${esc(err.message || "测试失败")}</p>${hint}`;
         });
       return;
     }
@@ -5779,8 +7328,7 @@ async function onClick(e) {
     }
 
     case "open-workspace":
-      closeSheet();
-      openSheet("workspace");
+      replaceSheet("workspace");
       return;
 
     case "goto-workspace":
@@ -5842,14 +7390,32 @@ async function onClick(e) {
       renderMain(true);
       return;
 
-    case "max-steps": {
-      const cur = Number(state.settings.maxSteps) || 24;
-      const dir = Number(value) < 0 ? -1 : 1;
-      // 步进随数值增大：20 以下 ±2，60 以下 ±5，再往上 ±10
-      const step = cur < 30 ? 2 : cur < 60 ? 5 : 10;
-      const next = Math.max(4, Math.min(100, cur + dir * step));
-      setSettings({ maxSteps: next });
+    case "toggle-isolate-workspace":
+      setSettings({ isolateWorkspace: state.settings.isolateWorkspace === false });
+      toast(state.settings.isolateWorkspace === false ? "已改为所有会话共用" : "已按会话隔离工作区", "ok");
       renderMain(true);
+      return;
+
+    case "purge-orphan": {
+      const info = orphanWorkspaceInfo();
+      if (!info.count) {
+        toast("没有需要清理的无主文件", "ok");
+        renderMain(true);
+        return;
+      }
+      openSheet("confirm", {
+        title: "清理无主文件？",
+        desc: `${info.sessions} 个已删除会话`,
+        detail: `共 ${info.count} 个文件 · ${(info.bytes / 1024).toFixed(1)} KB。它们属于已经不存在的会话，任何会话都看不到；清理后不可恢复。`,
+        danger: true,
+        confirmText: "清理",
+      });
+      ui.confirmAction = async () => {
+        const r = await purgeOrphanWorkspace();
+        closeSheet();
+        renderMain(true);
+        toast(`已清理 ${r.removed} 个文件`, "ok");
+      };
       return;
     }
 
@@ -5912,6 +7478,53 @@ async function onClick(e) {
       renderMain(ui.view !== "chat");
       return;
 
+    case "ime-open-settings": {
+      openImeSettings();
+      return;
+    }
+
+    case "ime-switch": {
+      switchIme();
+      return;
+    }
+
+    case "toggle-ime-auto-send": {
+      setSettings({ imeAutoSend: !state.settings.imeAutoSend });
+      renderMain(true);
+      return;
+    }
+
+    case "ime-clear-clips": {
+      clearClipboard();
+      renderMain(true);
+      toast("剪贴板历史已清空");
+      return;
+    }
+
+    case "ime-delete-phrase": {
+      const pid = target.dataset.id || "";
+      if (!pid) return;
+      deletePhrase(pid);
+      renderMain(true);
+      toast("短语已删除");
+      return;
+    }
+
+    case "ime-add-phrase": {
+      const text = prompt("短语内容");
+      if (text === null) return;
+      const t = String(text).trim();
+      if (!t) {
+        toast("内容不能为空", "err");
+        return;
+      }
+      const title = prompt("备注（可留空）");
+      savePhrase({ text: t, title: title ? String(title).trim() : "" });
+      renderMain(true);
+      toast("短语已添加");
+      return;
+    }
+
     case "toggle-plugin-watch": {
       const on = !state.settings.pluginWatch;
       setSettings({ pluginWatch: on });
@@ -5962,6 +7575,12 @@ async function onClick(e) {
 
     case "test-notification":
       testNotification();
+      return;
+
+    case "open-selfcheck":
+      // 独立页面而不是弹层：自检要能在"界面已经坏了"的情况下也能打开，
+      // 而弹层本身依赖界面正常。两者不能共用一条路。
+      location.href = "./diagnose.html";
       return;
 
     case "open-diagnostics":
@@ -6244,9 +7863,9 @@ async function onClick(e) {
           const files = data.files || data;
           if (!files || typeof files !== "object" || Array.isArray(files)) throw new Error("文件结构不对");
           openSheet("confirm", {
-            title: "替换当前工作区？",
+            title: "导入到当前会话？",
             desc: `${Object.keys(files).length} 个文件`,
-            detail: "导入会覆盖同名文件并删除当前工作区里多出来的文件。建议先导出一份备份。",
+            detail: "导入会覆盖当前会话里的同名文件，并清掉本会话多出来的文件；共享文件和其他会话不受影响。建议先导出一份备份。",
             danger: true,
             confirmText: "替换",
           });
@@ -6386,7 +8005,7 @@ async function onClick(e) {
       navigate("chat");
       ui.draft = "";
       setTimeout(() => {
-        sendMessage("用创造模式写一个番茄钟插件，要求能在会话里悬浮计时，25 分钟一轮。");
+        sendMessage("用创造模式写一个会话内待办插件：能加一条待办、勾掉一条，数据存在工作区里。");
       }, 120);
       return;
     }
@@ -6473,10 +8092,9 @@ async function onClick(e) {
 
     case "mention-file": {
       const path = target.dataset.path;
-      const base = composerValue();
-      setComposerValue(`${base}${base && !base.endsWith(" ") ? " " : ""}@${path} `);
+      // 插在光标处，不是拼到句末：用户很可能正把引用放到句子中间
+      insertComposerText(`@${path} `);
       closeSheet();
-      $("#composer-input")?.focus();
       return;
     }
 
@@ -6499,8 +8117,7 @@ async function onClick(e) {
       return;
 
     case "new-file":
-      closeSheet();
-      openSheet("new-file");
+      replaceSheet("new-file");
       return;
 
     case "create-file": {
@@ -6789,10 +8406,9 @@ function voiceStripLevel(level) {
 function appendVoiceText(text) {
   const t = String(text || "").trim();
   if (!t) return;
-  const cur = composerValue();
-  // 中文之间不加空格；中英混排时补一个，避免粘成一坨
-  const needSpace = cur && !/\s$/.test(cur) && /[A-Za-z0-9]$/.test(cur) && /^[A-Za-z0-9]/.test(t);
-  setComposerValue(`${cur}${needSpace ? " " : ""}${t}`);
+  // 走光标处插入：语音转写不该无视用户刚挪好的光标，硬接到句末。
+  // 中文之间不加空格、中英混排补空格的规则由 insertComposerText 统一处理。
+  insertComposerText(t);
 }
 
 /** 点麦克风：不再是一次性调用，而是可开可停的开关。 */
@@ -6995,11 +8611,16 @@ function hudSnapshot() {
     .slice(0, 3)
     .map((r) => ({ title: r.title, progress: r.status === "done" ? 100 : r.progress || 0 }));
 
-  // ===== 最近消息（0.28.0）=====
+  // ===== 最近消息（0.28.0，0.62.0 起可读完整回复）=====
   //
   // 悬浮窗展开态要能「接消息」——显示最近几条对话。
   // 只取**有实质内容**的：空的助手气泡（还在流式输出、content 还是空串）
   // 会显示成一条空行，比不显示更糟。
+  //
+  // 曾经每条只留 60 字，理由是「浮窗只有一行」。现在消息区能换行 + 上下滑，
+  // 60 字反而成了硬伤：一段代码解释只看到开头半句。上限放到 1200 字 ——
+  // 长到这个程度的回复本来就该回应用里看，浮窗只负责「不切应用也能读完大意」。
+  const HUD_MSG_MAX = 1200;
   const messages = [];
   const cur = activeSession();
   if (cur && Array.isArray(cur.messages)) {
@@ -7010,7 +8631,7 @@ function hudSnapshot() {
       if (!text) continue;
       messages.unshift({
         role: m.role === "user" ? "user" : "assistant",
-        text: text.length > 60 ? `${text.slice(0, 60)}…` : text,
+        text: text.length > HUD_MSG_MAX ? `${text.slice(0, HUD_MSG_MAX)}…` : text,
       });
     }
   }
@@ -7117,8 +8738,11 @@ async function runTest() {
     if (ui.view === "settings") renderMain(true);
     const fresh = $("#test-result");
     if (fresh) {
+      const hint = err.hint
+        ? `<pre style="white-space:pre-wrap;word-break:break-word;margin:9px 0 0;padding:9px 10px;background:var(--soft);border-radius:7px;font:11.5px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)">${esc(err.hint)}</pre>`
+        : "";
       fresh.innerHTML = `<div class="model-test model-test--err">${icon("alert", "icon--sm")}
-        <div><b>连接失败</b><p>${esc(err.message || "未知错误")}</p></div>
+        <div><b>连接失败</b><p>${esc(err.message || "未知错误")}</p>${hint}</div>
       </div>`;
     }
     toast(`连接失败：${err.message || "未知错误"}`, "err");

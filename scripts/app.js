@@ -3,6 +3,7 @@ import { initFiles } from "./store.js";
 import { installCrashGuard } from "./crash-guard.js";
 import { mountPluginHost } from "./plugin-caps.js";
 import { loadEnabledPlugins } from "./plugin-install.js";
+import { installImeHost } from "./ime.js";
 
 // 先装兜底：越早装，越能抓到启动阶段的异常
 installCrashGuard();
@@ -27,6 +28,9 @@ initFiles()
       .catch((err) => console.warn("插件装载失败：", err))
       .finally(() => {
         initUI();
+        // IME 主机接线：拍配置快照给键盘、接住键盘截回来的图。
+        // 放在 initUI 之后 —— 页面钩子（__dshAddAttachment）此时才挂好。
+        installImeHost();
         // 启动动画退场：等界面画出第一帧再交棒，
         // 否则淡出的时候后面还是空白，会闪一下。
         requestAnimationFrame(() =>

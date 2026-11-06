@@ -39,6 +39,9 @@ public class DshBotView extends View implements Choreographer.FrameCallback {
     private static final int INK = 0xFF0D0D10;
     private static final int FIN_COLOR = 0xFF3F5AE6;
     private static final int BELLY_COLOR = 0xFFC9D4FF;
+    /* 肚皮胶囊：宽 1.72r（x -0.86..0.86）、高 1.56r，中心落在球心 —— 与
+       scripts/dsh-ball.js 完全同款，悬浮窗和首页看起来才是同一颗球。 */
+    private static final float BELLY_W = 1.72f, BELLY_H = 1.56f;
 
     /** 鱼鳍：左右为可抬起的「手」，背鳍向后扫。 */
     private static final class Fin {
@@ -930,13 +933,14 @@ public class DshBotView extends View implements Choreographer.FrameCallback {
         canvas.drawRect(CENTER_X - R - 0.05f, CENTER_Y - R - 0.05f,
                 CENTER_X + R + 0.05f, CENTER_Y + R + 0.05f, bodyPaint);
 
-        // 白肚皮（圆角胶囊，贴在球身下部）
+        // 白肚皮（圆角胶囊，中心落在球心）
+        // 参数、位置都要和 Web 端 dsh-ball.js 一模一样 —— 首页那颗球是从悬浮窗
+        // 抄过去的，两边差一点点，用户一眼就看出"不是同一颗"。
         canvas.save();
         bellyPaint.setAlpha((int) (255 * dressed));
         canvas.translate(CENTER_X, CENTER_Y);
         canvas.scale(R, R);
-        float bw = 1.72f, bh = 1.56f; // x1-x0 = 0.86-(-0.86)，y1-y0 = 1.9-0.34
-        buildPill(bellyPath, bw, bh, 1f);
+        buildPill(bellyPath, BELLY_W, BELLY_H, 1f);
         canvas.drawPath(bellyPath, bellyPaint);
         canvas.restore();
         canvas.restore(); // 轮廓裁剪

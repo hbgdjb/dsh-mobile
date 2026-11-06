@@ -66,23 +66,22 @@ function installFakeBridge(opts = {}) {
         const id = "j" + fakeSeq;
         const params = paramsJson ? JSON.parse(paramsJson) : {};
         const fn = withDefaults[method];
+        // 回调是 2ms 后才跑的，期间可能有用例已经 delete globalThis.window
+        // （「没有原生桥」那一项就是这么干的）。抓住当时的 window 引用，
+        // 否则会在别人的用例里抛 "Cannot read properties of undefined"。
+        const win = globalThis.window;
         setTimeout(() => {
+          if (!win || typeof win.__dshNodeResponse !== "function") return;
           if (!fn) {
-            globalThis.window.__dshNodeResponse(id, false, "没有这个方法：" + method);
+            win.__dshNodeResponse(id, false, "没有这个方法：" + method);
             return;
           }
           Promise.resolve()
             .then(() => fn(params))
             .then((r) =>
-              globalThis.window.__dshNodeResponse(
-                id,
-                true,
-                JSON.stringify(r === undefined ? null : r)
-              )
+              win.__dshNodeResponse(id, true, JSON.stringify(r === undefined ? null : r))
             )
-            .catch((e) =>
-              globalThis.window.__dshNodeResponse(id, false, String(e?.message || e))
-            );
+            .catch((e) => win.__dshNodeResponse(id, false, String(e?.message || e)));
         }, 2);
         return id;
       },

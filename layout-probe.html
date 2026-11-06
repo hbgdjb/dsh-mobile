@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>DSH 布局探针</title>
+    <!--
+      布局探针
+      ============================================================
+      这个页面只做一件事：把主界面的**外壳**原样搭一遍，看它撑不撑得开。
+
+      为什么需要它：
+      「界面只出来一半」那类故障（标题栏和导航都在、中间一片黑）根因在 CSS ——
+      某条声明不被旧内核认识，整条被丢弃，容器就没了高度。
+      这种故障脚本层面完全正常，没有任何报错，只能量尺寸才能看见。
+
+      为什么不用 iframe 直接装 index.html：
+      那会连带跑 app.js —— 初始化文件系统、装载插件、发网络请求，
+      在诊断页里再跑一份完整应用，副作用比故障本身还大。
+      这里只引样式、不引任何 JS，量出来的结论和主界面一致，且零副作用。
+
+      所以本页**不能**加脚本。要保持和 index.html 相同的 DOM 层级：
+        .stage > .device > .app > (.appbar + .views > .view + .tabbar)
+      层级一改，塌陷的表现就变了，探针会失准。
+    -->
+    <link rel="stylesheet" href="./styles/tokens.css" />
+    <link rel="stylesheet" href="./styles/base.css" />
+    <link rel="stylesheet" href="./styles/components.css" />
+  </head>
+  <body>
+    <div class="stage">
+      <div class="stage__atmosphere" aria-hidden="true"></div>
+      <div class="stage__grid" aria-hidden="true"></div>
+
+      <div class="device">
+        <div class="app" id="probe-app">
+          <header class="appbar" id="probe-appbar">
+            <strong style="font-size: 15px">DSH</strong>
+            <span style="font-size: 12px; opacity: 0.6">布局探针</span>
+          </header>
+
+          <main class="views" id="probe-views">
+            <section class="view" data-view="chat" data-active="true">
+              <div style="padding: 16px">
+                <!-- 内容只要有点高度就够了：这一块的尺寸不参与判据，
+                     真正要看的是它外面那几层有没有被撑开 -->
+                <p style="margin: 0 0 12px; line-height: 1.7">
+                  这一段文字的作用是占位。看得见它，说明内容区有高度；
+                  看不见它，说明上面某一层塌了。
+                </p>
+                <p style="margin: 0; line-height: 1.7">布局探针 · 无脚本 · 无网络。</p>
+              </div>
+            </section>
+          </main>
+
+          <nav class="tabbar" id="probe-tabbar">
+            <span class="tab" data-active="true">对话</span>
+            <span class="tab">工作区</span>
+            <span class="tab">插件</span>
+            <span class="tab">任务</span>
+          </nav>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

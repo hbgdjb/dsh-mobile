@@ -58,6 +58,8 @@ const SPEC = {
   settle: 0,
   fins: [],
   finColor: "#3f5ae6",
+  // 肚皮：x/y 相对球心、以半径为单位。胶囊宽 1.72r、高 1.56r，按中心画在球心上，
+  // 靠轮廓裁剪 —— 位置与 DshBotView.java 一致（悬浮窗那颗先落地，首页照抄）。
   belly: { x0: -0.86, y0: 0.34, x1: 0.86, y1: 1.9, round: 1, color: "#c9d4ff" },
 };
 
@@ -887,10 +889,13 @@ function renderFrame(ctx, motion, opts) {
     spec.radius * 2 + 0.1
   );
 
-  // 白肚皮（soft 装饰：圆角胶囊，贴在球身下部）
+  // 白肚皮（soft 装饰：圆角胶囊，压在球心上）
   ctx.save();
   ctx.globalAlpha = morph.dressed;
   ctx.fillStyle = spec.belly.color;
+  // 胶囊按中心画在球心 —— 与原生 DshBotView.java 逐像素对齐。
+  // 首页这颗球是从悬浮窗抄过去的，两边肚皮差半个半径，用户一眼就看出
+  // "不是同一颗"；所以这里宁可跟着原生走，也不单独换位置。
   ctx.translate(spec.center.x, spec.center.y);
   ctx.scale(spec.radius, spec.radius);
   const bw = spec.belly.x1 - spec.belly.x0;
@@ -1019,13 +1024,16 @@ function drawSign(ctx, motion, { side, dpr }) {
 export class DshBall {
   /**
    * @param {HTMLCanvasElement} canvas
-   * @param {{side?: number, logo?: HTMLImageElement|null, onTap?: () => void}} opts
+   * @param {{side?: number, logo?: HTMLImageElement|null, onTap?: () => void, calm?: boolean}} opts
    */
   constructor(canvas, opts = {}) {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d");
+    // 挂一份实例引用：调试时能直接在元素上拿到球，重绑画布时也能据此复用
+    canvas.__dshBall = this;
     this.side = opts.side || 40;
     this.onTap = opts.onTap || null;
+    this.calm = !!opts.calm;
     this.motion = new BotMotion();
     this.logoImage = opts.logo || null;
     this.logoReach = null;
@@ -1056,6 +1064,8 @@ export class DshBall {
 
   _afterLogo(img) {
     this.logoReach = sampleLogoReach(img);
+    // 静态模式没有循环在补帧，logo 到位后得自己重画一次
+    if (this.calm && this.running) this._drawOnce();
   }
 
   resize() {
@@ -1068,6 +1078,8 @@ export class DshBall {
     this.canvas.style.width = `${this.side * 1.6}px`;
     this.canvas.style.height = `${this.side * 1.6}px`;
     this.dpr = dpr;
+    // 改尺寸会清空画布：静态模式要马上补一帧，否则球消失
+    if (this.calm && this.running) this._drawOnce();
   }
 
   /** 状态：idle / thinking / tool / plain / done / permission / question / plan / asleep */
@@ -1107,6 +1119,26 @@ export class DshBall {
     this.motion.state.badge = next;
   }
 
+  /**
+   * 换一块画布，接着画。
+   *
+   * 首页整块重绘（切工作模式、改设置）会把 canvas 节点换掉，
+   * 但球本身不该重来 —— 新建的话会从 logo 变形的第 0 帧开始，
+   * 用户看到的是"点一下模式，中间的球抖了一下"。
+   */
+  rebind(canvas) {
+    if (this.canvas === canvas) return;
+    const wasRunning = this.running;
+    this.stop();
+    this.canvas = canvas;
+    this.ctx = canvas.getContext("2d");
+    this.canvas.__dshBall = this;
+    this._bindInput();
+    this.resize();
+    if (wasRunning) this.start();
+    else this._drawOnce();
+  }
+
   _bindInput() {
     const el = this.canvas;
     el.addEventListener("pointermove", (e) => {
@@ -1125,6 +1157,12 @@ export class DshBall {
   start() {
     if (this.running) return;
     this.running = true;
+    // 减少动效：只画一帧静态球。小球本身有眨眼、呼吸，对前庭敏感的人
+    // 是持续的小幅刺激 —— 系统既然设了偏好，就不该当它不存在。
+    if (this.calm) {
+      this._drawOnce();
+      return;
+    }
     const loop = () => {
       if (!this.running) return;
       const now = performance.now() / 1000;
@@ -1138,6 +1176,17 @@ export class DshBall {
       this._raf = requestAnimationFrame(loop);
     };
     this._raf = requestAnimationFrame(loop);
+  }
+
+  /** 画一帧（静态模式与首帧共用）。 */
+  _drawOnce() {
+    this.motion.step(performance.now() / 1000, this.aim);
+    renderFrame(this.ctx, this.motion, {
+      side: this.side,
+      dpr: this.dpr || 1,
+      logoImage: this.logoImage,
+      logoReach: this.logoReach,
+    });
   }
 
   stop() {

@@ -144,11 +144,14 @@ check("分层：核心段不含任何易变内容", secs.filter((s) => s.tier ==
 const forced = assemblePrompt(secs, { budget: 300 });
 check("降级：超预算时确实砍了东西", forced.stats.dropped.length > 0, `dropped=${forced.stats.dropped}`);
 // 预算 300 可能砍不干净：MCP 能力声明是永不降级的（约 93 token），
-// 加上 tier 0 核心（约 250 token），地板就在 340 上下。
+// 加上 tier 0 核心，地板本来在 340 上下；0.70.0 新增两条行为准则后
+// 上移到约 419；0.75.0 把解压写进第 7 条，到约 433；
+// 0.79.0 新增第 10 条（技能包用 skill_install，不是 plugin.json），到约 464。
+// 容忍值跟着地板走，判据仍是「只留不可降级部分」。
 // 这是刻意的 —— 宁可超预算也不砍掉 0.20.0 修好的能力声明。
 check(
   "降级：砍到只剩不可降级部分（超出的部分是刻意保留的）",
-  forced.stats.tokens <= 300 + 120,
+  forced.stats.tokens <= 300 + 170,
   `tokens=${forced.stats.tokens}`
 );
 check(
@@ -181,7 +184,12 @@ check("降级：预算本身是有限值", PROMPT_BUDGET > 0 && PROMPT_BUDGET < 
 
 const rules = built.text.match(/【行为准则】\n([\s\S]*?)(?:\n\n|$)/)?.[1] || "";
 const ruleLines = rules.split("\n").filter((l) => /^\d+\./.test(l));
-check("准则：仍然有 7 条", ruleLines.length === 7, `n=${ruleLines.length}`);
+// 0.70.0 新增两条：终端拼接/写回的正确写法、运行中引导的处理
+// 0.79.0 新增第 10 条：技能包不是 plugin.json
+check("准则：共 10 条（含 0.70.0 与 0.79.0 的新增）", ruleLines.length === 10, `n=${ruleLines.length}`);
+check("准则：第 10 条点名 skill_install 与 SKILL.md", /skill_install/.test(ruleLines[9] || "") && /SKILL\.md/.test(ruleLines[9] || ""), ruleLines[9]);
+check("准则：第 8 条点名 cat / sed -i / grep -c", /cat a b/.test(ruleLines[7] || "") && /sed -i/.test(ruleLines[7] || "") && /grep -c/.test(ruleLines[7] || ""), ruleLines[7]);
+check("准则：第 9 条说明引导不是新任务", /保留已完成工作/.test(ruleLines[8] || "") && /补充的指令/.test(ruleLines[8] || ""), ruleLines[8]);
 check("准则：第 1 条保留「不臆造」", /臆造/.test(ruleLines[0] || ""), ruleLines[0]);
 check("准则：第 2 条保留「先确认原内容」", /确认原内容/.test(ruleLines[1] || ""), ruleLines[1]);
 check("准则：第 3 条保留「相对路径」", /相对路径/.test(ruleLines[2] || ""), ruleLines[2]);

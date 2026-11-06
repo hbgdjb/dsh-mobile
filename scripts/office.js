@@ -24,7 +24,7 @@ function crc32(bytes) {
 
 const enc = new TextEncoder();
 
-function zipStore(entries) {
+export function zipStore(entries) {
   const locals = [];
   const centrals = [];
   let offset = 0;

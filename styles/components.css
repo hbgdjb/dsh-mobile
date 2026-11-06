@@ -73,6 +73,11 @@
 .brandmark::before {
   content: "";
   position: absolute;
+  /* inset 是 Chrome 87 的简写，老内核整条丢弃 —— 先逐边写一遍 */
+  top: 4px;
+  right: 4px;
+  bottom: 4px;
+  left: 4px;
   inset: 4px;
   border: 1px solid var(--line-strong);
   border-radius: 3px;
@@ -94,6 +99,11 @@
 }
 
 .brandmark--lg::before {
+  /* inset 是 Chrome 87 的简写，老内核整条丢弃 —— 先逐边写一遍 */
+  top: 7px;
+  right: 7px;
+  bottom: 7px;
+  left: 7px;
   inset: 7px;
   border-radius: 5px;
 }
@@ -376,6 +386,11 @@
 
 .scrim {
   position: absolute;
+  /* inset 是 Chrome 87 的简写，老内核整条丢弃 —— 先逐边写一遍 */
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
   inset: 0;
   z-index: 60;
   background: rgba(3, 4, 6, 0.62);
@@ -587,6 +602,19 @@
   color: var(--text);
 }
 
+/* 会话列表里的「运行中」标记：切走了也知道任务还在后台跑 */
+.session-item__run {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 0 3px var(--ok-soft);
+  vertical-align: 1px;
+  animation: runPulse 1.6s ease-in-out infinite;
+}
+
 .session-item__time {
   font-family: var(--font-mono);
   font-size: 9.5px;
@@ -634,6 +662,11 @@
 
 .sheet-layer {
   position: absolute;
+  /* inset 是 Chrome 87 的简写，老内核整条丢弃 —— 先逐边写一遍 */
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
   inset: 0;
   z-index: 80;
   pointer-events: none;
@@ -641,6 +674,11 @@
 
 .sheet-backdrop {
   position: absolute;
+  /* inset 是 Chrome 87 的简写，老内核整条丢弃 —— 先逐边写一遍 */
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
   inset: 0;
   background: rgba(3, 4, 6, 0.58);
   backdrop-filter: blur(2px);
@@ -1169,7 +1207,295 @@ textarea.input {
   font-weight: 500;
 }
 
+/* ---------- 运行中：会动的状态标 ----------
+ *
+ * 工具跑起来之后，屏幕可能十几秒没有任何变化。
+ * 静态的「STEP 2」回答不了「它到底有没有在动」，
+ * 四格跳动成本极低，回答的却正是最容易让人退出应用的那个疑问。
+ *
+ * 节奏取 1.05s、每格错开 0.13s：像呼吸，不像加载进度条那样催人。
+ */
+.runbadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  width: fit-content;
+  align-self: flex-start;
+  margin-top: 10px;
+  padding: 5px 10px 5px 9px;
+  border-radius: 999px;
+  background: var(--accent-soft, rgba(109, 134, 255, 0.12));
+  color: var(--accent-bright, #8aa0ff);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1;
+  letter-spacing: 0.04em;
+}
+
+.runbadge__bars {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 11px;
+  flex: none;
+}
+
+.runbadge__bars i {
+  width: 2px;
+  height: 100%;
+  border-radius: 1px;
+  background: currentColor;
+  transform-origin: 50% 100%;
+  animation: runBar 1.05s ease-in-out infinite;
+}
+
+.runbadge__bars i:nth-child(2) { animation-delay: 0.13s; }
+.runbadge__bars i:nth-child(3) { animation-delay: 0.26s; }
+.runbadge__bars i:nth-child(4) { animation-delay: 0.39s; }
+
+@keyframes runBar {
+  0%,
+  100% {
+    transform: scaleY(0.35);
+    opacity: 0.45;
+  }
+  45% {
+    transform: scaleY(1);
+    opacity: 1;
+  }
+}
+
+.runbadge__label {
+  font-weight: 600;
+}
+
+.runbadge__time {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 顶栏那枚点也一起"呼吸"：切到别的页面时，仍然知道它在跑 */
+.badge-dot--live,
+.appbar__pill .dot--live {
+  animation: dotBreathe 1.6s ease-in-out infinite;
+}
+
+@keyframes dotBreathe {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(109, 134, 255, 0.45);
+    opacity: 0.5;
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(109, 134, 255, 0);
+    opacity: 1;
+  }
+}
+
+.no-motion .runbadge__bars i,
+.no-motion .badge-dot--live,
+.no-motion .appbar__pill .dot--live {
+  animation: none;
+}
+
+.no-motion .runbadge__bars i {
+  transform: scaleY(0.6);
+  opacity: 0.8;
+}
+
+/* ---------- 空思维链占位（0.69.0） ----------
+   服务端深度思考时客户端一个字都还没有，光靠一枚"工作中"胶囊
+   撑不过一分钟。这张卡负责把"连接正常 / 在思考 / 可能要一分钟"
+   三件事说明白，秒数升级文案由 paintRunBadges 刷新。 */
+.thinking-pending {
+  margin: 10px 0 2px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-2, rgba(255, 255, 255, 0.02));
+}
+
+.thinking-pending__top {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.thinking-pending__top b {
+  color: var(--text, var(--muted));
+  font-weight: 600;
+}
+
+.thinking-pending__tag {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  color: var(--dim);
+}
+
+.thinking-pending__pulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: dotBreathe 1.6s ease-in-out infinite;
+  flex: none;
+}
+
+.thinking-pending__bars {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 10px 0 8px;
+}
+
+.thinking-pending__bars i {
+  display: block;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--line-strong);
+  animation: thinkBar 1.8s ease-in-out infinite;
+}
+
+.thinking-pending__bars i:nth-child(1) { width: 92%; animation-delay: 0s; }
+.thinking-pending__bars i:nth-child(2) { width: 78%; animation-delay: 0.18s; }
+.thinking-pending__bars i:nth-child(3) { width: 86%; animation-delay: 0.36s; }
+.thinking-pending__bars i:nth-child(4) { width: 64%; animation-delay: 0.54s; }
+.thinking-pending__bars i:nth-child(5) { width: 42%; animation-delay: 0.72s; }
+
+@keyframes thinkBar {
+  0%, 100% { opacity: 0.28; }
+  50% { opacity: 0.85; }
+}
+
+.thinking-pending__hint {
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--dim);
+}
+
+.no-motion .thinking-pending__pulse,
+.no-motion .thinking-pending__bars i {
+  animation: none;
+  opacity: 0.65;
+}
+
 /* ---------- 工具调用卡 ---------- */
+
+/* 「N 步进程」折叠组：一轮里的思考与工具收在它里面，
+   组头常驻，正文（结论）始终露在外面。 */
+.run-group {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+  margin: 2px 0 10px;
+  overflow: hidden;
+}
+
+.run-group__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 9px 10px;
+  text-align: left;
+  min-height: 40px;
+  color: var(--text-soft);
+  font-size: var(--fs-12);
+}
+
+.run-group__ic {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+}
+
+.run-group__ic--spin .icon {
+  animation: spin 1s linear infinite;
+}
+
+.run-group__title {
+  flex: none;
+  font-weight: 500;
+}
+
+.run-group__meta {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dim);
+  font-size: var(--fs-11);
+}
+
+.run-group__chev {
+  flex: none;
+  display: grid;
+  place-items: center;
+  color: var(--dim);
+  transition: transform var(--dur-2) var(--ease-out);
+}
+
+.run-group[data-open="true"] .run-group__chev {
+  transform: rotate(90deg);
+}
+
+.run-group[data-wait="true"] {
+  border-color: rgba(240, 179, 90, 0.35);
+}
+
+.run-group[data-wait="true"] .run-group__ic,
+.run-group[data-wait="true"] .run-group__title {
+  color: var(--warn);
+}
+
+.run-group__body {
+  display: none;
+  padding: 0 7px 8px;
+}
+
+.run-group[data-open="true"] .run-group__body {
+  display: block;
+  animation: fadeIn var(--dur-2) var(--ease-out);
+}
+
+.run-group__body > *:first-child {
+  margin-top: 2px;
+}
+
+/* 子任务卡：标题是「子任务 N」，参数不再是 JSON，而是派了什么活 + 带回了什么 */
+.tool--task .tool__name--task {
+  flex: none;
+  color: var(--accent-bright);
+  font-weight: 500;
+}
+
+.tool__ask {
+  margin: 0 0 10px;
+  font-size: var(--fs-12);
+  line-height: 1.7;
+  color: var(--text-soft);
+  white-space: pre-wrap;
+}
+
+.tool__result {
+  font-size: var(--fs-13);
+  line-height: 1.72;
+}
+
+.tool__hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  font-size: var(--fs-12);
+  color: var(--dim);
+}
 
 .tools {
   display: flex;
@@ -1457,6 +1783,59 @@ textarea.input {
   background: linear-gradient(to top, var(--bg), rgba(244, 242, 236, 0));
 }
 
+/* 切到别的会话时，运行中的任务还在这条横条后面 —— 点一下就回去 */
+.run-away {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin: 0 0 6px;
+  padding: 7px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 11.5px;
+  text-align: left;
+}
+
+.run-away[hidden] {
+  display: none;
+}
+
+.run-away__dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 0 3px var(--ok-soft);
+  animation: runPulse 1.6s ease-in-out infinite;
+}
+
+.run-away__text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-away__go {
+  flex: none;
+  color: var(--accent);
+}
+
+@keyframes runPulse {
+  0%,
+  100% {
+    opacity: 0.5;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
 .composer {
   border: 1px solid var(--line-strong);
   background: var(--surface);
@@ -1561,6 +1940,44 @@ textarea.input {
 .send[data-stop="true"] {
   background: var(--text);
   color: var(--bg);
+}
+
+/* ---------- 运行中的输入引导（0.70.0） ---------- */
+/* :hover 是伪类、也计入 class 级优先级：clean.css 后加载的
+   `.send:hover { background:#fff }` 和 `.send.send--steer` 同为 (0,2,0)，
+   会把绿色盖成白色 —— 偏偏点发送前一定会悬停。
+   所以连 hover 态一起声明，提到 (0,3,0)。绿色=「可发送」，与「停止」区分。 */
+.send.send--steer,
+.send.send--steer:hover {
+  background: var(--ok);
+  color: var(--bg);
+  box-shadow: 0 4px 16px rgba(79, 209, 165, 0.30);
+}
+.send.send--steer:hover {
+  filter: brightness(1.08);
+}
+/* .icon-btn 是 display:grid，hidden 的默认 display:none 必须显式压过 */
+#stop-live-btn[hidden] {
+  display: none;
+}
+/* 运行中补的指令在对话记录里单独标出来，不与普通提问混淆 */
+.msg__steer {
+  display: inline-block;
+  vertical-align: middle;
+  margin-right: 7px;
+  padding: 1px 7px;
+  border-radius: 6px;
+  background: rgba(79, 209, 165, 0.18);
+  border: 1px solid rgba(79, 209, 165, 0.42);
+  color: var(--ok);
+  font-size: 10px;
+  line-height: 1.6;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+.msg--steer .msg__bubble {
+  border-color: rgba(79, 209, 165, 0.42);
+  background: linear-gradient(165deg, rgba(79, 209, 165, 0.16), rgba(71, 99, 244, 0.10));
 }
 
 .composer__hint {
@@ -1939,6 +2356,11 @@ textarea.input {
 }
 
 .brandmark--xs::before {
+  /* inset 是 Chrome 87 的简写，老内核整条丢弃 —— 先逐边写一遍 */
+  top: 3px;
+  right: 3px;
+  bottom: 3px;
+  left: 3px;
   inset: 3px;
   border-radius: 2px;
 }
@@ -2292,6 +2714,11 @@ html[data-density="compact"] .tool {
 
 .img-viewer {
   position: absolute;
+  /* inset 是 Chrome 87 的简写，老内核整条丢弃 —— 先逐边写一遍 */
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
   inset: 0;
   z-index: 95;
   display: flex;

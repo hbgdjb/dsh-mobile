@@ -69,8 +69,10 @@ export const PROMPT_CUT_ORDER = {
   library: 11,
   ui: 12,
   plugins: 20,
+  skills: 22,
   attach: 30,
   mode: 40,
+  preset: 45,
   reasoning: 50,
   time: 90,
 };
@@ -184,7 +186,19 @@ export const BEHAVIOR_RULES = [
   "4. 工具失败是中间状态不是结论：换参数或换方法再试；同一调用原样重复不超过 2 次。",
   "5. 结论先行，中文，简洁；对比内容用表格，不要客套。",
   "6. 不声称执行了没实际调用的工具。",
-  '7. 终端是白名单命令不是完整 Linux：看二进制用 fs_inspect，看字节用 fs_read(format="hex")，复制/移动/删除用 cp / mv / rm。',
+  '7. 终端是白名单命令：二进制用 fs_inspect / fs_read(format="hex")，复制移动删除用 cp / mv / rm；压缩包用 unzip 解压，或 fs_read("包.zip!内部/路径") 直接读条目。',
+  // 0.70.0：把「拼接 / 改文件 / 计数」的正确写法直接写进规则。
+  // 之前模型不知道 cat 能纯拼接、sed -i 能写回，于是反复重写整份文件
+  // 再手工拼装，既慢又容易把分段内容弄脏。
+  // 细节（纯拼接、sed -i 示例、grep -c、cd 保留）都在 TOOLS.shell.description 里，
+  // 这里只点名，避免把不可降级的 tier 0 核心段顶得太长。
+  "8. 拼文件用 cat a b > out；改文件用 sed -i 写回；计数用 grep -c。",
+  // 运行中引导：模型必须知道这不是新任务，否则容易把前半段成果推倒重来
+  "9. 遇到「用户在执行过程中补充的指令」，保留已完成工作，只调整后续步骤。",
+  // 截图里模型翻完 onetake 包，给出的结论是「包内没有 plugin.json / 工作区没有
+  // skills 目录 / DSH 插件格式不匹配」—— 全是真的，但用户要的是装上。
+  // 技能包不是 npm 插件，这句话得先从准则里说清楚，模型才会去用 skill_install。
+  "10. 含 SKILL.md 的包是技能包：用 skill_install 装、skill_read 读；它不需要 plugin.json。",
 ];
 
 const ATTACH_HINT =
@@ -282,6 +296,7 @@ export function uiControlHint(mcpServers = []) {
  *
  * @param {Object} ctx
  * @param {Object} ctx.mode           当前模式 { name, detail }
+ * @param {Object} [ctx.preset]       工作模式 { name, prompt }，未选则省略
  * @param {string} ctx.permission      权限文案
  * @param {string} ctx.reasoning       推理强度档位
  * @param {Array}  ctx.files           工作区条目（取 path）
@@ -296,7 +311,8 @@ export function buildPromptSections(ctx = {}) {
   const mode = ctx.mode || { name: "标准", detail: "" };
   const paths = (ctx.files || []).map((f) => (typeof f === "string" ? f : f?.path)).filter(Boolean);
   const libPaths = (ctx.library || []).map((f) => (typeof f === "string" ? f : f?.path)).filter(Boolean);
-  const plugins = (ctx.plugins || []).map((p) => p?.name).filter(Boolean);
+  const plugins = (ctx.plugins || []).filter((p) => p && p.name);
+  const skills = (ctx.skills || []).filter((s) => s && s.id);
 
   const sections = [];
 
@@ -340,6 +356,16 @@ export function buildPromptSections(ctx = {}) {
     tier: PROMPT_TIERS.state,
     text: `【当前模式】${mode.name}模式${mode.detail ? ` — ${mode.detail}` : ""}`,
   });
+  // 工作模式（设计/代码/办公/学习）：只在会话真的选过时才出现。
+  // 紧跟 mode 段 —— 两者的语义相关性最高，放一起模型才分得清
+  // 「我能用哪些工具」和「这次该怎么交付」。
+  if (ctx.preset && ctx.preset.prompt) {
+    sections.push({
+      id: "preset",
+      tier: PROMPT_TIERS.state,
+      text: ctx.preset.prompt,
+    });
+  }
   sections.push({
     id: "mcp",
     tier: PROMPT_TIERS.state,
@@ -358,9 +384,26 @@ export function buildPromptSections(ctx = {}) {
     id: "plugins",
     tier: PROMPT_TIERS.state,
     text: plugins.length
-      ? `【已启用插件】${plugins.join("、")}（工具见工具表，名为 plugin__<插件>__<工具>）`
+      ? `【已启用插件】${plugins
+          .map((p) => (Array.isArray(p.tools) && p.tools.length ? `${p.name}（${p.tools.join(" / ")}）` : p.name))
+          .join("、")}（工具直接列在工具表里；第三方沙箱插件才是 plugin__<插件>__<工具>）`
       : "【已启用插件】无",
   });
+  // 技能清单：只给 id + 名称 + 一句话说明。
+  // 全文在 skills/<id>/SKILL.md，模型用 skill_read 按需读 ——
+  // 一份 SKILL.md 动辄几千字，全塞进 system 等于每轮都付一遍。
+  if (skills.length) {
+    const lines = skills.slice(0, 12).map((s) => {
+      const desc = String(s.description || "").replace(/\s+/g, " ").trim();
+      const brief = desc.length > 110 ? `${desc.slice(0, 110)}…` : desc;
+      return `· ${s.id}${s.name && s.name !== s.id ? `（${s.name}）` : ""}${brief ? ` — ${brief}` : ""}`;
+    });
+    sections.push({
+      id: "skills",
+      tier: PROMPT_TIERS.state,
+      text: `【已装技能】${skills.length} 个，用 skill_read(id) 读 SKILL.md 全文：\n${lines.join("\n")}`,
+    });
+  }
   sections.push({
     id: "attach",
     tier: PROMPT_TIERS.state,

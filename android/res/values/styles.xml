@@ -3,12 +3,12 @@
     <!-- 深色状态栏：避免 WebView 顶部出现"看不见图标的空白条" -->
     <style name="AppTheme" parent="Theme.AppCompat.Light.DarkActionBar">
         <item name="colorPrimary">@color/colorPrimary</item>
-        <item name="colorPrimaryDark">#08090B</item>
+        <item name="colorPrimaryDark">#000000</item>
         <item name="colorAccent">@color/colorAccent</item>
-        <item name="android:windowBackground">#08090B</item>
-        <item name="android:statusBarColor">#08090B</item>
+        <item name="android:windowBackground">#000000</item>
+        <item name="android:statusBarColor">#000000</item>
         <item name="android:windowLightStatusBar">false</item>
-        <item name="android:navigationBarColor">#08090B</item>
+        <item name="android:navigationBarColor">#000000</item>
         <item name="android:windowLightNavigationBar">false</item>
     </style>
 
@@ -16,7 +16,7 @@
         <item name="windowActionBar">false</item>
         <item name="windowNoTitle">true</item>
         <item name="android:background">@null</item>
-        <item name="android:statusBarColor">#08090B</item>
+        <item name="android:statusBarColor">#000000</item>
         <item name="android:windowLightStatusBar">false</item>
     </style>
 
@@ -25,10 +25,43 @@
         底色调成和动画一致（#0b0c0e），两段之间就没有跳变了。
     -->
     <style name="AppTheme.NoActionBarLaunch" parent="Theme.SplashScreen">
-        <item name="android:background">#0B0C0E</item>
-        <item name="android:statusBarColor">#0B0C0E</item>
+        <item name="android:background">#000000</item>
+        <item name="android:statusBarColor">#000000</item>
         <item name="android:windowLightStatusBar">false</item>
-        <item name="android:navigationBarColor">#0B0C0E</item>
+        <item name="android:navigationBarColor">#000000</item>
+        <item name="android:windowLightNavigationBar">false</item>
+    </style>
+
+    <!--
+        DSH 键盘（IME）专用主题。
+
+        ============ 为什么必须有独立主题 ============
+
+        IME 是一个 Service，它的窗口默认继承 **application 的主题**。
+        而应用主题是浅色的（Theme.AppCompat.DayNight，白天走 light 分支），
+        窗口背景就是一整块白。
+
+        键盘窗口高度是 WRAP_CONTENT，实际内容比窗口矮一点，
+        那多出来的一条就从白背景里露出来 —— 就是用户看到的
+        "屏幕底部一条白边"。
+
+        所以这里做三件事：
+          1. windowBackground 透明：窗口多出来的地方什么都不露
+          2. background 透明：decorView 也不带底色
+          3. windowIsFloating=false：IME 窗口必须铺满宽度、
+             贴在底部，浮动窗口会只占中间一小块
+
+        颜色用键盘自己的深色（#050608），和 ime.css 里的深色变量一致。
+    -->
+    <style name="DshImeTheme" parent="@android:style/Theme.DeviceDefault">
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:background">@android:color/transparent</item>
+        <item name="android:windowIsFloating">false</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowContentTransitions">false</item>
+        <item name="android:statusBarColor">#050608</item>
+        <item name="android:navigationBarColor">#050608</item>
+        <item name="android:windowLightStatusBar">false</item>
         <item name="android:windowLightNavigationBar">false</item>
     </style>
 </resources>

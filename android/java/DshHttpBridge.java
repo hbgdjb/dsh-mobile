@@ -51,8 +51,25 @@ public class DshHttpBridge {
 
     @JavascriptInterface
     public void postStream(String id, String url, String headersJson, String bodyJson, int timeoutSec, String method) {
+        postStream(id, url, headersJson, bodyJson, timeoutSec, method, 0, 0);
+    }
+
+    /**
+     * 带「耐心值」的版本。
+     *
+     * @param firstByteSec 等第一个字节的上限；0 = 用默认 45 秒。
+     *                     思考型模型（Agnes 3.0 之类）首字节可能 60 秒以上，
+     *                     45 秒硬上限会把「正在思考」错判成「连接卡死」。
+     * @param connectSec   连接超时；0 = 用默认 8 秒。跨境节点握手更慢。
+     */
+    @JavascriptInterface
+    public void postStream(String id, String url, String headersJson, String bodyJson,
+                           int timeoutSec, String method, int firstByteSec, int connectSec) {
         final String m = (method == null || method.isEmpty()) ? "POST" : method.toUpperCase();
-        new Thread(() -> run(id, url, headersJson, bodyJson, timeoutSec, m), "dsh-http-" + id).start();
+        final long firstMs = firstByteSec > 0 ? firstByteSec * 1000L : FIRST_BYTE_MS;
+        final int connectMs = connectSec > 0 ? connectSec * 1000 : CONNECT_TIMEOUT_MS;
+        new Thread(() -> run(id, url, headersJson, bodyJson, timeoutSec, m, firstMs, connectMs),
+                "dsh-http-" + id).start();
     }
 
     /**
@@ -160,7 +177,8 @@ public class DshHttpBridge {
     /** 连接超时：弱网下宁可快点失败去重试，也不要干等。 */
     private static final int CONNECT_TIMEOUT_MS = 8000;
 
-    private void run(String id, String url, String headersJson, String bodyJson, int timeoutSec, String method) {
+    private void run(String id, String url, String headersJson, String bodyJson, int timeoutSec, String method,
+                     long firstByteMs, int connectTimeoutMs) {
         HttpURLConnection conn = null;
         Req meta = null;
         boolean hasBody = !"GET".equals(method);
@@ -169,7 +187,7 @@ public class DshHttpBridge {
         try {
             conn = (HttpURLConnection) new URL(url).openConnection();
             conn.setRequestMethod(method);
-            conn.setConnectTimeout(CONNECT_TIMEOUT_MS);
+            conn.setConnectTimeout(connectTimeoutMs);
             // 读超时给一个足够大的上限，真正的卡死判定交给看门狗：
             // 它区分"首字节"和"流中途停顿"，比一个笼统的读超时准得多。
             conn.setReadTimeout((int) Math.max(15, timeoutSec) * 1000);
@@ -193,7 +211,7 @@ public class DshHttpBridge {
             }
 
             active.put(id, conn);
-            meta = new Req(conn, FIRST_BYTE_MS, STREAM_IDLE_MS);
+            meta = new Req(conn, firstByteMs, STREAM_IDLE_MS);
             META.put(id, meta);
 
             if (hasBody) {

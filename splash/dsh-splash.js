@@ -30,7 +30,7 @@
   var CFG = {
     lines: ['DEEPSEEK', 'HARNESS'], // 竖屏分两行；横屏/平板自动并成一行
     subtitle: 'MOBILE HOST',
-    version: '0.49.0',              // 跟着 app 版本改这一处
+    version: '0.84.0',              // 跟着 app 版本改这一处
     label: 'DSH MOBILE',
 
     /*

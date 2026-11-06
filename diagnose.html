@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b0c0e" />
+    <title>DSH 环境自检</title>
+    <!--
+      自检页
+      ============================================================
+      它是"应用起不来时"唯一还能用的页面，所以**不依赖应用的任何东西**：
+
+        · 不引 styles/*.css —— 样式出问题正是要查的东西之一，
+          自检页要是也靠它排版，那就一起坏。
+        · 不 import 任何模块 —— 模块图一断，import 整条不执行。
+        · 不用 CSS 变量、flex gap、inset、dvh 等新特性 ——
+          全部用最土的内联样式和 margin 铺开，Chrome 60 都能正确渲染。
+
+      代价是这页看起来不像应用的一部分。值。它是排障工具，不是产品界面。
+
+      唯一的例外是 layout-probe.html：那个页面专门引真样式，
+      用来量主界面外壳撑不撑得开 —— 那是有意为之。
+    -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #0b0c0e;
+        color: #e8eaed;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, "PingFang SC",
+          "Noto Sans SC", "Microsoft YaHei", sans-serif;
+        font-size: 14px;
+        -webkit-text-size-adjust: 100%;
+        -webkit-tap-highlight-color: transparent;
+      }
+      * {
+        box-sizing: border-box;
+      }
+
+      /* 顶部工具条用 fixed：内容区再长也不影响按钮可点。
+         老内核不支持 env() 时 padding-top 退回 12px，够用。 */
+      .bar {
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        z-index: 20;
+        padding: 10px 12px;
+        padding-top: calc(10px + env(safe-area-inset-top, 0px));
+        background: #0f1116;
+        border-bottom: 1px solid #1e232b;
+        display: table;
+        width: 100%;
+      }
+      .bar__title {
+        display: table-cell;
+        vertical-align: middle;
+        font-size: 13px;
+        font-weight: 600;
+        color: #cfd6df;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .bar__acts {
+        display: table-cell;
+        vertical-align: middle;
+        text-align: right;
+        white-space: nowrap;
+        width: 1%;
+      }
+      .btn {
+        -webkit-appearance: none;
+        appearance: none;
+        margin-left: 6px;
+        padding: 7px 11px;
+        border: 1px solid #2a3038;
+        border-radius: 8px;
+        background: #171b21;
+        color: #d5dbe4;
+        font-family: inherit;
+        font-size: 12px;
+        line-height: 1;
+        cursor: pointer;
+      }
+      .btn:active {
+        background: #222833;
+      }
+      .btn--primary {
+        background: #1d6fe0;
+        border-color: #2a7cf0;
+        color: #fff;
+        font-weight: 600;
+      }
+      .btn--primary:active {
+        background: #1a63c8;
+      }
+
+      #sc-root {
+        padding-top: 54px;
+        padding-top: calc(54px + env(safe-area-inset-top, 0px));
+        padding-bottom: 24px;
+      }
+
+      /* 复制失败时给一段可手动选择的长文本 */
+      .raw {
+        margin: 0 12px 20px;
+        padding: 12px;
+        border-radius: 10px;
+        background: #12151a;
+        border: 1px solid #1e232b;
+        color: #9aa3af;
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 11px;
+        line-height: 1.6;
+        white-space: pre-wrap;
+        word-break: break-all;
+        -webkit-user-select: text;
+        user-select: text;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="bar" id="sc-bar">
+      <div class="bar__title">DSH 环境自检</div>
+      <div class="bar__acts">
+        <button class="btn" type="button" data-act="back">返回</button>
+        <button class="btn" type="button" data-act="rerun">重查</button>
+        <button class="btn btn--primary" type="button" data-act="copy">复制</button>
+      </div>
+    </div>
+
+    <div id="sc-root"></div>
+
+    <script src="./scripts/diagnose.js"></script>
+  </body>
+</html>

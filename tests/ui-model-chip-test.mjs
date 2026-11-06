@@ -187,7 +187,7 @@ await test("选中插件模型后，输入框与顶栏都在", async () => {
   }
 });
 
-await test("顶栏那颗 chip 显示的是插件给的模型名", async () => {
+await test("顶栏胶囊点开的会话面板里，显示的是插件给的模型名", async () => {
   const { ctx, page } = await openWith(browser, (st) => {
     st.settings.customModels = [
       { id: "node__echo__echo-1", name: "回声模型", apiModel: "echo-1", provider: "node__echo", source: "node-llm" },
@@ -195,19 +195,25 @@ await test("顶栏那颗 chip 显示的是插件给的模型名", async () => {
     st.settings.model = "node__echo__echo-1";
   });
   try {
-    const chips = await page.evaluate(() =>
-      Array.from(document.querySelectorAll(".chat__meta .chip")).map((e) => (e.innerText || "").trim())
+    // 0.60.0 起，模型入口从对话页上方那排 chip 移进了顶栏胶囊弹出的会话面板。
+    // 断言的数据没变：当前用的是哪个模型，必须能从界面上读出来。
+    await page.click(".appbar__pill");
+    await page.waitForTimeout(400);
+    const rows = await page.evaluate(() =>
+      Array.from(
+        document.querySelectorAll('#sheet-layer [data-act="open-model"], #sheet-layer [data-act="open-models"]')
+      ).map((e) => (e.innerText || "").trim())
     );
     assert.ok(
-      chips.some((c) => c.includes("回声模型")),
-      "应该显示「回声模型」，实际：" + JSON.stringify(chips)
+      rows.some((c) => c.includes("回声模型")),
+      "应该显示「回声模型」，实际：" + JSON.stringify(rows)
     );
   } finally {
     await ctx.close();
   }
 });
 
-await test("点顶栏的模型 chip 打开面板不会崩", async () => {
+await test("点会话面板里的模型行，打开面板不会崩", async () => {
   const { ctx, page, errors } = await openWith(browser, (st) => {
     st.settings.customModels = [
       { id: "node__echo__echo-1", label: "回声模型", name: "回声模型", apiModel: "echo-1", provider: "node__echo", source: "node-llm" },
@@ -215,13 +221,15 @@ await test("点顶栏的模型 chip 打开面板不会崩", async () => {
     st.settings.model = "node__echo__echo-1";
   });
   try {
+    await page.click(".appbar__pill");
+    await page.waitForTimeout(400);
     const clicked = await page.evaluate(() => {
       const el = document.querySelector('[data-act="open-model"]');
       if (!el) return false;
       el.click();
       return true;
     });
-    assert.ok(clicked, "顶栏应该有可点的模型 chip");
+    assert.ok(clicked, "会话面板里应该有可点的模型行");
     await page.waitForTimeout(500);
     const text = await page.evaluate(() => (document.body.innerText || "").trim());
     assert.ok(text.length > 0, "点完之后页面不能是空的");

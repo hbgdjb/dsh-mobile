@@ -20,8 +20,8 @@ MIRROR="${MIRROR:-1}"
 #
 # 现在这里说了算，并且校验 store.js 一致：
 # 不一致直接停下，而不是构建出一个版本号对不上的包。
-APP_VERSION="0.53.0"
-APP_CODE=123
+APP_VERSION="0.84.0"
+APP_CODE=161
 
 SRC_VER=$(grep -o 'APP_VERSION = "[^"]*"' "$ROOT/scripts/store.js" | head -1 | sed 's/.*"\(.*\)"/\1/')
 if [ "$SRC_VER" != "$APP_VERSION" ]; then
@@ -44,9 +44,13 @@ mkdir -p "$WORK/www"
 
 echo "→ 复制 Web 运行时"
 cp "$ROOT/index.html" "$WORK/www/"
+# 自检页必须一起打进去：它是界面起不来时唯一的出口，
+# 漏了它等于排障通道被关掉（而且只在出故障时才会发现）。
+cp "$ROOT/diagnose.html" "$WORK/www/"
+cp "$ROOT/layout-probe.html" "$WORK/www/"
 cp "$ROOT/manifest.webmanifest" "$WORK/www/"
 cp "$ROOT/sw.js" "$WORK/www/"
-cp -R "$ROOT/styles" "$ROOT/scripts" "$ROOT/icons" "$ROOT/splash" "$WORK/www/"
+cp -R "$ROOT/styles" "$ROOT/scripts" "$ROOT/icons" "$ROOT/splash" "$ROOT/ime" "$WORK/www/"
 cp "$ROOT/android/package.json" "$ROOT/android/capacitor.config.json" "$WORK/"
 
 cd "$WORK"
@@ -75,7 +79,7 @@ mkdir -p "$JAVA_DIR"
 #   DshA11yDiagnostics 诊断日志（名字沿用历史，现为通用日志，Shizuku 也在用）
 #   DshStatus          设备状态快照（0.24.0 起，只在 :device 采集）
 #   DshDeviceService   :device 进程入口（0.24.0 起，负责启停 MCP server）
-for f in DshShizuku DshShizukuService DshPointerOverlay DshSpeechBridge DshVoskEngine ModelDownloader DshNodeRuntime DshNodeService DshNodeBridge DshNodeChannel DshA11yDiagnostics DshStatus DshDeviceService DshHttpBridge DshHudState DshHudBridge DshHudService DshBotView DshFsBridge DshKeepAliveService DshKeepAliveBridge DshPowerBridge DshMcpServer DshMcpTools DshMcpPolicy DshMcpBridge DshMcpBootstrap MainActivity; do
+for f in DshShizuku DshShizukuService DshPointerOverlay DshSpeechBridge DshVoskEngine ModelDownloader DshNodeRuntime DshNodeService DshNodeBridge DshNodeChannel DshA11yDiagnostics DshStatus DshDeviceService DshHttpBridge DshHudState DshHudBridge DshHudService DshBotView DshFsBridge DshKeepAliveService DshKeepAliveBridge DshPowerBridge DshMcpServer DshMcpTools DshMcpPolicy DshMcpBridge DshMcpBootstrap DshImeService DshImeBridge DshImeState DshImeHostBridge DshImeActivity DshCaptureService DshDelete MainActivity; do
   cp "$ROOT/android/java/$f.java" "$JAVA_DIR/$f.java"
 done
 
@@ -429,6 +433,66 @@ if 'DshDeviceService' not in s:
         '        android:process=":device"\n'
         '    />\n'
         '</application>',
+    )
+
+
+# ---- DSH 键盘（IME，0.54.0）----
+#
+# 输入法是一个 Service，但它和普通 Service 不一样：
+# 必须在 manifest 里用 <service> + <intent-filter> 里那个
+# android.view.InputMethod 这个 action 声明，
+# 并且要用 meta-data 指向 res/xml/method.xml 描述它的子类型。
+# 少任何一样，系统设置里的"输入法"列表里就不会出现它。
+if 'DshImeService' not in s:
+    s = s.replace(
+        '</application>',
+        '    <service\n'
+        '        android:name=".DshImeService"\n'
+        '        android:exported="true"\n'
+        '        android:label="DSH 键盘"\n'
+        '        android:theme="@style/DshImeTheme"\n'
+        '        android:permission="android.permission.BIND_INPUT_METHOD">\n'
+        '        <intent-filter>\n'
+        '            <action android:name="android.view.InputMethod" />\n'
+        '        </intent-filter>\n'
+        '        <meta-data\n'
+        '            android:name="android.view.im"\n'
+        '            android:resource="@xml/method" />\n'
+        '    </service>\n'
+        '</application>',
+    )
+
+# 截图授权的中转 Activity（透明、无界面）
+if 'DshImeActivity' not in s:
+    s = s.replace(
+        '</application>',
+        '    <activity\n'
+        '        android:name=".DshImeActivity"\n'
+        '        android:exported="false"\n'
+        '        android:excludeFromRecents="true"\n'
+        '        android:theme="@android:style/Theme.Translucent.NoTitleBar" />\n'
+        '</application>',
+    )
+
+# 截图的前台服务 —— Android 14 起必须声明 mediaProjection 类型
+if 'DshCaptureService' not in s:
+    s = s.replace(
+        '</application>',
+        '    <service\n'
+        '        android:name=".DshCaptureService"\n'
+        '        android:exported="false"\n'
+        '        android:foregroundServiceType="mediaProjection" />\n'
+        '</application>',
+    )
+
+# 权限：
+#   RECORD_AUDIO     语音输入（0.23.0 已有，这里保证还在）
+#   FOREGROUND_SERVICE_MEDIA_PROJECTION  截图前台服务（API 34+ 必须显式声明）
+if 'android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION' not in s:
+    s = s.replace(
+        '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />',
+        '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n'
+        '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />',
     )
 
 m.write_text(s)

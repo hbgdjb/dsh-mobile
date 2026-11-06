@@ -135,6 +135,88 @@
   max-width: 25em;
 }
 
+/* 工作模式选择：设计 / 代码 / 办公 / 学习
+   放在首页空态里 —— 会话一开始就定，发第一条消息后这块自然消失。 */
+.home__preset {
+  margin: 2px 0 22px;
+  padding: 13px 13px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface);
+}
+
+.preset__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.preset__label {
+  font-family: var(--font-mono);
+  font-size: var(--fs-11);
+  letter-spacing: 0.12em;
+  color: var(--dim);
+}
+
+.preset__hint {
+  font-size: var(--fs-11);
+  color: var(--dim);
+  text-align: right;
+}
+
+.preset__grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.preset {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color var(--dur-2) var(--ease-out), background var(--dur-2) var(--ease-out);
+}
+
+.preset:active {
+  background: var(--surface-3);
+}
+
+.preset--on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.preset__name {
+  font-size: var(--fs-13);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.preset--on .preset__name {
+  color: var(--accent-bright);
+}
+
+.preset__brief {
+  font-size: var(--fs-11);
+  line-height: 1.4;
+  color: var(--dim);
+}
+
+.preset__intro {
+  margin: 10px 0 0;
+  font-size: var(--fs-12);
+  color: var(--muted);
+}
+
 .home__section {
   display: flex;
   align-items: center;
@@ -749,13 +831,16 @@
   background: var(--line);
 }
 
+/* 设置里的条目行：52 → 44。
+   「账号 / 模型管理」这两行原来上下各 12px 留白，两行文字加起来还没留白高，
+   看着像空了一格。压紧后仍然满足 44px 的点击高度下限。 */
 .settings__row {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 12px 0;
+  padding: 9px 0;
   border-bottom: 1px solid var(--line);
-  min-height: 52px;
+  min-height: 44px;
 }
 
 .settings__row:last-child {
@@ -773,12 +858,13 @@
   display: flex;
   align-items: center;
   gap: 6px;
+  line-height: 1.3;
 }
 
 .settings__row-sub {
   font-size: 11px;
   color: var(--dim);
-  line-height: 1.5;
+  line-height: 1.4;
   margin-top: 2px;
 }
 
@@ -1833,21 +1919,23 @@ html[data-density="compact"] .conn-banner {
 
 /* ---------------- 设置：大类列表 ---------------- */
 
+/* 行高收紧：九个大类原来一屏放不下，要滑两下才看到「关于」。
+   高度压到 54px 上下 —— 仍然是可点的一整行，但没有多余的上下留白。 */
 .settings__cards {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 7px;
 }
 
 .settings-card {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
   width: 100%;
-  padding: 13px 14px;
+  padding: 9px 12px;
   text-align: left;
-  border-radius: 16px;
+  border-radius: 14px;
   border: 1px solid var(--line);
   background: var(--surface);
   color: var(--text);
@@ -1857,6 +1945,11 @@ html[data-density="compact"] .conn-banner {
 .settings-card::after {
   content: "";
   position: absolute;
+  /* inset 是 Chrome 87 的简写，老内核整条丢弃 —— 先逐边写一遍 */
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
   inset: 0;
   border-radius: inherit;
   background: radial-gradient(120% 140% at 0% 0%, rgba(109, 134, 255, 0.09), transparent 62%);
@@ -1882,18 +1975,20 @@ html[data-density="compact"] .conn-banner {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 2px;
 }
 
 .settings-card__title {
-  font-size: 13.5px;
+  font-size: 13px;
   font-weight: 600;
   letter-spacing: 0.01em;
+  line-height: 1.3;
 }
 
 .settings-card__sub {
-  font-size: 10.5px;
+  font-size: 10px;
   color: var(--dim);
+  line-height: 1.35;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1937,6 +2032,136 @@ html[data-density="compact"] .conn-banner {
   margin-top: 4px;
 }
 
+/* 探测结果的状态条：探到几条、探的哪个地址、要不要重探 */
+.cm-probe {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  font-size: var(--fs-11);
+}
+
+.cm-probe__ok {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--ok);
+  flex: none;
+}
+
+.cm-probe__meta {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: 10px;
+}
+
+.cm-probe__refresh {
+  flex: none;
+  padding: 2px 6px;
+}
+
+/* 「N 已添加」单独一颗，不跟着端点一起被省略号吃掉 */
+.cm-probe__added {
+  flex: none;
+  font-size: 10px;
+  color: var(--accent-bright);
+  background: var(--accent-soft);
+  border-radius: 6px;
+  padding: 2px 6px;
+}
+
+.cm-probe__loading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 工具行：筛选框 + 全选 + 加入所选 */
+.cm-probe__tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0;
+}
+
+.cm-probe__tools .input {
+  flex: 1;
+  min-width: 0;
+}
+
+.cm-probe__tools .btn {
+  flex: none;
+  white-space: nowrap;
+}
+
+/* 多选列表：一行一个模型，已加进来的置灰并打标 */
+.cm-model-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  margin-bottom: 5px;
+  background: var(--surface-2);
+  cursor: pointer;
+}
+
+.cm-model-row input {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
+.cm-model-row__id {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--fs-12);
+  color: var(--text);
+}
+
+.cm-model-row__meta {
+  flex: none;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10.5px;
+  color: var(--dim);
+}
+
+.cm-model-row__badge {
+  flex: none;
+  font-size: 10px;
+  color: var(--ok);
+  background: var(--ok-soft);
+  border-radius: 6px;
+  padding: 2px 6px;
+}
+
+.cm-model-row.is-added {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* 非 OpenAI 格式下，图片与推理强度两行没有意义：整行压暗、开关点不动 */
+.settings__row.is-disabled {
+  opacity: 0.45;
+}
+
+.settings__row.is-disabled .switch {
+  pointer-events: none;
+}
+
 .cm-model-list {
   max-height: 168px;
   overflow-y: auto;
@@ -1950,6 +2175,14 @@ html[data-density="compact"] .conn-banner {
 
 .cm-model-list:empty {
   display: none;
+}
+
+/* 多选清单：一行一个，别跟着上面那套「chip 平铺」的 flex-wrap 走 */
+.cm-model-list--rows {
+  display: block;
+  max-height: 260px;
+  border: 0;
+  padding: 0;
 }
 
 .cm-scenes {

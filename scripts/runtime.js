@@ -8,8 +8,10 @@
 import {
   state,
   currentMode,
+  currentPreset,
   readFile,
   readDoc,
+  listFiles,
   fmtTime,
   currentModel,
   modelApiId,
@@ -21,7 +23,12 @@ import {
   setModelStatus,
   allModels,
   knownModelVision,
+  modelFormat,
   upsertCustomModel,
+  resolveDiscoveredModels,
+  providerKeyOf,
+  keyDiagnosis,
+  saveModelOverride,
 } from "./store.js";
 import { trimMessages, compactMessages, estimateTokens } from "./context.js";
 import { buildSystemPromptText } from "./prompt.js";
@@ -29,6 +36,7 @@ import { sanitizeUntrusted } from "./inject.js";
 import { toolSchemas, executeTool, availableToolNames, inspectPath } from "./tools.js";
 import { nativeStream, nativeHttpAvailable } from "./native-http.js";
 import { withRetry } from "./retry.js";
+import { parseToolArgs, argsErrorText } from "./toolargs.js";
 import { isImagePath, imageMime, prepareImage } from "./image.js";
 import {
   buildPromptBlock,
@@ -41,6 +49,18 @@ import {
 } from "./memory.js";
 import { beginTrajectory, captureTool, endTrajectory, abortTrajectory } from "./traj.js";
 import { isNodeLlmModel, nodeProviderOf, streamViaNode } from "./llm-bridge.js";
+import {
+  formatOf,
+  normalizeFormat,
+  accumulateToolCall,
+  safeUrl,
+  errorDetail as fmtErrorDetail,
+  httpHint as fmtHttpHint,
+  authFailureHint,
+  connectionProfile,
+  agnesSiteOf,
+  agnesAltBaseUrl,
+} from "./formats.js";
 
 const sleep = (ms, signal) =>
   new Promise((resolve, reject) => {
@@ -89,8 +109,11 @@ function buildSystemPrompt(query = "") {
 /** 从当前状态取提示词需要的全部上下文。 */
 function promptContext() {
   const mode = currentMode();
+  const preset = currentPreset();
   return {
     mode: { name: mode.name, detail: mode.detail },
+    // 只有选过工作模式才带；没选就是 undefined，那一段根本不会出现在 prompt 里
+    preset: preset ? { name: preset.name, prompt: preset.prompt } : undefined,
     permission:
       state.settings.permission === "readonly"
         ? "只读"
@@ -98,9 +121,13 @@ function promptContext() {
           ? "完全访问"
           : "工作区写入",
     reasoning: state.settings.reasoning,
-    files: Object.values(state.files || {}),
+    // 只给模型看「当前会话的工作区视图」。state.files 是全量真实路径索引，
+    // 直接塞进去会把别的会话的 sessions/<id>/… 路径也暴露出来。
+    files: listFiles(),
     library: Object.values(state.library || {}),
     plugins: state.plugins.filter((p) => p.enabled),
+    // 已装技能：只给清单，全文让模型自己 skill_read
+    skills: Array.isArray(state.skills) ? state.skills : [],
     mcpServers: Array.isArray(state.settings.mcpServers) ? state.settings.mcpServers : [],
     minimal: state.settings.mode === "minimal",
     now: new Date().toLocaleString("zh-CN", { hour12: false }),
@@ -306,12 +333,6 @@ async function withAttachments(text, attachments, { vision = false } = {}) {
 
 /* ---------------- 网络请求 ---------------- */
 
-function endpointFor(baseUrl) {
-  const b = String(baseUrl || "").trim().replace(/\/+$/, "");
-  if (/\/chat\/completions$/.test(b)) return b;
-  return `${b}/chat/completions`;
-}
-
 /** 带超时的 fetch；外部 signal 仍可随时中止。 */
 async function fetchWithTimeout(url, options, externalSignal) {
   const seconds = Math.max(10, Math.min(600, Number(state.settings.requestTimeout) || 60));
@@ -335,121 +356,98 @@ async function fetchWithTimeout(url, options, externalSignal) {
   }
 }
 
-/** 增量解析 OpenAI 兼容 SSE；fetch 与原生桥共用。 */
-function createSSEConsumer({ onText, onReasoning, onToolDelta, onUsage }) {
-  let buffer = "";
-  let finish = null;
-  let sawEvent = false;
-
-  const consume = (line) => {
-    if (!line.startsWith("data:")) return;
-    const payload = line.slice(5).trim();
-    if (!payload) return;
-    sawEvent = true;
-    if (payload === "[DONE]") {
-      finish = finish || "stop";
-      return;
-    }
-    let json;
-    try {
-      json = JSON.parse(payload);
-    } catch {
-      return;
-    }
-    if (json.usage) onUsage?.(json.usage);
-    const choice = json.choices?.[0];
-    if (!choice) return;
-    const delta = choice.delta || {};
-    if (delta.reasoning_content) onReasoning?.(delta.reasoning_content);
-    if (delta.content) onText?.(delta.content);
-    if (delta.tool_calls) onToolDelta?.(delta.tool_calls);
-    if (choice.finish_reason) finish = choice.finish_reason;
-  };
-
-  return {
-    feed(text) {
-      buffer += text;
-      let idx;
-      while ((idx = buffer.indexOf("\n")) >= 0) {
-        const line = buffer.slice(0, idx).replace(/\r$/, "").trim();
-        buffer = buffer.slice(idx + 1);
-        consume(line);
-      }
-    },
-    get finish() {
-      return finish;
-    },
-    get sawEvent() {
-      return sawEvent;
-    },
-  };
-}
-
-/** 有些兼容网关会忽略 stream:true，直接返回一整段 JSON。 */
-function consumeWholeJSON(raw, { onText, onReasoning, onToolDelta, onUsage }) {
-  try {
-    const data = JSON.parse(raw);
-    if (data.usage) onUsage?.(data.usage);
-    const message = data.choices?.[0]?.message;
-    if (!message) return false;
-    if (message.reasoning_content) onReasoning?.(message.reasoning_content);
-    if (message.content) onText?.(message.content);
-    if (Array.isArray(message.tool_calls) && message.tool_calls.length) {
-      onToolDelta?.(
-        message.tool_calls.map((c, index) => ({
-          index,
-          id: c.id,
-          function: { name: c.function?.name, arguments: c.function?.arguments },
-        }))
-      );
-    }
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function readSSE(res, handlers) {
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  const consumer = createSSEConsumer(handlers);
+/**
+ * 流式读到底，喂给协议适配器。
+ *
+ * 适配器自己知道怎么切帧（SSE / NDJSON），这里只负责把字节搬过去，
+ * 顺便留一份原文给「网关其实没走流」的回退用。
+ */
+async function readStream(res, parser) {
   let raw = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    const text = decoder.decode(value, { stream: true });
-    raw += text;
-    consumer.feed(text);
+  if (res.body && typeof res.body.getReader === "function") {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const text = decoder.decode(value, { stream: true });
+      if (raw.length < 8000000) raw += text;
+      parser.feed(text);
+    }
+    const tail = decoder.decode();
+    if (tail) {
+      if (raw.length < 8000000) raw += tail;
+      parser.feed(tail);
+    }
+  } else {
+    // 有些环境没有 stream API（老 WebView、被代理过的响应）
+    raw = await res.text();
+    parser.feed(raw);
   }
-  consumer.feed(decoder.decode());
-  return { finish: consumer.finish, raw, sawEvent: consumer.sawEvent };
+  parser.flush();
+  return { raw };
 }
 
 function errorDetail(text) {
-  const raw = String(text || "").trim();
-  if (!raw) return "";
-  try {
-    const body = JSON.parse(raw);
-    return body.error?.message || body.message || JSON.stringify(body).slice(0, 240);
-  } catch {
-    return raw.slice(0, 240);
-  }
+  return fmtErrorDetail(text);
 }
 
 function httpHint(status) {
-  return (
-    {
-      400: "请求格式被拒绝，请检查模型 ID 与参数。",
-      401: "API Key 无效或已过期，请到「账号与服务」重新填写。",
-      402: "账户余额不足，请前往服务商控制台充值。",
-      403: "该 Key 没有访问此模型的权限，或服务端拒绝了请求来源。",
-      404: "接口路径或模型不存在，请检查 Base URL 与模型 ID。",
-      429: "触发限流（429）：30–60 秒后再试；免费 / 低价档模型并发限制更严，连续多次请求也容易触发，请检查账户余额与限流规则。",
-      500: "服务端内部错误，稍后重试。",
-      502: "网关错误，服务端暂时不可用。",
-      503: "服务端繁忙或过载，稍后重试。",
-    }[status] || `请求失败（HTTP ${status}）。`
-  );
+  return fmtHttpHint(status);
+}
+
+/** 401 / 403 时把服务端原文、Key 槽位与自查清单组装成可展示的诊断。 */
+function authDiagnosisFor(model, status, detail) {
+  if (status !== 401 && status !== 403) return "";
+  try {
+    return authFailureHint(status, detail, {
+      ...keyDiagnosis(model),
+      providerKey: providerKeyOf(model),
+    });
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * 401 / 403 时判断该不该换一个 Agnes 站点重试。
+ *
+ * 为什么只在这一处判断：Agnes 是唯一「同一套 API、两套互不通用的 Key」
+ * 的服务商。国内站的 Key 打到国际站，服务端只会说「Invalid token」——
+ * 和「Key 打错了」在字面上完全一样，但换一个域名就好了。
+ * 用户不会想到「端口填错了站」，只会以为应用把 Key 弄丢了。
+ *
+ * 返回 "" 表示不重试：非 Agnes 端点、已经重试过、或状态码不是鉴权类。
+ */
+function agnesSwitchTarget(model, baseUrl, status, alreadyRetried) {
+  if (alreadyRetried) return "";
+  if (status !== 401 && status !== 403) return "";
+  const alt = agnesAltBaseUrl(baseUrl);
+  if (!alt) return "";
+  // 403 也可能是「这个模型没开通」，但代价只是多一次几百毫秒的请求，
+  // 换来的结论明确得多：两站都不行就不是站点问题。
+  return alt;
+}
+
+/**
+ * 两站都试过之后，把结论说透。
+ *
+ * 只写「Key 无效」会让用户继续在字符上找问题；明确告诉他已经排除了站点，
+ * 才能把注意力放回 Key 本身（是否被删除、是否属于另一个账号）。
+ */
+function withSiteNote(hint, retried) {
+  if (!retried) return hint;
+  const line =
+    "已分别试过国内站（.cn）与国际站（.com），两站都拒绝 —— 问题不在站点选择，而在 Key 本身或账号状态。";
+  return hint ? `${hint}\n${line}` : line;
+}
+
+/** 换站成功后的说明，拼进成功结果里给界面展示。 */
+function siteNoteOf(baseUrl, alt, status) {
+  const to = agnesSiteOf(alt);
+  const from = agnesSiteOf(baseUrl);
+  const where = (x) => (x === "cn" ? "国内站（.cn）" : "国际站（.com）");
+  return `原端点 ${where(from)} 返回 ${status}，已自动切换到${where(to)}并保存。国内站与国际站的 Key 不通用，换站后即可正常对话。`;
 }
 
 /** 端点拒绝 reasoning_effort 时，自动关掉该模型的透传并留下可操作提示。 */
@@ -478,7 +476,7 @@ function effortFallback(active, detail) {
  * 没有 HTTP 状态码，端点是「node:<provider>」。硬塞进同一个函数里
  * 只会让两边都变得难读。
  */
-async function chatViaNode(active, { messages, tools, signal, onText, onReasoning, onUsage }) {
+async function chatViaNode(active, { messages, tools, signal, onText, onReasoning, onUsage, onPhase }) {
   const provider = nodeProviderOf(active);
   const model = modelApiId(active);
   if (!provider) throw new Error("这个模型没有记录来源供应方，请到设置里重新同步一次模型列表");
@@ -500,8 +498,14 @@ async function chatViaNode(active, { messages, tools, signal, onText, onReasonin
       maxTokens: Number(active.maxTokens) > 0 ? Number(active.maxTokens) : undefined,
       reasoningEffort: active.supportsEffort !== false ? state.settings.reasoning : undefined,
       signal,
-      onText,
-      onReasoning,
+      onText: (d) => {
+        onPhase?.("streaming");
+        onText?.(d);
+      },
+      onReasoning: (d) => {
+        onPhase?.("thinking");
+        onReasoning?.(d);
+      },
       onUsage(u) {
         diag.tokens = u?.total_tokens || diag.tokens;
         onUsage?.(u);
@@ -537,10 +541,15 @@ async function chatViaNode(active, { messages, tools, signal, onText, onReasonin
  */
 async function chatOnce(opts) {
   let produced = false;
+  // 一条消息最多回滚一次。第二次还断说明链路确实不行，
+  // 再闪一次只是折磨人 —— 那时改成如实报错。
+  let rolledBack = false;
 
   return await withRetry(
     async () => {
       produced = false;
+      // 每次尝试从同一个起点重来，界面层在这里记快照
+      opts.onAttemptStart?.();
       try {
         return await chatAttempt({
           ...opts,
@@ -555,6 +564,28 @@ async function chatOnce(opts) {
         });
       } catch (err) {
         err.produced = produced;
+        // ============ 断流 + 已经吐了字：撤回重发 ============
+        //
+        // 这是「已经输出过就不重试」的唯一例外。断流和 4xx 不一样：
+        // 服务端没有拒绝，只是链路中途断了，重发一次大概率就好。
+        //
+        // 之所以敢撤回，是因为工具执行发生在 chatAttempt 返回之后 ——
+        // 此刻一个工具都没跑过，把这几段文字抹掉重来不会产生副作用。
+        // 不撤回的话，用户只能看着一条跑到 20 步的任务整轮失败。
+        // 代价是文字会闪一下重新出现，所以限制为每条消息只回滚一次。
+        const canRollback =
+          produced && err.streamBroken && !rolledBack && typeof opts.onRollback === "function";
+        if (canRollback) {
+          rolledBack = true;
+          opts.onRollback();
+          produced = false;
+          err.produced = false;
+          err.rolledBack = true;
+        } else if (produced && err.streamBroken) {
+          // 已经回滚过一次还断：不重试，但要说清原因，
+          // 别让人以为是程序卡住了。
+          err.message += "（这条回复已经输出了一部分，为避免内容重复没有自动重试；直接再发一次即可）";
+        }
         throw err;
       }
     },
@@ -565,7 +596,40 @@ async function chatOnce(opts) {
   );
 }
 
-async function chatAttempt({ messages, tools, signal, onText, onReasoning, onUsage }) {
+/**
+ * 一轮对话请求的外层。
+ *
+ * 只做一件事：换站成功之后把新地址写回配置。失败的尝试一律不改配置 ——
+ * 「两站都不通」时把用户填的地址悄悄换掉，只会让下次排查更难。
+ */
+async function chatAttempt(args) {
+  const out = await chatAttemptOnce(args);
+  if (args.siteRetry && args.forceBaseUrl) {
+    const active = currentModel();
+    if (active && active.id) {
+      try {
+        saveModelOverride(active.id, { baseUrl: args.forceBaseUrl });
+      } catch {
+        /* 存档失败不影响这一轮 */
+      }
+    }
+  }
+  return out;
+}
+
+async function chatAttemptOnce({
+  messages,
+  tools,
+  signal,
+  onText,
+  onReasoning,
+  onUsage,
+  onPhase,
+  // Agnes 换站重试：forceBaseUrl 直接指定这一轮要打的地址，
+  // 不依赖 saveModelOverride 是否已经反映到 currentModel() 上。
+  siteRetry = false,
+  forceBaseUrl = "",
+}) {
   const active = currentModel();
   if (!active) throw new Error("还没有添加模型。到 设置 → 模型管理 里添加一个，选好供应方一分钟就能接上。");
 
@@ -574,54 +638,62 @@ async function chatAttempt({ messages, tools, signal, onText, onReasoning, onUsa
   // 这类模型没有 Base URL —— 它的端点在插件的 adapter 闭包里，
   // 只有加载了插件的 Node 进程能执行它。所以这里换一条路走。
   if (isNodeLlmModel(active)) {
-    return await chatViaNode(active, { messages, tools, signal, onText, onReasoning, onUsage });
+    return await chatViaNode(active, { messages, tools, signal, onText, onReasoning, onUsage, onPhase });
   }
 
   const apiKey = apiKeyFor(active);
-  const baseUrl = modelBaseUrl(active);
+  const baseUrl = forceBaseUrl || modelBaseUrl(active);
   const model = modelApiId(active);
   if (!apiKey) throw new Error("当前模型所属服务还没有配置 API Key");
   if (!baseUrl) throw new Error("当前模型没有 Base URL，请到模型参数里填写");
   if (!model) throw new Error("当前模型没有模型 ID，请到模型参数里填写");
 
+  // 协议：条目自己带的 format 优先；老条目没有这个字段，按 OpenAI 兼容处理。
+  const format = normalizeFormat(active.format);
+  const adapter = formatOf(format);
+
   // 图片输入不被支持时，服务端通常返回 400/422，这里补一句可操作提示
   const hasImage = messages.some(
     (m) => Array.isArray(m?.content) && m.content.some((part) => part?.type === "image_url")
   );
-  const imageHint = hasImage
-    ? "（本条消息含图片：若该模型不支持图片输入会返回这个错误，可在 设置 → 当前模型 → 更多参数 关闭「图片输入」，或换用支持视觉的模型）"
-    : "";
+  const imageHint =
+    hasImage && adapter.supportsImages
+      ? "（本条消息含图片：若该模型不支持图片输入会返回这个错误，可在 设置 → 当前模型 → 更多参数 关闭「图片输入」，或换用支持视觉的模型）"
+      : "";
 
   const started = Date.now();
-  let diag = { endpoint: baseUrl, model, status: 0, ok: false, tokens: 0, ms: 0 };
-  let recorded = false;
   const temperature =
     typeof active.temperature === "number" ? active.temperature : state.settings.temperature ?? 0.3;
-  const payload = {
-    model,
+
+  const req = adapter.buildRequest({
+    baseUrl,
+    apiKey,
+    modelId: model,
     messages,
-    tools: tools.length ? tools : undefined,
-    tool_choice: tools.length ? "auto" : undefined,
+    tools: Array.isArray(tools) ? tools : [],
     stream: true,
-    stream_options: { include_usage: true },
     temperature,
-    ...(Number(active.maxTokens) > 0 ? { max_tokens: Number(active.maxTokens) } : {}),
-    // 默认透传 reasoning_effort；模型明确标为不支持时才省略，避免 4xx
-    ...(active.supportsEffort !== false
-      ? {
-          reasoning_effort:
-            { off: "minimal", low: "low", high: "high", max: "high" }[state.settings.reasoning] || "high",
-        }
-      : {}),
+    maxTokens: Number(active.maxTokens) > 0 ? Number(active.maxTokens) : 0,
+    // 默认透传推理强度；协议没有这个开关、或模型明确不支持时省略，避免 4xx
+    effort:
+      adapter.supportsEffort && active.supportsEffort !== false
+        ? { off: "minimal", low: "low", high: "high", max: "high" }[state.settings.reasoning] || "high"
+        : null,
+  });
+
+  let diag = {
+    endpoint: adapter.chatEndpoint(baseUrl),
+    format,
+    model,
+    status: 0,
+    ok: false,
+    tokens: 0,
+    ms: 0,
   };
-  const headers = {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${apiKey}`,
-  };
-  const url = endpointFor(baseUrl);
+  let recorded = false;
 
   const calls = [];
-  const consumer = createSSEConsumer({
+  const handlers = {
     onText,
     onReasoning,
     onUsage(u) {
@@ -629,55 +701,154 @@ async function chatAttempt({ messages, tools, signal, onText, onReasoning, onUsa
       onUsage?.(u);
     },
     onToolDelta(deltas) {
-      deltas.forEach((d) => {
-        const i = d.index ?? calls.length;
-        if (!calls[i]) calls[i] = { id: "", name: "", args: "" };
-        // 多数网关每个分片都重复携带 id / name：必须覆盖而非拼接，否则聚合出 "call_Acall_A"
-        if (d.id) calls[i].id = d.id;
-        if (d.function?.name) calls[i].name = d.function.name;
-        if (d.function?.arguments) calls[i].args += d.function.arguments;
-      });
+      (deltas || []).forEach((d) => accumulateToolCall(calls, d));
     },
-  });
+  };
+  const parser = adapter.createStreamParser(handlers);
 
   let status = 0;
   let raw = "";
+  let wholeFinish = null;
+
+  /** 网关忽略 stream:true、直接回一整段 JSON 时，从整包里补出内容。 */
+  const applyWhole = () => {
+    const whole = adapter.parseWhole(raw);
+    if (!whole) return false;
+    if (whole.reasoning) handlers.onReasoning(whole.reasoning);
+    if (whole.text) handlers.onText(whole.text);
+    (whole.toolCalls || []).forEach((c, i) =>
+      handlers.onToolDelta([{ index: i, id: c.id, name: c.name, args: c.args }])
+    );
+    if (whole.usage) handlers.onUsage(whole.usage);
+    if (whole.finish) wholeFinish = whole.finish;
+    return true;
+  };
+
+  /** Anthropic / Gemini / Ollama 会把错误塞进流里，而不是靠 HTTP 状态码。 */
+  const throwStreamError = () => {
+    if (!parser.error) return;
+    const detail = String(parser.error);
+    diag = { ...diag, status: status || 0, ms: Date.now() - started, error: detail };
+    addDiagnostic(diag);
+    setModelStatus(active.id, { ok: false, status: status || 0, error: detail, model });
+    throw new Error(`接口返回错误：${detail}`);
+  };
 
   if (nativeHttpAvailable()) {
     // Android 原生通道：绕开 WebView 的 CORS 与流式限制
     await new Promise((resolve, reject) => {
       nativeStream({
-        url,
-        headers,
-        body: payload,
+        url: req.url,
+        headers: req.headers,
+        body: req.body,
         signal,
         timeoutSec: 300,
+        // 思考型端点（Agnes）首字节可能超过 45 秒；其他服务保持默认，
+        // 断网时仍然很快给出结果，不用陪着等到 90 秒。
+        ...connectionProfile(baseUrl),
         onStatus: (s) => {
           status = s;
+          // 拿到 2xx 就说明请求已经送达、服务端已接受；
+          // 之后再久都只是模型在思考，不是"连接失败"。
+          if (s >= 200 && s < 300) onPhase?.("waiting");
         },
         onChunk: (text) => {
-          if (raw.length < 8_000_000) raw += text;
-          consumer.feed(text);
+          if (raw.length < 8000000) raw += text;
+          parser.feed(text);
         },
         onEnd: () => resolve(),
-        onError: (err) => reject(err),
+        onError: (err) => {
+          // ============ 收尾阶段的断流不算失败 ============
+          //
+          // 不少网关发完最后一个 chunk（里面已经带了 finish_reason）
+          // 就直接关连接，收尾的 `data: [DONE]` 根本发不出来。
+          // 这时内容其实是完整的，报「请求失败」等于把已经生成好的结果
+          // 扔掉，再让模型白跑一遍 —— 长工具循环里这一步特别疼。
+          //
+          // 判据要严：必须是 2xx、真的解析到过事件、并且拿到了明确的
+          // 结束原因。缺一个都不算，宁可重试也不要拿半截结果去执行工具。
+          if (status >= 200 && status < 300 && parser.sawEvent && parser.finish) {
+            resolve();
+            return;
+          }
+          reject(err);
+        },
       });
     }).catch((err) => {
       if (err.name === "AbortError") throw err;
-      const code = Number(err.httpStatus) || status;
+      const httpStatus = Number(err.httpStatus) || 0;
+      // ============ 这里以前会把 200 当成错误码 ============
+      //
+      // `status` 是**这次请求收到过的**状态码。HTTP 200 意味着连接已建好、
+      // 服务端已接受请求，此后再出错只可能是「流读到一半断了」，不是
+      // 「HTTP 200 这个错误」。
+      //
+      // 老写法 `code = err.httpStatus || status` 把两者混成一个数，于是
+      // 200 被一路带下去：
+      //   · 文案变成「请求失败（HTTP 200）」，自相矛盾
+      //   · 重试层看到 200 —— 既不是 4xx/5xx 也不是 0 —— 判定不可重试
+      //   · 状态条显示「连接失败 · 200」，看起来像服务端返回了错误
+      // 结果是：一次流抖动就把整轮对话打死，长工具循环里每多一步就多
+      // 一次断流机会，越跑越容易失败。断流本身躲不掉，能修的是别把它
+      // 当成终局。
+      const gotOk = httpStatus === 0 && status >= 200 && status < 300;
+      const code = httpStatus;
       const detail = err.body ? errorDetail(err.body) : err.message;
-      diag = { ...diag, status: code, ms: Date.now() - started, error: detail };
+      const hint = authDiagnosisFor(active, code, detail);
+      diag = { ...diag, status: code, ms: Date.now() - started, error: detail, hint };
       addDiagnostic(diag);
       recorded = true;
-      setModelStatus(active.id, { ok: false, status: code, error: detail, model });
+      setModelStatus(active.id, {
+        ok: false,
+        status: code,
+        // 状态条据此区分「没连上」和「连上了但流断了」——
+        // 后者不是 Key / 地址的问题，重试通常就好。
+        phase: gotOk ? "stream" : "",
+        httpStatus: gotOk ? status : code,
+        error: detail,
+        hint,
+        model,
+      });
       // httpStatus / retryAfter 要挂在错误上：外层据此判断该不该重试、等多久。
       // 以前这里只抛了文案，重试层拿不到状态码，只能一律不重试。
       if (code) {
+        const alt = agnesSwitchTarget(active, baseUrl, code, siteRetry);
+        if (alt) {
+          // 换站重发；写回配置交给外层，成功才写。
+          return chatAttempt({
+            messages,
+            tools,
+            signal,
+            onText,
+            onReasoning,
+            onUsage,
+            onPhase,
+            siteRetry: true,
+            forceBaseUrl: alt,
+          });
+        }
         const e = new Error(
           `${httpHint(code)}${detail ? ` · ${detail}` : ""}${imageHint}${effortFallback(active, detail)}`
         );
         e.httpStatus = code;
         e.retryAfter = Number(err.retryAfter) || 0;
+        e.hint = withSiteNote(hint, siteRetry);
+        throw e;
+      }
+      if (gotOk) {
+        // 看门狗掐断（流中间长时间没数据）和连接被重置要分开说：
+        // 前者是"服务端还在想/卡住了"，后者是"链路断了"，处理方式不一样。
+        const stalled = /空闲|超时|timeout/i.test(detail);
+        const e = new Error(
+          stalled
+            ? `等待响应超时（HTTP ${status} 已连上，${detail}）。服务端长时间没有继续发送数据，可能是模型排队或网关卡住。`
+            : `响应中途断开（HTTP ${status} 已连上，数据流在读取时中断${detail ? `：${detail}` : ""}）。` +
+              "常见原因是网络切换、代理或网关重置长连接；这一轮没有收到完整回复。"
+        );
+        // 状态码留 0：这是网络层故障，不是服务端拒绝。
+        // streamBroken 让重试层明确放行（已经吐过字时仍然不重试）。
+        e.httpStatus = 0;
+        e.streamBroken = true;
         throw e;
       }
       const e = new Error(
@@ -687,34 +858,21 @@ async function chatAttempt({ messages, tools, signal, onText, onReasoning, onUsa
       throw e;
     });
 
-    if (!consumer.sawEvent && raw.trim()) {
-      // 部分兼容网关忽略 stream:true，直接返回整段 JSON
-      if (!consumeWholeJSON(raw, { onText, onReasoning, onUsage, onToolDelta: (deltas) => {
-        deltas.forEach((d) => {
-          const i = d.index ?? calls.length;
-          if (!calls[i]) calls[i] = { id: "", name: "", args: "" };
-          if (d.id) calls[i].id = d.id;
-          if (d.function?.name) calls[i].name += d.function.name;
-          if (d.function?.arguments) calls[i].args += d.function.arguments;
-        });
-      } })) {
-        const detail = errorDetail(raw) || "接口返回了无法解析的内容";
-        diag = { ...diag, status: status || 0, ms: Date.now() - started, error: detail };
-        addDiagnostic(diag);
-        setModelStatus(active.id, { ok: false, status, error: detail, model });
-        throw new Error(`接口返回异常：${detail}`);
-      }
+    parser.flush();
+    throwStreamError();
+    if (!parser.sawEvent && raw.trim() && !applyWhole()) {
+      const detail = errorDetail(raw) || "接口返回了无法解析的内容";
+      diag = { ...diag, status: status || 0, ms: Date.now() - started, error: detail };
+      addDiagnostic(diag);
+      setModelStatus(active.id, { ok: false, status, error: detail, model });
+      throw new Error(`接口返回异常：${detail}`);
     }
   } else {
     let res;
     try {
       res = await fetchWithTimeout(
-        url,
-        {
-          method: "POST",
-          headers,
-          body: JSON.stringify(payload),
-        },
+        req.url,
+        { method: req.method, headers: req.headers, body: JSON.stringify(req.body) },
         signal
       );
     } catch (err) {
@@ -730,59 +888,43 @@ async function chatAttempt({ messages, tools, signal, onText, onReasoning, onUsa
       throw e;
     }
     status = res.status;
+    if (res.ok) onPhase?.("waiting");
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       const detail = errorDetail(body);
       addDiagnostic({ ...diag, status, ms: Date.now() - started, error: detail || `HTTP ${status}` });
       recorded = true;
       setModelStatus(active.id, { ok: false, status, error: detail, model });
+      const alt = agnesSwitchTarget(active, baseUrl, status, siteRetry);
+      if (alt) {
+        return chatAttempt({
+          messages,
+          tools,
+          signal,
+          onText,
+          onReasoning,
+          onUsage,
+          onPhase,
+          siteRetry: true,
+          forceBaseUrl: alt,
+        });
+      }
       const e = new Error(
         `${httpHint(status)}${detail ? ` · ${detail}` : ""}${imageHint}${effortFallback(active, detail)}`
       );
       e.httpStatus = status;
+      e.hint = withSiteNote(authDiagnosisFor(active, status, detail), siteRetry);
       // 浏览器分支拿 Retry-After 要显式读头，原生桥那边已经带回来了
       const ra = Number(res.headers.get("retry-after")) || 0;
       e.retryAfter = ra;
       throw e;
     }
-    const { finish, raw, sawEvent } = await readSSE(res, {
-      onText,
-      onReasoning,
-      onUsage: (u) => {
-        diag.tokens = u?.total_tokens || diag.tokens;
-        onUsage?.(u);
-      },
-      onToolDelta: (deltas) => {
-        deltas.forEach((d) => {
-          const i = d.index ?? calls.length;
-          if (!calls[i]) calls[i] = { id: "", name: "", args: "" };
-          if (d.id) calls[i].id = d.id;
-          if (d.function?.name) calls[i].name = d.function.name;
-          if (d.function?.arguments) calls[i].args += d.function.arguments;
-        });
-      },
-    });
-    if (!sawEvent && raw.trim()) {
+    const out = await readStream(res, parser);
+    raw = out.raw;
+    throwStreamError();
+    if (!parser.sawEvent && raw.trim()) {
       // 网关忽略 stream:true 直接回整包 JSON —— 解析它而不是给用户一条空白回复
-      if (
-        !consumeWholeJSON(raw, {
-          onText,
-          onReasoning,
-          onUsage: (u) => {
-            diag.tokens = u?.total_tokens || diag.tokens;
-            onUsage?.(u);
-          },
-          onToolDelta: (deltas) => {
-            deltas.forEach((d) => {
-              const i = d.index ?? calls.length;
-              if (!calls[i]) calls[i] = { id: "", name: "", args: "" };
-              if (d.id) calls[i].id = d.id;
-              if (d.function?.name) calls[i].name = d.function.name;
-              if (d.function?.arguments) calls[i].args += d.function.arguments;
-            });
-          },
-        })
-      ) {
+      if (!applyWhole()) {
         const detail = errorDetail(raw) || "接口返回了无法解析的内容";
         addDiagnostic({ ...diag, status, ms: Date.now() - started, error: detail });
         recorded = true;
@@ -793,20 +935,20 @@ async function chatAttempt({ messages, tools, signal, onText, onReasoning, onUsa
         addDiagnostic({ ...diag, status, ok: true, ms: Date.now() - started });
         setModelStatus(active.id, { ok: true, status, ms: Date.now() - started, model });
       }
-      return { calls: calls.filter(Boolean), finish: finish || "stop" };
+      return { calls: calls.filter(Boolean), finish: wholeFinish || parser.finish || "stop" };
     }
     if (!recorded) {
       addDiagnostic({ ...diag, status, ok: true, ms: Date.now() - started });
       setModelStatus(active.id, { ok: true, status, ms: Date.now() - started, model });
     }
-    return { calls: calls.filter(Boolean), finish };
+    return { calls: calls.filter(Boolean), finish: parser.finish };
   }
 
   const ms = Date.now() - started;
   diag = { ...diag, ms, tokens: diag.tokens };
   if (!recorded) addDiagnostic({ ...diag, status, ok: true });
   setModelStatus(active.id, { ok: true, status, ms, model });
-  return { calls: calls.filter(Boolean), finish: consumer.finish };
+  return { calls: calls.filter(Boolean), finish: wholeFinish || parser.finish };
 }
 
 /* ---------------- 工具执行封装 ---------------- */
@@ -855,6 +997,49 @@ export function isParallelSafeTool(name) {
  *
  * 所以位置在**开始执行前**就占好，执行完只回填内容。
  */
+/* ---------------- 时间线 ---------------- */
+
+/**
+ * 把「思考 / 正文 / 工具」的真实发生顺序记下来。
+ *
+ * 早先只存三个桶：msg.reasoning 累积、msg.tools 追加、msg.content 累积。
+ * 渲染时固定排成「思考 → 工具 → 正文」，可 Agent 的节奏根本不是这样 ——
+ * 想一下、调一个工具、看结果、再想、再调。三桶一平铺，这个顺序就没了，
+ * 用户看到的是一坨思考、一堆工具、一段结论，像三份互不相干的附录。
+ *
+ * 这里额外维护 msg.timeline，只记「哪段文字落在哪个位置」：
+ *   { type: "reasoning" | "text", from, to }   to 为 null 表示还在增长
+ *   { type: "tool", id }                       指向 msg.tools 里的同一张卡
+ *
+ * 刻意不把文本搬进 timeline：reasoning / content 仍是唯一副本。
+ * 好处是 token 估算、持久化、旧会话降级渲染全都不用改，
+ * 写坏的代价也小 —— timeline 丢了只是回到三桶布局，不会丢内容。
+ */
+function segLength(msg, type) {
+  return type === "reasoning" ? (msg.reasoning || "").length : (msg.content || "").length;
+}
+
+/** 开始一段文本；类型变了就先把上一段封口。 */
+function openSegment(msg, type) {
+  const arr = msg.timeline || (msg.timeline = []);
+  const last = arr[arr.length - 1];
+  if (last && last.type === type && last.to === null) return;
+  if (last && last.type !== "tool" && last.to === null) {
+    last.to = segLength(msg, last.type);
+  }
+  arr.push({ type, from: segLength(msg, type), to: null });
+}
+
+/** 工具卡插进时间线。卡片位置按模型给出的顺序占好，不等执行完。 */
+function pushToolSegment(msg, tool) {
+  const arr = msg.timeline || (msg.timeline = []);
+  const last = arr[arr.length - 1];
+  if (last && last.type !== "tool" && last.to === null) {
+    last.to = segLength(msg, last.type);
+  }
+  arr.push({ type: "tool", id: tool.id });
+}
+
 function prepareToolCall(msg, call, args) {
   const tool = {
     id: call.id || `t_${Date.now()}`,
@@ -868,6 +1053,7 @@ function prepareToolCall(msg, call, args) {
     ms: 0,
   };
   msg.tools.push(tool);
+  pushToolSegment(msg, tool);
   return tool;
 }
 
@@ -1023,6 +1209,7 @@ function previewOf(name, args) {
     run_code: "执行编排脚本",
     web_search: args.query,
     spawn_subagent: (args.task || "").slice(0, 40),
+    agent_team: (args.goal || "").slice(0, 40),
     task_schedule: args.name,
     plugin_inspect: args.query || "runtime",
     plugin_scaffold: args.name || args.id,
@@ -1036,11 +1223,25 @@ function previewOf(name, args) {
 
 /* ---------------- 主入口 ---------------- */
 
-export async function runAgent({ session, text, msg, attachments, signal, onChange, requestApproval, spawnSubagent }) {
-  const ctx = { onChange, requestApproval, spawnSubagent };
+/**
+ * 运行中用户补充的指令包一层说明：它不是新开一轮任务，而是要求
+ * 在**不丢已完成工作**的前提下调整后续步骤。模型看到裸文本容易
+ * 把前半段成果推倒重来，这层包装是必要的。
+ */
+const steerMessage = (text) =>
+  `[用户在执行过程中补充的指令 —— 保留已完成的工作，据此调整后续步骤]\n${text}`;
+
+export async function runAgent({ session, text, msg, attachments, signal, onChange, requestApproval, spawnSubagent, pollSteer }) {
+  const ctx = { onChange, requestApproval, spawnSubagent, pollSteer };
   msg.status = "running";
   msg.startedAt = Date.now();
   msg.steps = 0;
+  // 运行阶段：connecting → waiting → thinking → streaming / acting。
+  // 光有"工作中"+秒数不够 —— 服务端深度思考 90 秒时，
+  // 用户需要一眼看出"已经连上了，只是模型还没吐字"。
+  msg.phase = "connecting";
+  // 时间线每轮重建：重发同一条消息时不能把上一轮的段落接在下面
+  msg.timeline = [];
   onChange();
 
   // 开一条轨迹：本轮用户输入就是「指令」。
@@ -1069,6 +1270,7 @@ export async function runAgent({ session, text, msg, attachments, signal, onChan
     msg.retry = null;
   } finally {
     msg.duration = Date.now() - msg.startedAt;
+    delete msg.phase;
     msg.tokens = msg.tokens || estimateTokens(msg.content + msg.reasoning);
     onChange();
     // 收尾落库：成功、失败、中断都算 —— 半条轨迹也有参考价值，
@@ -1095,7 +1297,10 @@ async function liveRun({ session, text, msg, attachments, signal, ctx }) {
     history.pop();
   }
   const active = currentModel();
-  const vision = active ? active.vision !== false : false;
+  // 图片这一期只做 OpenAI 那一套 image_url；其它协议哪怕用户勾了也不发，
+  // 否则 Anthropic / Gemini 的转换层会把 image_url 当成未知片段丢掉。
+  // 判据取适配器自己的能力声明，以后哪个协议跟上了只改 formats.js。
+  const vision = active ? active.vision !== false && !!formatOf(modelFormat(active)).supportsImages : false;
   const built = await withAttachments(text, attachments, { vision });
   msg.media = built.media; // 让界面能显示"图片发了几张 / 是否被跳过"
   const userContent = built.content;
@@ -1107,6 +1312,20 @@ async function liveRun({ session, text, msg, attachments, signal, ctx }) {
     { role: "user", content: userContent },
   ];
 
+  // 运行中的输入引导：pollSteer 由界面提供，取出这段时间内用户追加的指令。
+  // 不打断正在进行的请求 —— 在工具循环边界（下一步请求前）注入 convo，
+  // 那既是模型能读到新指令的最早时机，也不会丢掉当前这一轮的流式输出。
+  const takeSteer = () => {
+    const list = typeof ctx.pollSteer === "function" ? ctx.pollSteer() : [];
+    return (Array.isArray(list) ? list : []).map((s) => String(s || "").trim()).filter(Boolean);
+  };
+  const applySteer = (list) => {
+    for (const t of list) convo.push({ role: "user", content: steerMessage(t) });
+    msg.steerCount = (msg.steerCount || 0) + list.length;
+    msg.steerPending = Math.max(0, (msg.steerPending || 0) - list.length);
+    ctx.onChange();
+  };
+
   // 记忆标签在流式过程中就要挡住，否则用户会看到半截 JSON
   const tagFilter = createTagFilter();
   // 用户这次是不是在纠正我们（"不对/错了/重新说"）—— 命中就提高纠正类记忆权重
@@ -1114,7 +1333,15 @@ async function liveRun({ session, text, msg, attachments, signal, ctx }) {
   // 已显示的正文（已剥掉标签）：与 msg.content 同步，但由过滤器产出
   let display = "";
 
-  const maxSteps = Math.max(1, Math.min(100, state.settings.maxSteps || 24));
+  // 工具调用步数不设上限：模型不再返回工具调用时循环自然结束（见下方 !calls.length）。
+  // 0.67.0 之前这里夹在 4..100 之间，超了就抛错打断 —— 长任务跑到第 24 步
+  // 被硬砍一刀，用户只能去设置里调数字。现在默认 Infinity。
+  //
+  // 只保留一条不在界面上暴露的内部限流：显式把 settings.maxSteps 设成正数才生效，
+  // 给自动化测试限流用（它们的假上游会一直返回工具调用，否则永远不结束）。
+  const configuredSteps = Number(state.settings.maxSteps);
+  const maxSteps =
+    Number.isFinite(configuredSteps) && configuredSteps > 0 ? Math.floor(configuredSteps) : Infinity;
 
   /**
    * 同一调用连续失败了几次。
@@ -1128,10 +1355,26 @@ async function liveRun({ session, text, msg, attachments, signal, ctx }) {
    */
   const sameCallFailures = new Map();
 
+  /** 阶段只在真的变化时推进 —— 每个流式 delta 都重绘整条消息太贵。 */
+  const setPhase = (p) => {
+    if (msg.status !== "running" || msg.phase === p) return;
+    msg.phase = p;
+    ctx.onChange();
+  };
+
   try {
     for (let step = 0; step < maxSteps; step++) {
       if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+      // 每个工具循环边界都收一次引导：执行工具期间用户补的指令，
+      // 下一次请求就能读到，不必等整轮跑完再重新发一条消息。
+      const steers = takeSteer();
+      if (steers.length) applySteer(steers);
       msg.steps = step + 1;
+      // 多步任务的每一步都是一次新的请求，阶段要回到"连接中"
+      if (msg.phase !== "connecting") {
+        msg.phase = "connecting";
+        ctx.onChange();
+      }
       let streamed = "";
       let reasoning = "";
       // 本步推理的起止时刻：用于在 UI 上显示「已思考 X」
@@ -1159,21 +1402,52 @@ async function liveRun({ session, text, msg, attachments, signal, ctx }) {
         ctx.onChange();
       }
 
+      // 断流回滚要用到「这次尝试开始时界面长什么样」。
+      // 三个起点的含义不同，别混用：
+      //   display      跨步累积的正文（msg.content 直接用它）
+      //   reasoning    只属于本步，每步开头清空
+      //   msg.reasoning 跨步累积，回滚要退回本步开头
+      const attemptBase = { display: "", reasoning: "", msgReasoning: "", timeline: 0, tag: null };
+
       const { calls } = await chatOnce({
         messages: trimmed.messages,
         tools: toolSchemas(),
         signal,
+        onPhase: setPhase,
+        onAttemptStart() {
+          attemptBase.display = display;
+          attemptBase.reasoning = reasoning;
+          attemptBase.msgReasoning = msg.reasoning || "";
+          attemptBase.timeline = Array.isArray(msg.timeline) ? msg.timeline.length : 0;
+          attemptBase.tag = tagFilter.snapshot();
+        },
+        onRollback() {
+          display = attemptBase.display;
+          msg.content = display;
+          reasoning = attemptBase.reasoning;
+          msg.reasoning = attemptBase.msgReasoning;
+          streamed = "";
+          if (Array.isArray(msg.timeline)) msg.timeline.length = attemptBase.timeline;
+          tagFilter.restore(attemptBase.tag);
+          if (msg.phase !== "connecting") msg.phase = "connecting";
+          ctx.onChange();
+        },
         onText(delta) {
+          setPhase("streaming");
           streamed += delta;
           // 只把「确认不是标签」的部分显示出去
           const clean = tagFilter.push(delta);
           if (clean) {
+            openSegment(msg, "text");
             display += clean;
             msg.content = display;
             ctx.onChange();
           }
         },
         onReasoning(delta) {
+          // 正文已经开始后不再倒回"正在思考"，多段输出时标签才不会来回跳
+          if (msg.phase !== "streaming") setPhase("thinking");
+          openSegment(msg, "reasoning");
           reasoning += delta;
           msg.reasoning += delta;
           // 记录本步推理的起止时刻，供 UI 显示「已思考 X」
@@ -1204,10 +1478,26 @@ async function liveRun({ session, text, msg, attachments, signal, ctx }) {
       }
 
       if (!calls.length) {
-        display = display.trim();
+        // 这里不再 trim。timeline 里的 from/to 是按**未裁剪**的字符串记的，
+        // 一旦裁掉首尾空白，所有偏移就整体错位 —— 实测正文会被截掉半句。
+        // 结尾的空行交给渲染层处理（那里本来就按段 trim）。
         msg.content = display;
+        // 模型刚要收尾、但用户在这段时间里补了指令：不能让它就此结束。
+        // 把这一轮的回答写进 convo，再把引导作为新一轮输入，继续循环。
+        // 深度思考 90 秒的场景里，引导往往就是在这段"没反应"里输入的。
+        const tailSteers = takeSteer();
+        if (tailSteers.length) {
+          convo.push({ role: "assistant", content: stripMemoryTags(streamed) || "（继续）" });
+          applySteer(tailSteers);
+          display += "\n\n";
+          msg.content = display; // 与 display 同步，时间线偏移才不会错位
+          ctx.onChange();
+          continue;
+        }
         return;
       }
+
+      setPhase("acting");
 
       const resolved = calls.map((c) => ({
         ...c,
@@ -1233,12 +1523,18 @@ async function liveRun({ session, text, msg, attachments, signal, ctx }) {
       //   · 但回灌给模型的 tool 结果必须严格按原顺序 —— 那是模型自己
       //     排好的，顺序变了它会看不懂「刚才那个结果对应哪次调用」
       const items = resolved.map((call) => {
-        let args = {};
-        let parseError = null;
-        try {
-          args = JSON.parse(call.args || "{}");
-        } catch (err) {
-          parseError = err.message;
+        // 模型给的 arguments 不总是合法 JSON：可能是两个对象粘在一起、
+        // 被 ```json 围栏包着、字符串里有裸换行。截图里那张
+        // 「参数解析失败 · Unexpected non-whitespace character after JSON」
+        // 就是第一种。先做无损修复，修不了才判失败。
+        const parsed = parseToolArgs(call.args);
+        const args = parsed.ok ? parsed.value : {};
+        const parseError = parsed.ok ? null : parsed.error;
+
+        // 修复是透明的：参数内容仍然是模型原本那一个对象。
+        // 只留一行日志，方便排查"它到底发成了什么样"。
+        if (parsed.ok && parsed.repaired) {
+          console.warn(`[tool-args] ${call.name}: 已修复（${parsed.repaired}）`);
         }
 
         if (parseError) {
@@ -1248,10 +1544,11 @@ async function liveRun({ session, text, msg, attachments, signal, ctx }) {
             argLabel: "参数解析失败",
             status: "error",
             args: {},
-            output: `工具参数不是合法 JSON：${parseError}`,
+            output: argsErrorText(parseError, call.args),
             ms: 0,
           };
           msg.tools.push(badTool);
+          pushToolSegment(msg, badTool);
           return { call, args, parseError, tool: badTool, res: null };
         }
 
@@ -1354,7 +1651,8 @@ async function liveRun({ session, text, msg, attachments, signal, ctx }) {
     }
   }
 
-  throw new Error(`已达到最大步数（${maxSteps}），Agent 停止。可在设置中调高上限。`);
+  // 只有显式设了内部限流才会走到这里；正常用户是无限循环，靠 !calls.length 收尾。
+  throw new Error(`已达到内部设定的步数限流（${maxSteps}），Agent 停止。`);
 }
 
 /* ---------------- 子 Agent / 连通性测试 ---------------- */
@@ -1413,19 +1711,33 @@ export async function spawnSubagentOnce(task, signal) {
   if (!baseUrl) throw new Error("请先配置 Base URL");
   const apiKey = apiKeyFor(active);
   if (!apiKey) throw new Error("当前服务未配置 API Key");
-  const res = await fetchWithTimeout(endpointFor(baseUrl), {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({
-      model,
-      messages: subMessages,
-      temperature: 0.2,
-      stream: false,
-    }),
-  }, signal);
-  if (!res.ok) throw new Error(`子 Agent 请求失败（HTTP ${res.status}）`);
-  const data = await res.json();
-  const raw = data.choices?.[0]?.message?.content || "（子 Agent 没有返回内容）";
+
+  // 子 Agent 也必须按当前模型的协议发：它在 Anthropic 模型下用 OpenAI 形状
+  // 请求只会拿到 400，而且报错会以「工具结果」的形式混进主对话。
+  const adapter = formatOf(normalizeFormat(active.format));
+  const req = adapter.buildRequest({
+    baseUrl,
+    apiKey,
+    modelId: model,
+    messages: subMessages,
+    tools: [],
+    stream: false,
+    temperature: 0.2,
+    maxTokens: 1024,
+    effort: null,
+  });
+  const out = await minimalRequest({
+    url: req.url,
+    headers: req.headers,
+    payload: req.body,
+    timeoutSec: 120,
+    signal,
+  });
+  if (out.status < 200 || out.status >= 300) {
+    throw new Error(`子 Agent 请求失败（HTTP ${out.status}）${errorDetail(out.raw) ? `：${errorDetail(out.raw)}` : ""}`);
+  }
+  const whole = adapter.parseWhole(out.raw);
+  const raw = (whole && whole.text) || "（子 Agent 没有返回内容）";
   // 出口层清洗：子 Agent 的输出会以工具结果的形式回到主对话。
   // 如果子 Agent 读了恶意网页/文件，它的输出可能带着伪造的
   // 记忆标签或角色头 —— 不清洗就等于让内容二次注入。
@@ -1433,27 +1745,39 @@ export async function spawnSubagentOnce(task, signal) {
 }
 
 /** 发一次最小请求，返回原始文本与状态码；Android 走原生，浏览器走 fetch。 */
-async function minimalRequest({ url, headers, payload, timeoutSec = 60, method = "POST" }) {
+async function minimalRequest({ url, headers, payload, timeoutSec = 60, method = "POST", signal }) {
   if (nativeHttpAvailable()) {
     let status = 0;
     let raw = "";
+    // 读超时必须比「首字节耐心值」更长，否则 SocketTimeout 会先于看门狗
+    // 触发，用户看到的是一条没有上下文的 SocketTimeoutException。
+    // GET（模型列表）不抬：探测模型是轻请求，断网时应该 20 秒内失败，
+    // 不该陪着聊天模型等 105 秒。
+    const prof = connectionProfile(url);
+    const readSec =
+      method === "GET"
+        ? Number(timeoutSec) || 60
+        : Math.max(Number(timeoutSec) || 60, prof.firstByteSec > 0 ? prof.firstByteSec + 15 : 0);
     await new Promise((resolve, reject) => {
       nativeStream({
         url,
         headers,
         body: method === "GET" ? {} : payload,
         method,
-        timeoutSec,
+        timeoutSec: readSec,
+        ...prof,
+        signal,
         onStatus: (s) => {
           status = s;
         },
         onChunk: (t) => {
-          if (raw.length < 2_000_000) raw += t;
+          if (raw.length < 2000000) raw += t;
         },
         onEnd: resolve,
         onError: reject,
       });
     }).catch((err) => {
+      if (err.name === "AbortError") throw err;
       if (err.httpStatus) {
         err.status = err.httpStatus;
         err.body = err.body || "";
@@ -1467,12 +1791,17 @@ async function minimalRequest({ url, headers, payload, timeoutSec = 60, method =
   }
   let res;
   try {
-    res = await fetchWithTimeout(url, {
-      method,
-      headers,
-      body: method === "GET" ? undefined : JSON.stringify(payload),
-    });
+    res = await fetchWithTimeout(
+      url,
+      {
+        method,
+        headers,
+        body: method === "GET" ? undefined : JSON.stringify(payload),
+      },
+      signal
+    );
   } catch (err) {
+    if (err.name === "AbortError") throw err;
     const e = new Error(`无法连接：${err.message}（浏览器预览下还要求服务端允许 CORS）`);
     e.network = true;
     throw e;
@@ -1481,73 +1810,56 @@ async function minimalRequest({ url, headers, payload, timeoutSec = 60, method =
   return { status: res.status, raw };
 }
 
-/** 从各种常见响应结构里取出模型 ID 列表。 */
-function parseModelIds(raw) {
-  let data;
+/**
+ * 按协议探测端点的可用模型。
+ *
+ * 每家的端点、鉴权、响应结构都不一样，所以具体怎么试交给 formats.js；
+ * 这里只提供一个「发请求」的能力，顺便把原生桥的 status/body 错误
+ * 转回统一的 { status, text }，让适配器不必知道底下走的是哪条通道。
+ */
+export async function fetchModelList({ format = "openai", baseUrl, apiKey, signal, providerKey = "" } = {}) {
+  const adapter = formatOf(format);
+  const run = async (base) =>
+    adapter.listModels({
+      baseUrl: base,
+      apiKey,
+      signal,
+      request: async (r) => {
+        try {
+          const out = await minimalRequest({
+            url: r.url,
+            headers: r.headers,
+            method: r.method,
+            timeoutSec: r.timeoutSec,
+            signal,
+          });
+          return { status: out.status, text: out.raw };
+        } catch (err) {
+          if (err.status) return { status: err.status, text: err.body || "" };
+          throw err;
+        }
+      },
+    });
+
+  // 拉列表和对话走的是同一对域名，也会撞上「Key 属于另一站」。
+  // 这里没有模型 id 可以写回，只能把对的地址带回去让表单自己改 ——
+  // 否则用户会卡在「填了 Key 却一个模型都列不出来」。
+  let listed;
+  let switchedTo = "";
   try {
-    data = JSON.parse(raw);
-  } catch {
-    return [];
+    listed = await run(baseUrl);
+  } catch (err) {
+    const code = Number(err?.httpStatus || err?.status) || 0;
+    const alt = code === 401 || code === 403 ? agnesAltBaseUrl(baseUrl) : "";
+    if (!alt) throw err;
+    listed = await run(alt);
+    switchedTo = alt;
   }
-  const pick = (v) => (Array.isArray(v) ? v : Array.isArray(v?.data) ? v.data : Array.isArray(v?.models) ? v.models : null);
-  const list = pick(data) || pick(data?.result) || pick(data?.response) || [];
-  return list
-    .map((m) => (typeof m === "string" ? m : m?.id || m?.name || m?.model))
-    .filter((x) => typeof x === "string" && x.trim())
-    .sort((a, b) => a.localeCompare(b));
-}
 
-const shortUrl = (u) => String(u || "").replace(/^https?:\/\//, "").slice(0, 72);
-
-/** 拉取端点的可用模型列表（OpenAI 兼容 GET /models），多路径探测并汇总失败原因。 */
-export async function fetchModelList({ baseUrl, apiKey }) {
-  if (!baseUrl) throw new Error("先填 Base URL");
-  if (!apiKey) throw new Error("先填这个服务的 API Key，才能获取可用模型");
-
-  const base = String(baseUrl).trim().replace(/\/+$/, "");
-  // 端点形态各异：/v1、/compatible-mode/v1、/api/paas/v4、纯域名……逐个形态试
-  const roots = new Set([base]);
-  const stripped = base.replace(/\/v\d+$/i, "");
-  if (stripped !== base) roots.add(stripped);
-  const urls = [];
-  roots.forEach((r) => {
-    urls.push(`${r}/models`);
-    if (!/\/v\d+$/i.test(r)) urls.push(`${r}/v1/models`);
-  });
-  const unique = Array.from(new Set(urls)).slice(0, 6);
-
-  const tried = [];
-  for (const url of unique) {
-    try {
-      const { status, raw } = await minimalRequest({
-        url,
-        headers: { Authorization: `Bearer ${apiKey}` },
-        method: "GET",
-        timeoutSec: 30,
-      });
-      if (status === 401 || status === 403 || status === 402) {
-        const detail = errorDetail(raw);
-        throw new Error(`${httpHint(status)}${detail ? ` · ${detail}` : ""}`);
-      }
-      if (status < 200 || status >= 300) {
-        tried.push(`${shortUrl(url)} → HTTP ${status}`);
-        continue;
-      }
-      const ids = parseModelIds(raw);
-      if (!ids.length) {
-        tried.push(`${shortUrl(url)} → 200 但列表为空`);
-        continue;
-      }
-      return ids;
-    } catch (err) {
-      // Key 类错误换路径也没用，直接抛给用户
-      if (/API Key|余额|权限|无效/.test(err.message || "")) throw err;
-      tried.push(`${shortUrl(url)} → ${err.message || "请求失败"}`);
-    }
-  }
-  throw new Error(
-    `这个端点没有返回模型列表（${tried.slice(0, 3).join("；")}）。很多网关不提供 /models，直接点下方「常用模型」即可，不必手动填 ID。`
-  );
+  // 显示名在这里统一收口成可直接发送的真实 ID，UI 不必再关心上游字段命名。
+  const out = { ...listed, items: resolveDiscoveredModels(providerKey, listed.items) };
+  if (switchedTo) out.switchedTo = switchedTo;
+  return out;
 }
 
 /** 测试任意模型（不只是当前模型）。 */
@@ -1593,65 +1905,133 @@ export async function testModel(modelOrId) {
   if (!apiModel) throw new Error("缺少模型 ID，请到模型参数里填写");
 
   const started = Date.now();
-  const payload = {
-    model: apiModel,
-    messages: [{ role: "user", content: "ping" }],
-    max_tokens: 16,
-    stream: false,
-  };
-  let result;
-  try {
-    result = await minimalRequest({
-      url: endpointFor(baseUrl),
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-      payload,
-      timeoutSec: 60,
+  const format = normalizeFormat(model.format);
+  const adapter = formatOf(format);
+
+  // ============ 先打配置里的地址，必要时再换一个 Agnes 站 ============
+  //
+  // 用户填的国际站地址 + 国内站生成的 Key，是最容易发生、也最难自查的
+  // 一种 401：两站是同一套 API，报错文案一模一样，只有域名不同。
+  // 所以这里不急着下结论 —— 先换另一个站试一次，再决定怎么报错。
+  let site = baseUrl;
+  let switchedFrom = "";
+  let switchedStatus = 0;
+  let result = null;
+  let req = null;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    // 用同一个适配器发 ping，测的才是聊天真正会走的那条路
+    req = adapter.buildRequest({
+      baseUrl: site,
+      apiKey: key,
+      modelId: apiModel,
+      messages: [{ role: "user", content: "ping" }],
+      tools: [],
+      stream: false,
+      temperature: 0.2,
+      maxTokens: 16,
+      effort: null,
     });
-  } catch (err) {
-    const message = err.message || "网络不可达";
+
+    let failure = null;
+    try {
+      result = await minimalRequest({
+        url: req.url,
+        headers: req.headers,
+        payload: req.body,
+        timeoutSec: 60,
+      });
+      if (result.status >= 200 && result.status < 300) break;
+      failure = { code: result.status, detail: errorDetail(result.raw) };
+    } catch (err) {
+      // 原生桥把 4xx 的响应体放在 err.body，err.message 只有干巴巴的
+      // "HTTP 401"。以前直接用它，服务端真正的原因（Invalid token /
+      // Token not provided / 额度不足）全被丢掉，界面只剩「Key 无效」四个字，
+      // 用户拿着电脑上验证过的 Key 无从查起。
+      const code = Number(err.status || err.httpStatus) || 0;
+      failure = { code, detail: errorDetail(err.body) || err.message || "网络不可达" };
+    }
+
     const ms = Date.now() - started;
-    addDiagnostic({ endpoint: baseUrl, model: apiModel, status: err.status || 0, ok: false, ms, error: message });
-    record({ ok: false, status: err.status || 0, error: message, model: apiModel });
-    throw new Error(message);
+    addDiagnostic({
+      endpoint: safeUrl(req.url),
+      format,
+      model: apiModel,
+      status: failure.code,
+      ok: false,
+      ms,
+      error: failure.detail,
+    });
+
+    const alt = agnesSwitchTarget(model, site, failure.code, attempt > 0);
+    if (alt) {
+      switchedFrom = site;
+      switchedStatus = failure.code;
+      site = alt;
+      continue;
+    }
+
+    const hint = authDiagnosisFor(model, failure.code, failure.detail);
+    const message = failure.code
+      ? `${httpHint(failure.code)}${failure.detail ? ` · ${failure.detail}` : ""}`
+      : failure.detail || "网络不可达";
+    record({
+      ok: false,
+      status: failure.code,
+      error: failure.detail,
+      hint,
+      model: apiModel,
+      endpoint: safeUrl(req.url),
+    });
+    const e = new Error(message);
+    e.hint = withSiteNote(hint, attempt > 0);
+    e.httpStatus = failure.code;
+    throw e;
   }
 
-  if (result.status < 200 || result.status >= 300) {
-    const detail = errorDetail(result.raw);
-    const message = `${httpHint(result.status)}${detail ? ` · ${detail}` : ""}`;
-    addDiagnostic({ endpoint: baseUrl, model: apiModel, status: result.status, ok: false, error: detail });
-    record({ ok: false, status: result.status, error: detail, model: apiModel });
-    throw new Error(message);
+  if (!result || result.status < 200 || result.status >= 300) {
+    throw new Error("连接失败：重试后仍未拿到可用响应");
   }
 
-  let data = {};
-  try {
-    data = JSON.parse(result.raw);
-  } catch {
-    data = {};
-  }
+  const whole = adapter.parseWhole(result.raw);
+  const usage = (whole && whole.usage && whole.usage.total_tokens) || 0;
   const ms = Date.now() - started;
+
+  // 换站成功 → 写回配置，下次直接打对的地址，不再多花一次请求。
+  if (switchedFrom) {
+    try {
+      saveModelOverride(model.id, { baseUrl: site });
+    } catch {
+      /* 存档失败不影响这次结论 */
+    }
+  }
+
   addDiagnostic({
-    endpoint: baseUrl,
+    endpoint: safeUrl(req.url),
+    format,
     model: apiModel,
     status: result.status,
     ok: true,
-    tokens: data.usage?.total_tokens || 0,
+    tokens: usage,
     ms,
   });
-  record({
-    ok: true,
-    status: result.status,
-    ms,
-    model: data.model || apiModel,
-    endpoint: baseUrl,
-  });
-  return {
-    ms,
-    model: data.model || apiModel,
-    usage: data.usage?.total_tokens || 0,
-    endpoint: baseUrl,
-    status: result.status,
-  };
+  record({ ok: true, status: result.status, ms, model: apiModel, endpoint: safeUrl(req.url) });
+
+  const out = { ms, model: apiModel, usage, endpoint: safeUrl(req.url), status: result.status };
+  if (switchedFrom) {
+    out.siteSwitched = true;
+    out.site = agnesSiteOf(site);
+    out.siteNote = siteNoteOf(switchedFrom, site, switchedStatus);
+    record({
+      ok: true,
+      status: result.status,
+      ms,
+      model: apiModel,
+      endpoint: safeUrl(req.url),
+      siteNote: out.siteNote,
+    });
+  }
+  return out;
 }
 
 export async function testProvider(slot) {

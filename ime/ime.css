@@ -1,0 +1,580 @@
+/* ============================================================
+   键盘样式
+
+   ============ 约束 ============
+   
+   · 固定高度 290dp（键区 4×48 + 候选条 40 + 工具条 36）
+   · 不能滚动、不能有长按菜单、不能选中文字
+   · 一切以"手指按得准"为先：按键最小 40dp 宽、间隙 5dp
+   ============================================================ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: var(--bg-deep);
+  color: var(--text);
+  font-family: var(--font-body);
+  overscroll-behavior: none;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  border: 0;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+
+.kb {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 4px 4px calc(4px + env(safe-area-inset-bottom, 0px));
+  gap: 4px;
+  background: var(--bg-deep);
+}
+
+/* ---------------- 候选条 ---------------- */
+
+.bar {
+  display: flex;
+  align-items: center;
+  height: 40px;
+  flex: none;
+  gap: 2px;
+}
+
+.bar__cands {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+}
+
+.bar__cands::-webkit-scrollbar {
+  display: none;
+}
+
+/* 候选：整句那个加一点强调，让"直接整句上屏"更显眼 */
+.cand {
+  flex: none;
+  min-width: 44px;
+  height: 36px;
+  padding: 0 10px;
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-size: var(--fs-15);
+  line-height: 36px;
+  white-space: nowrap;
+  transition: background var(--dur-1) var(--ease-out);
+}
+
+.cand:active {
+  background: var(--surface-3);
+}
+
+.cand[data-kind="whole"] {
+  background: var(--accent-soft);
+  color: var(--accent-bright);
+  border: 1px solid var(--accent-line);
+}
+
+/* 拼音缓冲：始终显示在候选左边，
+   让用户随时核对"我打的拼音对不对"。
+   —— 有候选时也要显示，否则用户没法确认自己打错没有。 */
+.buffer {
+  flex: none;
+  max-width: 40%;
+  padding: 0 8px;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--fs-14);
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 有真实拼音输入时高亮一下，和"空提示"区分开 */
+.buffer[data-role="pinyin"] {
+  color: var(--accent-bright);
+}
+
+.bar__more {
+  flex: none;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--r-sm);
+  color: var(--muted);
+  font-size: 20px;
+  line-height: 1;
+}
+
+.bar__more:disabled {
+  opacity: 0.25;
+}
+
+/* ---------------- 工具条 ---------------- */
+
+.tools {
+  display: flex;
+  gap: 4px;
+  height: 36px;
+  flex: none;
+}
+
+.tool {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  border-radius: var(--r-sm);
+  background: var(--surface);
+  color: var(--text-soft);
+  font-size: var(--fs-11);
+  border: 1px solid var(--line);
+}
+
+.tool:active {
+  background: var(--surface-3);
+}
+
+.tool[data-active="true"] {
+  background: var(--accent-soft);
+  color: var(--accent-bright);
+  border-color: var(--accent-line);
+}
+
+.tool:disabled {
+  opacity: 0.35;
+}
+
+.tool svg {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* ---------------- 键区 ---------------- */
+
+.keys {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-height: 0;
+}
+
+.row {
+  display: flex;
+  gap: 5px;
+  flex: 1;
+  min-height: 0;
+}
+
+.key {
+  flex: 1;
+  min-width: 0;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: var(--fs-17);
+  font-weight: 500;
+  border: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background var(--dur-1) var(--ease-out), transform 60ms var(--ease-out);
+}
+
+.key:active,
+.key.is-down {
+  background: var(--surface-3);
+  transform: scale(0.96);
+}
+
+/* 功能键：颜色更暗，和字符键区分开，避免误按 */
+.key[data-fn="true"] {
+  background: var(--surface);
+  color: var(--text-soft);
+  font-size: var(--fs-12);
+}
+
+.key[data-wide="1.5"] {
+  flex: 1.5;
+}
+
+.key[data-wide="2"] {
+  flex: 2;
+}
+
+.key[data-wide="3"] {
+  flex: 3;
+}
+
+.key[data-accent="true"] {
+  background: var(--accent);
+  color: #fff;
+  border-color: transparent;
+}
+
+.key svg {
+  width: 20px;
+  height: 20px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* ---------------- 面板 ---------------- */
+
+.panel {
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  bottom: calc(4px + env(safe-area-inset-bottom, 0px));
+  height: 218px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-3);
+  display: flex;
+  flex-direction: column;
+  z-index: 5;
+}
+
+.panel[hidden] {
+  display: none;
+}
+
+.panel__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  font-size: var(--fs-13);
+  flex: none;
+}
+
+.panel__close {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--r-sm);
+  color: var(--muted);
+}
+
+.panel__body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 12px;
+  font-size: var(--fs-13);
+  color: var(--text-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.panel__body .item {
+  padding: 9px 10px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  color: var(--text);
+  text-align: left;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.panel__body .item:active {
+  background: var(--surface-3);
+}
+
+.panel__body .item small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: var(--fs-11);
+}
+
+.panel__body .hint {
+  color: var(--muted);
+  font-size: var(--fs-12);
+  line-height: 1.6;
+}
+
+/* 输入记忆那行：和上面的短语列表分开，别让人以为它也是一条短语 */
+.panel__body .hint[data-role="learn"] {
+  margin-top: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.panel__body .hint[data-role="learn"] .row-btns {
+  margin-top: 8px;
+}
+
+.panel__body .row-btns {
+  display: flex;
+  gap: 8px;
+}
+
+.panel__body .btn {
+  flex: 1;
+  height: 38px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  color: var(--text);
+  font-size: var(--fs-13);
+}
+
+.panel__body .btn[data-primary="true"] {
+  background: var(--accent);
+  border-color: transparent;
+  color: #fff;
+}
+
+.panel__body .btn:disabled {
+  opacity: 0.4;
+}
+
+/* AI 结果区 */
+.ai-out {
+  background: var(--bg-deep);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  padding: 10px;
+  line-height: 1.6;
+  color: var(--text);
+  min-height: 60px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ai-out[data-state="error"] {
+  color: var(--danger);
+}
+
+/* ---------------- 提示 ---------------- */
+
+.toast {
+  position: absolute;
+  left: 50%;
+  bottom: 120px;
+  transform: translateX(-50%);
+  max-width: 80%;
+  padding: 7px 14px;
+  border-radius: var(--r-full);
+  background: rgba(0, 0, 0, 0.82);
+  color: #fff;
+  font-size: var(--fs-12);
+  z-index: 20;
+  pointer-events: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.toast[hidden] {
+  display: none;
+}
+
+/* 录音中的呼吸提示 */
+.rec {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-line);
+  color: var(--accent-bright);
+}
+
+.rec__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent-bright);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.4;
+    transform: scale(0.75);
+  }
+}
+
+/* ============================================================
+   手写面板
+   ============================================================ */
+
+/* 手写面板要把面板的留白吃掉：218px 里每一像素都要给画布，
+   否则字写不开，笔画一挤就被模型认成别的字 */
+/* 手写面板撑满整个键盘区域：218px 里画布只剩 79px 高，
+   复杂字（"赢""藏"）根本写不开，笔画一挤就被认成别的字 */
+.panel.is-hand {
+  top: 4px;
+  height: auto;
+}
+
+.panel__body.is-flush {
+  padding: 6px 8px;
+  gap: 0;
+  overflow: hidden;
+}
+
+.hw {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  height: 100%;
+  min-height: 0;
+}
+
+/* ---- 候选行 ---- */
+
+.hw__head {
+  flex: none;
+  min-height: 30px;
+  display: flex;
+  align-items: center;
+}
+
+.hw__cands {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  flex: 1;
+  min-width: 0;
+}
+
+.hw__cands::-webkit-scrollbar {
+  display: none;
+}
+
+.hw__cands .cand {
+  height: 30px;
+  line-height: 30px;
+  min-width: 40px;
+  font-size: var(--fs-16);
+}
+
+.hw__hint {
+  color: var(--muted);
+  font-size: var(--fs-12);
+  padding-left: 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* 作为 .hw__head 的 flex 项，默认 min-width:auto 会撑破 360dp 的键盘；
+     长提示必须允许被压缩，省略号才有意义 */
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+/* 带「重试」的失败提示：文字先吃满宽度，按钮固定在右端不被挤掉 */
+.hw__hint--act {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.hw__hint-txt {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hw__retry {
+  flex: none;
+  height: 26px;
+  padding: 0 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-full);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: var(--fs-12);
+  font-family: inherit;
+}
+
+.hw__retry:active {
+  background: var(--surface-3);
+}
+
+/* ---- 画布 ---- */
+
+.hw__stage {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  border-radius: var(--r-sm);
+  overflow: hidden;
+  background: #fff;
+  /* 浅色描边：深色键盘上，纯白画布会"发光"，加一条边压住 */
+  border: 1px solid var(--line-strong);
+}
+
+.hw__canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  /* 不加这条，手指在画布上滑动会被 WebView 当成滚动，
+     笔迹会断成一节一节 */
+  touch-action: none;
+}
+
+/* 九宫格参考线：告诉用户"往中间写"，也让字有个位置感。
+   纯装饰，不接事件 */
+.hw__grid {
+  position: absolute;
+  /* inset 是 Chrome 87 的简写，老内核整条丢弃 —— 先逐边写一遍 */
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(to right, rgba(0, 0, 0, 0.07) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(0, 0, 0, 0.07) 1px, transparent 1px);
+  background-size: 33.333% 33.333%;
+  background-position: -1px -1px;
+}
